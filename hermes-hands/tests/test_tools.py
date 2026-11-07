@@ -2,6 +2,8 @@ import json
 import importlib
 import sys
 import types
+import os
+import time
 
 from hands import store
 
@@ -60,6 +62,23 @@ def test_screenshot_returns_media_line(monkeypatch, tmp_path):
     constants = types.ModuleType("hermes_constants")
     constants.get_hermes_home = lambda: tmp_path
     monkeypatch.setitem(sys.modules, "hermes_constants", constants)
+    cache_dir = tmp_path / "cache" / "hermes-hands"
+    cache_dir.mkdir(parents=True)
+    old_png = cache_dir / "old.png"
+    new_png = cache_dir / "new.png"
+    unrelated = cache_dir / "old.jpg"
+    outside = tmp_path / "cache" / "outside.png"
+    for file in (old_png, new_png, unrelated, outside):
+        file.write_bytes(b"old")
+    old_time = time.time() - 24 * 60 * 60 - 1
+    os.utime(old_png, (old_time, old_time))
+    os.utime(unrelated, (old_time, old_time))
+    os.utime(outside, (old_time, old_time))
+    symlink = cache_dir / "linked.png"
+    try:
+        symlink.symlink_to(old_png)
+    except OSError:
+        symlink = None
     monkeypatch.setattr("hands.targets.store.get_session_target", lambda key: "laptop")
     monkeypatch.setattr(store, "get_device", lambda name: {"name": name})
     ctx = load_tools(monkeypatch, session_key="session")
@@ -67,6 +86,12 @@ def test_screenshot_returns_media_line(monkeypatch, tmp_path):
     path = result["text"].split("MEDIA:", 1)[1]
     assert path.endswith(".png")
     assert (tmp_path / "cache" / "hermes-hands" / path.split("/")[-1]).read_bytes() == b"png"
+    assert not old_png.exists()
+    assert new_png.exists()
+    assert unrelated.exists()
+    assert outside.exists()
+    if symlink is not None:
+        assert symlink.is_symlink()
 
 
 def test_screenshot_errors_are_json(monkeypatch):

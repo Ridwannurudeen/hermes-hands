@@ -3,9 +3,34 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import uuid
 
 from . import client, store, targets
+
+SCREENSHOT_MAX_AGE_SECONDS = 24 * 60 * 60
+
+
+def _cleanup_screenshots(directory, now=None) -> None:
+    cutoff = (time.time() if now is None else now) - SCREENSHOT_MAX_AGE_SECONDS
+    if directory.is_symlink():
+        return
+    try:
+        entries = os.scandir(directory)
+    except OSError:
+        return
+    with entries:
+        for entry in entries:
+            if not entry.name.endswith(".png") or not entry.is_file(follow_symlinks=False):
+                continue
+            try:
+                if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                    from pathlib import Path
+
+                    Path(entry.path).unlink()
+            except OSError:
+                continue
 
 
 def register_tools(ctx) -> None:
@@ -30,6 +55,7 @@ def register_tools(ctx) -> None:
 
             output = get_hermes_home() / "cache" / "hermes-hands" / f"{uuid.uuid4()}.png"
             output.parent.mkdir(parents=True, exist_ok=True)
+            _cleanup_screenshots(output.parent)
             output.write_bytes(png)
             path = str(output.resolve())
             return json.dumps({"text": f"Screenshot saved. Include this exact line in your reply and call vision_analyze on the path.\nMEDIA:{path}"})

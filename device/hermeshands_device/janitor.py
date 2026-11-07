@@ -11,6 +11,7 @@ from . import config
 
 logger = logging.getLogger(__name__)
 MAX_AGE_SECONDS = 24 * 60 * 60
+OUT_LOG_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 SWEEP_INTERVAL_SECONDS = 60 * 60
 
 
@@ -46,6 +47,7 @@ def _matches(name: str) -> bool:
 
 def cleanup(now: float | None = None) -> int:
     cutoff = (time.time() if now is None else now) - MAX_AGE_SECONDS
+    log_cutoff = (time.time() if now is None else now) - OUT_LOG_MAX_AGE_SECONDS
     removed = 0
     for directory in _temp_dirs() | {config.OUT_DIR}:
         if directory.is_symlink():
@@ -56,10 +58,12 @@ def cleanup(now: float | None = None) -> int:
             continue
         with entries:
             for entry in entries:
-                if not _matches(entry.name) or not entry.is_file(follow_symlinks=False):
+                is_out_log = directory == config.OUT_DIR and entry.name.endswith(".log")
+                if not (_matches(entry.name) or is_out_log) or not entry.is_file(follow_symlinks=False):
                     continue
                 try:
-                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                    age_cutoff = log_cutoff if is_out_log else cutoff
+                    if entry.stat(follow_symlinks=False).st_mtime < age_cutoff:
                         Path(entry.path).unlink()
                         removed += 1
                 except OSError:
