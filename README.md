@@ -139,7 +139,7 @@ A skill can explain how to use a feature, but cannot register a terminal backend
 
 ## Tests and validation
 
-124 tests run against Hermes 0.23.0, 6 of them end to end with the real device agent and the real relay in one process; 46 device tests. CI workflows cover Ubuntu and Windows for the plugin, and Ubuntu, Windows, and macOS for the device.
+180 tests run against Hermes 0.23.0: 126 plugin tests, 6 of them end to end with the real device agent and the real relay in one process, and 54 device tests. On Windows 178 pass and 2 are skipped by design (one needs a Linux gateway, one is POSIX only). CI workflows cover Ubuntu and Windows for the plugin, and Ubuntu, Windows, and macOS for the device.
 
 The device CI tests on Python 3.11 and 3.12. Plugin CI validates the plugin and doctor, runs the plugin suite against Hermes 0.23.0, validates catalog shape, scans plugin payloads, and checks Python changes for Windows footguns.
 
