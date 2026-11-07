@@ -14,7 +14,7 @@ import httpx
 
 from . import __version__, config, executor, policy, screen
 from .keys import get_or_create
-from .protocol import D2R, R2D, canonical_json, fresh, make_bearer, new_nonce, request_message, sign_request, verify
+from .protocol import D2R, R2D, canonical_json, fresh, make_bearer, new_nonce, sign_request, verify_request
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +64,10 @@ class DeviceLoop:
             request_nonce = response.request.headers["X-Hands-Nonce"]
             signature = response.headers["X-Hands-Signature"]
             path = urlparse(config.gateway_url()).path.rstrip("/") + endpoint
-            valid = nonce == request_nonce and fresh(ts, int(time.time())) and verify(
-                config.relay_public_key(), signature.encode("ascii"), request_message(R2D, ts, nonce, "POST", path, response.content)
+            valid = nonce == request_nonce and fresh(ts, int(time.time())) and verify_request(
+                config.relay_public_key(), signature, R2D, ts, nonce, "POST", path, response.content
             )
-        except (KeyError, ValueError, UnicodeEncodeError, httpx.RequestNotRead):
+        except (KeyError, ValueError, httpx.RequestNotRead):
             valid = False
         if not valid:
             logger.warning("Dropping invalid relay reply for %s", endpoint)

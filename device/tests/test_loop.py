@@ -3,8 +3,104 @@ import threading
 
 import httpx
 
-from hermeshands_device import loop, config
-from hermeshands_device.protocol import R2D, generate_keypair, sign_request
+from hermeshands_device import cli, loop, config
+from hermeshands_device.protocol import R2D, b64u, canonical_json, generate_keypair, sign_request
+
+
+def _signed_poll(monkeypatch, *, body=None, signature_body=None, response_ts=None, response_nonce=None, signing_key=None):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
+    monkeypatch.setattr(config, "device_id", lambda: "device-1")
+    monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    payload = {"job_id": "job-1", "type": "exec", "script": "echo signed"}
+    body = canonical_json(payload) if body is None else body
+    signature_body = body if signature_body is None else signature_body
+    ts = int(time.time()) if response_ts is None else response_ts
+    key = private if signing_key is None else signing_key
+
+    def handler(request):
+        nonce = request.headers["X-Hands-Nonce"] if response_nonce is None else response_nonce
+        path = "/api/plugins/hermes-hands/device/poll"
+        return httpx.Response(200, content=body, request=request, headers={
+            "X-Hands-Ts": str(ts), "X-Hands-Nonce": nonce,
+            "X-Hands-Signature": sign_request(key, R2D, ts, nonce, "POST", path, signature_body),
+        })
+
+    return payload, loop.DeviceLoop(transport=httpx.MockTransport(handler))
+
+
+def test_loop_accepts_correctly_signed_poll_reply(monkeypatch):
+    job, agent = _signed_poll(monkeypatch)
+    try:
+        assert agent._verify_response(agent._post("/device/poll", {"wait": 25}), "/device/poll") == job
+    finally:
+        agent.client.close()
+
+
+def test_loop_rejects_tampered_poll_body(monkeypatch):
+    body = canonical_json({"job_id": "job-1", "type": "exec", "script": "echo altered"})
+    signature_body = canonical_json({"job_id": "job-1", "type": "exec", "script": "echo signed"})
+    _, agent = _signed_poll(monkeypatch, body=body, signature_body=signature_body)
+    try:
+        try:
+            agent._verify_response(agent._post("/device/poll", {"wait": 25}), "/device/poll")
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("tampered body accepted")
+    finally:
+        agent.client.close()
+
+
+def test_loop_rejects_stale_poll_reply(monkeypatch):
+    _, agent = _signed_poll(monkeypatch, response_ts=int(time.time()) - 301)
+    try:
+        try:
+            agent._verify_response(agent._post("/device/poll", {"wait": 25}), "/device/poll")
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("stale reply accepted")
+    finally:
+        agent.client.close()
+
+
+def test_loop_rejects_poll_reply_signed_by_wrong_key(monkeypatch):
+    wrong_private, _ = generate_keypair()
+    _, agent = _signed_poll(monkeypatch, signing_key=wrong_private)
+    try:
+        try:
+            agent._verify_response(agent._post("/device/poll", {"wait": 25}), "/device/poll")
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("reply signed by the wrong key accepted")
+    finally:
+        agent.client.close()
+
+
+def test_pair_accepts_correctly_signed_reply(monkeypatch):
+    private, public = generate_keypair()
+    _, device_public = generate_keypair()
+    monkeypatch.setattr(cli, "get_or_create", lambda: (private, device_public))
+    monkeypatch.setattr(cli.policy, "digest", lambda: "policy-hash")
+    saved = []
+    monkeypatch.setattr(config, "save", lambda data: saved.append(data))
+    body = canonical_json({"device_id": "device-1", "relay_public_key": b64u(public)})
+    ts = int(time.time())
+    path = "/api/plugins/hermes-hands/pair"
+
+    def post(url, **kwargs):
+        request = httpx.Request("POST", url, headers=kwargs["headers"], content=kwargs["content"])
+        return httpx.Response(200, content=body, request=request, headers={
+            "X-Hands-Ts": str(ts), "X-Hands-Nonce": "relay-nonce",
+            "X-Hands-Signature": sign_request(private, R2D, ts, "relay-nonce", "POST", path, body),
+        })
+
+    monkeypatch.setattr(cli.httpx, "post", post)
+    assert cli._pair("https://example.test", "test device", "pair-code") == 0
+    assert saved == [{"gateway_url": "https://example.test/api/plugins/hermes-hands", "device_id": "device-1", "relay_public_key": b64u(public)}]
 
 
 def test_loop_rejects_bad_signature(monkeypatch):
