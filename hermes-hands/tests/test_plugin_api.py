@@ -2,11 +2,8 @@
 the plugin package is imported the way the plugin loader does (``hermes_plugins.<slug>``), the
 dashboard file on its own, and requests go through the real token-auth middleware."""
 
-import importlib.util
 import sys
 import time
-import types
-from pathlib import Path
 
 import pytest
 
@@ -14,72 +11,26 @@ pytest.importorskip("fastapi")
 pytest.importorskip("hermes_cli.dashboard_auth.token_auth")
 pytest.importorskip("agent.secret_scope")
 
-from fastapi import FastAPI  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
 from hermes_cli.dashboard_auth import registry, token_auth  # noqa: E402
 
 from hands import protocol  # noqa: E402
-from hands_fakes import hands_db  # noqa: E402,F401  (fixture)
+from hands_fakes import (  # noqa: E402
+    PLUGIN_DIR,
+    RegisterCtx,
+    hands_db,  # noqa: F401  (fixture)
+    load_plugin_api,
+    load_plugin_package,
+    make_app,
+)
 
-PLUGIN_DIR = Path(__file__).resolve().parents[1]
 SEED = "9a" * 32
-
-
-class Ctx:
-    def __init__(self):
-        self.config = {}
-        self.calls = []
-
-    def get_config(self, key, default=None):
-        return self.config.get(key, default)
-
-    def register_terminal_environment_provider(self, provider):
-        self.calls.append(("terminal", provider))
-
-    def register_dashboard_auth_provider(self, provider):
-        registry.register_global_provider(provider)  # what PluginContext does (plugins.py:737-778)
-        self.calls.append(("auth", provider))
-
-    def register_command(self, name, handler, **kwargs):
-        self.calls.append(("command", name))
-
-    def register_cli_command(self, name, *args, **kwargs):
-        self.calls.append(("cli", name))
-
-    def register_tool(self, *, name, **kwargs):
-        self.calls.append(("tool", name))
-
-
-def load_plugin_package():
-    """``hermes_plugins.hermes_hands`` exactly as plugins_loader.py:811-837 imports it."""
-    sys.modules.setdefault("hermes_plugins", types.ModuleType("hermes_plugins")).__path__ = []
-    name = "hermes_plugins.hermes_hands"
-    for key in [k for k in sys.modules if k == name or k.startswith(name + ".")]:
-        del sys.modules[key]
-    spec = importlib.util.spec_from_file_location(
-        name, PLUGIN_DIR / "__init__.py", submodule_search_locations=[str(PLUGIN_DIR)]
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_plugin_api():
-    """The dashboard file on its own, as web_server_dashboard.py:1233-1246 imports it."""
-    name = "hermes_dashboard_plugin_hermes-hands"
-    spec = importlib.util.spec_from_file_location(name, PLUGIN_DIR / "dashboard" / "plugin_api.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.fixture
 def plugin(hands_db, monkeypatch):
     monkeypatch.setenv("HANDS_RELAY_SEED", SEED)
     package = load_plugin_package()
-    ctx = Ctx()
+    ctx = RegisterCtx()
     package.register(ctx)
     hands = sys.modules["hermes_plugins.hermes_hands.hands"]
     monkeypatch.setattr(hands.relay.Relay, "start", lambda self: None)
@@ -89,15 +40,6 @@ def plugin(hands_db, monkeypatch):
     registry.unregister_global_provider(provider.name, provider)
     token_auth.clear_token_routes()
     hands.client.configure("http://127.0.0.1:9119", None)
-
-
-def make_app(plugin_api, *, gateway: bool = False) -> TestClient:
-    app = FastAPI()
-    app.middleware("http")(token_auth.token_auth_middleware)
-    app.include_router(plugin_api.router, prefix="/api/plugins/hermes-hands")
-    if gateway:
-        app.state.gateway_runner = object()
-    return TestClient(app)
 
 
 def signed(device_id, private, path, body: bytes) -> dict:
@@ -128,7 +70,7 @@ def test_register_wires_everything(plugin):
 def test_register_without_seed_still_serves_the_server_target(hands_db, monkeypatch):
     monkeypatch.delenv("HANDS_RELAY_SEED", raising=False)
     package = load_plugin_package()
-    ctx = Ctx()
+    ctx = RegisterCtx()
     package.register(ctx)
     provider = dict((kind, obj) for kind, obj in ctx.calls if kind == "auth")["auth"]
     try:

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import functools
+import importlib.util
 import json
 import sqlite3
 import sys
@@ -14,6 +15,7 @@ import threading
 import time
 import types
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 import pytest
@@ -21,6 +23,7 @@ import pytest
 from hands import client, protocol, relay, store
 
 SEED = "ab" * 32
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
 _LOCAL_ROUTES = {
     "/local/exec": "local_exec",
     "/local/output": "local_output",
@@ -158,3 +161,74 @@ class Agent:
                 output, returncode = self.run(job)
                 self._result(job["job_id"], 0, output)
                 self._result(job["job_id"], 1, done=True, returncode=returncode)
+
+
+class RegisterCtx:
+    """The parts of ``PluginContext`` that ``register()`` and the terminal backend use."""
+
+    def __init__(self):
+        self.config = {}
+        self.calls = []
+
+    def get_config(self, key, default=None):
+        return self.config.get(key, default)
+
+    def current_cron_execution(self):
+        return None
+
+    def register_terminal_environment_provider(self, provider):
+        self.calls.append(("terminal", provider))
+
+    def register_dashboard_auth_provider(self, provider):
+        from hermes_cli.dashboard_auth import registry
+
+        registry.register_global_provider(provider)  # what PluginContext does (plugins.py:737-778)
+        self.calls.append(("auth", provider))
+
+    def register_command(self, name, handler, **kwargs):
+        self.calls.append(("command", name))
+
+    def register_cli_command(self, name, *args, **kwargs):
+        self.calls.append(("cli", name))
+
+    def register_tool(self, *, name, **kwargs):
+        self.calls.append(("tool", name))
+
+
+def load_plugin_package():
+    """``hermes_plugins.hermes_hands`` exactly as plugins_loader.py:811-837 imports it."""
+    sys.modules.setdefault("hermes_plugins", types.ModuleType("hermes_plugins")).__path__ = []
+    name = "hermes_plugins.hermes_hands"
+    for key in [k for k in sys.modules if k == name or k.startswith(name + ".")]:
+        del sys.modules[key]
+    spec = importlib.util.spec_from_file_location(
+        name, PLUGIN_DIR / "__init__.py", submodule_search_locations=[str(PLUGIN_DIR)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_plugin_api():
+    """The dashboard file on its own, as web_server_dashboard.py:1233-1246 imports it."""
+    name = "hermes_dashboard_plugin_hermes-hands"
+    spec = importlib.util.spec_from_file_location(name, PLUGIN_DIR / "dashboard" / "plugin_api.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def make_app(plugin_api, *, gateway: bool = False, base_url: str = "http://testserver"):
+    """A dashboard-shaped app: the real token-auth middleware in front of the plugin router."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from hermes_cli.dashboard_auth import token_auth
+
+    app = FastAPI()
+    app.middleware("http")(token_auth.token_auth_middleware)
+    app.include_router(plugin_api.router, prefix=relay.API)
+    if gateway:
+        app.state.gateway_runner = object()
+    return TestClient(app, base_url=base_url)
