@@ -43,21 +43,19 @@ TOKEN_ROUTES = tuple(
 )
 SCOPE_PAIR = "hands:pair"
 SCOPE_DEVICE = "hands:device"
-SCOPE_UNKNOWN = "hands:unknown"  # a well-formed device bearer whose device_id is not paired
+SCOPE_REVOKED = "hands:revoked"  # a fresh bearer signed by a revoked device's key
 SCOPE_LOCAL = "hands:local"
 
-UNREACHABLE = 255  # nothing ran: device offline, revoked or refused, relay down
+UNREACHABLE = 255  # the gateway's own exit code; its hands: line says whether anything ran
 CANCELLED = 137
 MAX_POLL_WAIT = 25
 MAX_OUTPUT_WAIT = 20
+MAX_JOB_TEXT = 16_000_000  # characters in an exec job's script, and in its stdin
 MAX_PNG_BYTES = 2 * 1024 * 1024
 _MAX_PNG_B64 = 4 * -(-MAX_PNG_BYTES // 3)
 _LIVENESS_EVERY = 1.0
 _ABANDONED_AFTER = 60  # seconds without a gateway fetch: the caller is gone, cancel the job
 _HEARTBEAT_EVERY = 5
-_UNKNOWN_LIMIT = 10  # unknown_device replies per client address per window
-_UNKNOWN_WINDOW = 60.0
-_UNKNOWN_TRACKED = 10_000  # addresses remembered before expired windows are dropped
 
 logger = logging.getLogger(__name__)
 
@@ -146,23 +144,25 @@ class Relay:
         self._jobs: dict[str, _Job] = {}
         self._queues: dict[str, deque] = {}
         self._nonces = protocol.NonceCache()
-        self._unknown_hits: dict[
-            str, tuple[float, int]
-        ] = {}  # client address -> (window start, count)
         self._refused: set[str] = set()  # devices currently refused for a changed deny-list
+        self._instances: dict[str, str] = {}  # device id -> the agent process it last reported
+        self._polls: dict[str, int] = {}  # device id -> generation of its newest poll
         # Long-polls waiting for a change, by device id (a queued job) or job id (output, the end).
         self._waiters: dict[str, set[tuple[asyncio.AbstractEventLoop, asyncio.Future]]] = {}
 
     # --- lifecycle -----------------------------------------------------------------------------
     def start(self) -> None:
+        """Write the first liveness row before this relay answers its first request, so a caller
+        can read ``store.relay_alive`` right after it; a daemon thread keeps the row fresh."""
+        self._beat()
         threading.Thread(
             target=self._heartbeat_loop, name="hermes-hands-relay", daemon=True
         ).start()
 
     def _heartbeat_loop(self) -> None:
         while True:
-            self._beat()
             time.sleep(_HEARTBEAT_EVERY)
+            self._beat()
 
     def _beat(self) -> None:
         """Write the liveness row the gateway reads (``store.relay_alive``) and reap abandoned jobs."""
@@ -194,21 +194,26 @@ class Relay:
         )
 
     def _finish_locked(self, job: _Job, returncode: int, error: str) -> None:
+        """End ``job`` for any reason but the device's own done; a job the device picked up is
+        also cancelled there, so abandoned work never keeps running on the device."""
         job.done, job.returncode, job.error = True, returncode, error
         self._wake_locked(job.job_id)
-
-    def _cancel_locked(self, job: _Job) -> None:
-        if job.done:
-            return
-        self._finish_locked(job, CANCELLED, messages.cancelled(job.device_name))
         if job.picked:
             cancel = {"job_id": secrets.token_hex(8), "type": "cancel", "target_job_id": job.job_id}
             self._queues.setdefault(job.device_id, deque()).append(cancel)
             self._wake_locked(job.device_id)
 
+    def _cancel_locked(self, job: _Job) -> None:
+        if not job.done:
+            self._finish_locked(job, CANCELLED, messages.cancelled(job.device_name))
+
     def _fail_device(self, device_id: str, error: str) -> None:
+        """Fail every job of the device and end its parked polls: a poll that began before this
+        refusal must not hand out a job, which would tell the device its old hash is accepted. Its
+        queue stays: finished jobs are never handed out (``_pop_locked``), and the cancels for the
+        picked ones must still reach it."""
         with self._lock:
-            self._queues.pop(device_id, None)
+            self._supersede_polls_locked(device_id)
             for job in self._jobs.values():
                 if job.device_id == device_id and not job.done:
                     self._finish_locked(job, UNREACHABLE, error)
@@ -292,13 +297,13 @@ class Relay:
         The token provider checked the bearer's signature and freshness; this checks the request
         signature (X-Hands-Signature) over the same ts and nonce, and only then burns the nonce, so a
         caller without the device key cannot burn one. ``NonceCache.check_and_add`` is atomic, so of
-        two concurrent copies of one request exactly one gets through. Refusals here are unsigned: a
-        caller that has not proven a device key never gets a relay signature."""
+        two concurrent copies of one request exactly one gets through. A revoked device (also one
+        revoked after the token seam ran) proves its tombstoned key the same way and then gets the
+        signed ``unknown_device``. Other refusals here are unsigned: a caller that has not proven a
+        device key never gets a relay signature."""
         bearer = protocol.parse_bearer(_bearer(headers))
-        if _has(principal, SCOPE_UNKNOWN):
-            return None, None, self._unknown(peer)
         if (
-            not _has(principal, SCOPE_DEVICE)
+            not (_has(principal, SCOPE_DEVICE) or _has(principal, SCOPE_REVOKED))
             or bearer is None
             or bearer.device_id != principal.principal
         ):
@@ -308,10 +313,9 @@ class Relay:
                 Reply.json(401, {"error": "unauthenticated", "detail": messages.UNAUTHENTICATED}),
             )
         device = store.device_by_id(bearer.device_id)
-        if device is None:
-            return None, None, self._unknown(peer)
-        if not protocol.verify_request(
-            device["public_key"],
+        public_key = store.revoked_key(bearer.device_id) if device is None else device["public_key"]
+        if public_key is None or not protocol.verify_request(
+            public_key,
             headers.get("x-hands-signature", ""),
             protocol.D2R,
             bearer.ts,
@@ -327,40 +331,48 @@ class Relay:
             )
         if not self._nonces.check_and_add(bearer.nonce, int(time.time())):
             return None, None, Reply.json(401, {"error": "replayed", "detail": messages.REPLAYED})
+        if device is None:
+            return None, None, self._unknown(bearer.device_id, path, bearer.nonce, peer)
         return device, bearer.nonce, None
 
-    def _unknown(self, peer: str) -> Reply:
-        """``401 unknown_device`` (the device stops on it), unsigned, at most ``_UNKNOWN_LIMIT`` per
-        client address per window; logged here because a forged bearer leaves no token-auth audit row."""
-        now = time.monotonic()
-        with self._lock:
-            start, count = self._unknown_hits.get(peer, (now, 0))
-            if now - start > _UNKNOWN_WINDOW:
-                start, count = now, 0
-            self._unknown_hits[peer] = (start, count + 1)
-            if len(self._unknown_hits) > _UNKNOWN_TRACKED:
-                self._unknown_hits = {
-                    ip: hit
-                    for ip, hit in self._unknown_hits.items()
-                    if now - hit[0] <= _UNKNOWN_WINDOW
-                }
-                if len(self._unknown_hits) > _UNKNOWN_TRACKED:
-                    self._unknown_hits.clear()
-        if count >= _UNKNOWN_LIMIT:
-            if count == _UNKNOWN_LIMIT:
-                logger.warning("hermes-hands: rate-limiting unknown_device replies to %s", peer)
-            return Reply.json(429, {"error": "rate_limited", "detail": messages.RATE_LIMITED})
+    def _unknown(self, device_id: str, path: str, nonce: str, peer: str) -> Reply:
+        """The signed ``401 unknown_device`` that stops a revoked device, which proved its key; logged
+        here because the token seam writes no audit row for a principal it let through."""
         logger.warning(
-            "hermes-hands: unknown_device from %s (unpaired or revoked device bearer)", peer
+            "hermes-hands: revoked device %s called from %s; told it to stop", device_id, peer
         )
-        return Reply.json(401, {"error": "unknown_device", "detail": messages.UNKNOWN_DEVICE_WIRE})
+        return self._signed(
+            401, {"error": "unknown_device", "detail": messages.UNKNOWN_DEVICE_WIRE}, path, nonce
+        )
+
+    def _supersede_polls_locked(self, device_id: str) -> int:
+        """End every poll of the device parked here (each returns 204); the new poll generation."""
+        generation = self._polls[device_id] = self._polls.get(device_id, 0) + 1
+        self._wake_locked(device_id)
+        return generation
+
+    def _note_instance(self, device: dict, instance: str | None) -> None:
+        """A new agent process on the device: the old one's parked polls are dead connections and
+        the jobs it picked up died with it or are out of reach, so those polls end and those jobs
+        fail now instead of at the gateway's timeout."""
+        if instance is None:
+            return
+        with self._lock:
+            previous = self._instances.get(device["device_id"])
+            self._instances[device["device_id"]] = instance
+            if previous is None or previous == instance:
+                return
+            self._supersede_polls_locked(device["device_id"])
+            for job in self._jobs.values():
+                if job.device_id == device["device_id"] and job.picked and not job.done:
+                    self._finish_locked(job, UNREACHABLE, messages.agent_restarted(device["name"]))
 
     def _seen_refusal(
         self, ok: bool | None, device: dict, path: str, nonce: str, peer: str
     ) -> Reply | None:
         """The reply for a device whose ``record_seen`` came back unknown or policy-refused, else None."""
         if ok is None:
-            return self._unknown(peer)
+            return self._unknown(device["device_id"], path, nonce, peer)
         if not ok:
             self._fail_device(device["device_id"], messages.policy_changed(device["name"]))
             reply = self._signed(
@@ -429,28 +441,45 @@ class Relay:
         return reply
 
     async def device_poll(self, principal, headers, path: str, body: bytes, peer: str) -> Reply:
+        """Long-poll for the device's next job. Only a device's newest poll can take one: an older
+        poll still parked here belongs to a connection the device dropped (an agent restart, a
+        network change), so it returns 204 instead of handing a job to nobody."""
         device, nonce, refusal = await asyncio.to_thread(
             self._device, principal, headers, path, body, peer
         )
         if refusal is not None:
             return refusal
         try:
-            wait = min(max(int(json.loads(body).get("wait", MAX_POLL_WAIT)), 0), MAX_POLL_WAIT)
+            request = json.loads(body)
+            wait = min(max(int(request.get("wait", MAX_POLL_WAIT)), 0), MAX_POLL_WAIT)
+            instance = None if request.get("instance") is None else str(request["instance"])
+            policy_hash = (
+                None if request.get("policy_hash") is None else str(request["policy_hash"])
+            )
         except (ValueError, TypeError, AttributeError):
             return self._signed(
                 400, {"error": "bad_request", "detail": messages.BAD_REQUEST}, path, nonce
             )
-        ok = await asyncio.to_thread(store.record_seen, device["device_id"])
+        # A job reply to a poll that carried a hash tells the device that hash is the accepted one.
+        ok = await asyncio.to_thread(
+            store.record_seen, device["device_id"], policy_hash=policy_hash
+        )
         refusal = self._seen_refusal(ok, device, path, nonce, peer)
         if refusal is not None:
             return refusal
+        self._note_instance(device, instance)
         device_id, deadline = device["device_id"], time.monotonic() + wait
+        with self._lock:
+            generation = self._supersede_polls_locked(device_id)
         while True:
             with self._lock:
-                job = self._pop_locked(device_id)
+                newest = self._polls[device_id] == generation
+                job = self._pop_locked(device_id) if newest else None
                 remaining = deadline - time.monotonic()
                 waiter = (
-                    None if job is not None or remaining <= 0 else self._waiter_locked(device_id)
+                    None
+                    if job is not None or not newest or remaining <= 0
+                    else self._waiter_locked(device_id)
                 )
             if job is not None:
                 return self._signed(200, job, path, nonce)
@@ -521,6 +550,7 @@ class Relay:
         try:
             beat = json.loads(body)
             policy_hash, device_os, home = (str(beat[k]) for k in ("policy_hash", "os", "home"))
+            instance = None if beat.get("instance") is None else str(beat["instance"])
         except (ValueError, KeyError, TypeError, AttributeError):
             return self._signed(
                 400, {"error": "bad_request", "detail": messages.BAD_REQUEST}, path, nonce
@@ -531,6 +561,7 @@ class Relay:
         refusal = self._seen_refusal(ok, device, path, nonce, peer)
         if refusal is not None:
             return refusal
+        self._note_instance(device, instance)
         return self._signed(200, {"ok": True}, path, nonce)
 
     # --- local routes (gateway loopback client) ------------------------------------------------
@@ -555,12 +586,16 @@ class Relay:
                     "login": bool(request.get("login", False)),
                     "timeout": int(request["timeout"]),
                 }
+                if request.get("stdin") is not None:
+                    extra["stdin"] = str(request["stdin"])
             elif kind == "screenshot":
                 extra = {}
             else:
                 raise ValueError(f"unknown job type {kind!r}")
         except (ValueError, KeyError, TypeError, AttributeError):
             return Reply.json(400, {"error": "bad_request", "detail": messages.BAD_REQUEST})
+        if any(len(extra.get(key, "")) > MAX_JOB_TEXT for key in ("script", "stdin")):
+            return Reply.json(413, {"error": "too_large", "detail": messages.JOB_TOO_LARGE})
         device = await asyncio.to_thread(store.get_device, name)
         if device is None:
             return Reply.json(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import shlex
 
-from . import messages, store
+from . import client, messages, store
 
 
 def _ids(value: object) -> set[str]:
@@ -28,8 +28,9 @@ def _is_owner(ctx, platform: str, source) -> bool:
     user_id = getattr(source, "user_id", None)
     if not user_id:
         return False
-    if f"{platform}:{user_id}" in _ids(ctx.get_config("owner_ids", default=[])):
-        return True
+    owners = _ids(ctx.get_config("owner_ids", default=[]))
+    if owners:
+        return f"{platform}:{user_id}" in owners
     try:
         from gateway.config import load_gateway_config
 
@@ -48,7 +49,7 @@ def _is_owner(ctx, platform: str, source) -> bool:
         return False
 
 
-def register_commands(ctx) -> None:
+def register_commands(ctx, *, has_seed: bool) -> None:
     def handle(raw_args: str, *, session_id="", session_key="", platform="", source=None) -> str:
         try:
             args = shlex.split(raw_args)
@@ -57,11 +58,16 @@ def register_commands(ctx) -> None:
         action = args[0].lower() if args else "status"
         if action == "status":
             devices = store.list_devices()
-            relay = "up" if store.relay_alive() else "down"
+            relay, cause = "up", []
+            if not store.relay_alive():
+                try:
+                    client.state()
+                except client.HandsError as exc:
+                    relay, cause = "down", [str(exc)]
             target = store.get_session_target(session_key) if session_key else None
             status = f"Hands: relay {relay}; target {target or ctx.get_config('default_target', default='server')}; {len(devices)} device(s)."
             alerts = messages.alerts(devices)
-            return "\n".join([status, *alerts])
+            return "\n".join([status, *cause, *alerts])
         if action == "devices" and len(args) == 1:
             devices = store.list_devices()
             if not devices:
@@ -74,11 +80,18 @@ def register_commands(ctx) -> None:
         if action == "setup" and len(args) == 1:
             user_id = getattr(source, "user_id", None)
             owner_id = f"{platform}:{user_id}" if user_id else "local owner"
-            return f"Owner: {owner_id}\nSet desktop placement with: hermes config set bot_desktop.placement gateway"
+            return (
+                f"Owner: {owner_id}\n"
+                "Select the Hands backend with: hermes config set terminal.backend hands\n"
+                "Set desktop placement with: hermes config set bot_desktop.placement gateway\n"
+                "Then restart the gateway and the dashboard."
+            )
         if len(args) != 2:
             return f"Usage: /hands {action} <name>"
         name = args[1]
         if action == "pair":
+            if not has_seed:
+                return messages.NOT_SET_UP
             code = store.mint_pairing_code(name)
             from hermes_cli.config import load_config_readonly
 
@@ -88,9 +101,18 @@ def register_commands(ctx) -> None:
                 or dashboard.get("public_url")
                 or ctx.get_config("dashboard_url", default="http://127.0.0.1:9119")
             )
-            command = f"hermes-hands pair {gateway_url} --name {shlex.quote(name)} --code {shlex.quote(code)}"
+            command = f"hermes-hands pair {gateway_url} --name {shlex.quote(name)} --code={shlex.quote(code)}"
             return f"Pair code: {code}\nRun on the device: {command}"
         if action == "use":
+            from hermes_cli.config import load_config_readonly
+
+            backend = ((load_config_readonly() or {}).get("terminal") or {}).get("backend")
+            if name != "server" and backend != "hands":
+                return (
+                    f"Hands: terminal.backend is {backend or 'not set'}, not hands, so commands would still run on "
+                    "this host. Run hermes config set terminal.backend hands on the gateway host, then restart "
+                    "the gateway."
+                )
             device = store.get_device(name)
             if name != "server" and device is None:
                 return f"No paired device named {name}."

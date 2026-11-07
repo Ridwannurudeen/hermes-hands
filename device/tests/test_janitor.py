@@ -25,9 +25,10 @@ def test_cleanup_removes_only_old_regular_matching_files(monkeypatch, tmp_path, 
     unrelated = temp_dir / "hermes-snap-old.txt"
     old_script = out_dir / "tmp-old.sh"
     new_script = out_dir / "tmp-new.sh"
+    shared_tmp_script = temp_dir / "tmp-user.sh"
     old_log = out_dir / "old.log"
     new_log = out_dir / "new.log"
-    for path in (old_snapshot, new_snapshot, old_cwd, unrelated, old_script, new_script, old_log, new_log):
+    for path in (old_snapshot, new_snapshot, old_cwd, unrelated, old_script, new_script, shared_tmp_script, old_log, new_log):
         path.write_text("content", encoding="utf-8")
     old_time = time.time() - janitor.MAX_AGE_SECONDS - 1
     for path in (old_snapshot, old_cwd, old_script):
@@ -46,6 +47,7 @@ def test_cleanup_removes_only_old_regular_matching_files(monkeypatch, tmp_path, 
     assert not old_snapshot.exists()
     assert not old_cwd.exists()
     assert not old_script.exists()
+    assert shared_tmp_script.exists()
     assert not old_log.exists()
     assert new_snapshot.exists()
     assert new_script.exists()

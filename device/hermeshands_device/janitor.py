@@ -41,8 +41,8 @@ def _temp_dirs() -> set[Path]:
     return candidates
 
 
-def _matches(name: str) -> bool:
-    return name.startswith("hermes-snap-") and name.endswith(".sh") or name.startswith("hermes-cwd-") and name.endswith(".txt") or name.startswith("tmp") and name.endswith(".sh")
+def _matches(name: str, *, output_dir: bool = False) -> bool:
+    return name.startswith("hermes-snap-") and name.endswith(".sh") or name.startswith("hermes-cwd-") and name.endswith(".txt") or output_dir and name.startswith("tmp") and name.endswith(".sh")
 
 
 def cleanup(now: float | None = None) -> int:
@@ -59,7 +59,7 @@ def cleanup(now: float | None = None) -> int:
         with entries:
             for entry in entries:
                 is_out_log = directory == config.OUT_DIR and entry.name.endswith(".log")
-                if not (_matches(entry.name) or is_out_log) or not entry.is_file(follow_symlinks=False):
+                if not (_matches(entry.name, output_dir=directory == config.OUT_DIR) or is_out_log) or not entry.is_file(follow_symlinks=False):
                     continue
                 try:
                     age_cutoff = log_cutoff if is_out_log else cutoff

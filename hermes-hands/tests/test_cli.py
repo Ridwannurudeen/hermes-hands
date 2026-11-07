@@ -43,34 +43,106 @@ def test_setup_writes_seed_once_and_owner(monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "hermes_cli.gateway_setup_wizard", wizard)
     monkeypatch.setattr("builtins.input", lambda prompt: "12345")
     ctx = Context()
-    cli.register_cli(ctx)
+    cli.register_cli(ctx, has_seed=True)
     args = types.SimpleNamespace(hands_action="setup")
     ctx.handler(args)
     ctx.handler(args)
     assert len(calls) == 1
     assert len(calls[0]["HANDS_RELAY_SEED"]) == 64
     assert ctx.set_calls == [("owner_ids", ["telegram:12345"])] * 2
-    assert "hermes config set bot_desktop.placement gateway" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "hermes config set terminal.backend hands" in out
+    assert "hermes config set bot_desktop.placement gateway" in out
+    assert "restart the gateway" in out
 
 
-def test_doctor_reports_each_deployment_check(monkeypatch, capsys):
+def install_doctor_modules(monkeypatch, config):
     hermes_cli = types.ModuleType("hermes_cli")
     hermes_cli.__path__ = []
-    config = types.ModuleType("hermes_cli.config")
-    config.load_config_readonly = lambda: {"dashboard": {"public_url": "https://hands.example"}}
+    config_module = types.ModuleType("hermes_cli.config")
+    config_module.load_config_readonly = lambda: config
     auth = types.ModuleType("hermes_cli.dashboard_auth")
     auth.list_interactive_providers = lambda: [object()]
     monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
-    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config_module)
     monkeypatch.setitem(sys.modules, "hermes_cli.dashboard_auth", auth)
-    monkeypatch.setattr(cli.httpx, "get", lambda url, timeout: types.SimpleNamespace(is_success=True))
-    monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
+
+
+def run_doctor(capsys):
     ctx = Context()
-    cli.register_cli(ctx)
+    cli.register_cli(ctx, has_seed=True)
     ctx.handler(types.SimpleNamespace(hands_action="doctor"))
-    lines = capsys.readouterr().out.splitlines()
-    assert len(lines) == 4
+    return capsys.readouterr().out.splitlines()
+
+
+def test_doctor_reports_each_deployment_check(monkeypatch, capsys):
+    install_doctor_modules(
+        monkeypatch, {"terminal": {"backend": "hands"}, "dashboard": {"public_url": "https://hands.example"}}
+    )
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True, "devices": [], "alerts": []})
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
+    lines = run_doctor(capsys)
+    assert len(lines) == 5
     assert all(line.startswith("PASS ") for line in lines)
+
+
+def test_doctor_names_the_backend_and_the_relay_refusal(monkeypatch, capsys):
+    install_doctor_modules(
+        monkeypatch, {"terminal": {"backend": "local"}, "dashboard": {"public_url": "https://hands.example"}}
+    )
+
+    def refuse():
+        raise cli.client.HandsError("hands: the relay is not reachable.")
+
+    monkeypatch.setattr(cli.client, "state", refuse)
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: False)
+    lines = run_doctor(capsys)
+    assert lines[0] == (
+        "FAIL terminal.backend is hands: It is local. Run hermes config set terminal.backend hands, "
+        "then restart the gateway."
+    )
+    assert lines[1] == "FAIL Relay answers at dashboard_url: hands: the relay is not reachable."
+    assert lines[4] == "FAIL Shared plugin_data_dir: Fix the relay check first."
+
+
+def test_doctor_reads_the_heartbeat_only_after_the_relay_answered(monkeypatch, capsys):
+    """/local/state starts the relay, which writes its first heartbeat row before replying."""
+    install_doctor_modules(
+        monkeypatch, {"terminal": {"backend": "hands"}, "dashboard": {"public_url": "https://hands.example"}}
+    )
+    calls = []
+    monkeypatch.setattr(cli.client, "state", lambda: calls.append("state") or {"relay": True})
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: calls.append("heartbeat") or "state" in calls)
+    assert run_doctor(capsys)[4] == "PASS Shared plugin_data_dir"
+    assert calls == ["state", "heartbeat"]
+
+
+def test_doctor_blames_hermes_home_only_when_the_relay_answers(monkeypatch, capsys):
+    install_doctor_modules(
+        monkeypatch, {"terminal": {"backend": "hands"}, "dashboard": {"public_url": "https://hands.example"}}
+    )
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True, "devices": [], "alerts": []})
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: False)
+    assert run_doctor(capsys)[4] == (
+        "FAIL Shared plugin_data_dir: Run the gateway and dashboard with the same HERMES_HOME."
+    )
+
+
+def test_status_asks_a_relay_that_has_no_fresh_heartbeat(monkeypatch, capsys):
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: False)
+    monkeypatch.setattr(cli.store, "list_devices", lambda: [])
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True, "devices": [], "alerts": []})
+    ctx = Context()
+    cli.register_cli(ctx, has_seed=True)
+    ctx.handler(types.SimpleNamespace(hands_action="status"))
+    assert capsys.readouterr().out == "Relay: up\n"
+
+    def refuse():
+        raise cli.client.HandsError("hands: the relay is not reachable.")
+
+    monkeypatch.setattr(cli.client, "state", refuse)
+    ctx.handler(types.SimpleNamespace(hands_action="status"))
+    assert capsys.readouterr().out == "Relay: down\nhands: the relay is not reachable.\n"
 
 
 def test_pair_cli_mints_code_and_prints_device_command(monkeypatch, capsys):
@@ -82,7 +154,7 @@ def test_pair_cli_mints_code_and_prints_device_command(monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
     monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name: "pair-code")
     ctx = Context()
-    cli.register_cli(ctx)
+    cli.register_cli(ctx, has_seed=True)
     parser = argparse.ArgumentParser()
     ctx.setup_fn(parser)
     args = parser.parse_args(["pair", "my laptop"])
@@ -91,8 +163,22 @@ def test_pair_cli_mints_code_and_prints_device_command(monkeypatch, capsys):
 
     assert capsys.readouterr().out == (
         "Pair code: pair-code\n"
-        "Run on the device: hermes-hands pair https://hands.example.com --name 'my laptop' --code pair-code\n"
+        "Run on the device: hermes-hands pair https://hands.example.com --name 'my laptop' --code=pair-code\n"
     )
+
+
+def test_pair_cli_refuses_without_a_relay_seed(monkeypatch, capsys):
+    minted = []
+    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name: minted.append(name) or "pair-code")
+    ctx = Context()
+    cli.register_cli(ctx, has_seed=False)
+    parser = argparse.ArgumentParser()
+    ctx.setup_fn(parser)
+
+    ctx.handler(parser.parse_args(["pair", "laptop"]))
+
+    assert capsys.readouterr().out == cli.messages.NOT_SET_UP + "\n"
+    assert minted == []
 
 
 def test_pair_cli_falls_back_to_dashboard_url(monkeypatch, capsys):
@@ -105,10 +191,10 @@ def test_pair_cli_falls_back_to_dashboard_url(monkeypatch, capsys):
     monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name: "pair-code")
     ctx = Context()
     ctx.config["dashboard_url"] = "http://127.0.0.1:9119"
-    cli.register_cli(ctx)
+    cli.register_cli(ctx, has_seed=True)
     parser = argparse.ArgumentParser()
     ctx.setup_fn(parser)
 
     ctx.handler(parser.parse_args(["pair", "laptop"]))
 
-    assert "hermes-hands pair http://127.0.0.1:9119 --name laptop --code pair-code" in capsys.readouterr().out
+    assert "hermes-hands pair http://127.0.0.1:9119 --name laptop --code=pair-code" in capsys.readouterr().out

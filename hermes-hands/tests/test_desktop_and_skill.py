@@ -132,7 +132,8 @@ def test_the_pane_reads_the_hands_command_output(hands_db, monkeypatch):
     """The pane runs /hands through slash.exec as a Desktop session (source None, platform desktop)
     and reads the target and the pairing reply out of the command's text."""
     ctx = CommandCtx()
-    commands.register_commands(ctx)
+    commands.register_commands(ctx, has_seed=True)
+    monkeypatch.setattr(commands.client, "state", lambda: {"relay": True, "devices": [], "alerts": []})
     store.set_session_target("k", "my laptop")
     refused = Device("box")
     store.record_seen(refused.device_id, policy_hash="changed")
@@ -149,4 +150,17 @@ def test_the_pane_reads_the_hands_command_output(hands_db, monkeypatch):
     code = _pane_pattern("PAIR_CODE").search(reply).group(1)
     command = _pane_pattern("PAIR_COMMAND").search(reply).group(1)
     assert store.pairing_code_name(code) == "new pc"
-    assert command.startswith("hermes-hands pair ") and command.endswith(f"--name 'new pc' --code {code}")
+    assert command.startswith("hermes-hands pair ") and command.endswith(f"--name 'new pc' --code={code}")
+
+
+def test_the_relay_seed_setting_names_the_variable_the_plugin_reads(hands_db, monkeypatch):
+    """The Plugins settings form shows the seed as set, and writes it where ``register()`` reads it."""
+    pytest.importorskip("hermes_cli.plugins_settings")
+    from hermes_cli.plugins_settings import plugin_settings_fields
+
+    monkeypatch.setenv("HERMES_HOME", str(hands_db))
+    monkeypatch.setenv("HANDS_RELAY_SEED", "ab" * 32)
+    [seed] = [f for f in plugin_settings_fields("hermes-hands", PLUGIN_DIR) if f["key"] == "HANDS_RELAY_SEED"]
+    assert seed["type"] == "secret"
+    assert seed["env"] == "HANDS_RELAY_SEED"
+    assert seed["has_value"] is True

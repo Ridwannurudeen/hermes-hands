@@ -25,8 +25,8 @@ def register(ctx) -> None:
     ctx.register_dashboard_auth_provider(auth.HandsTokenProvider(keys))
     for path in relay.TOKEN_ROUTES:
         register_token_route(path)
-    commands.register_commands(ctx)
-    cli.register_cli(ctx)
+    commands.register_commands(ctx, has_seed=keys is not None)
+    cli.register_cli(ctx, has_seed=keys is not None)
     tools.register_tools(ctx)
     ctx.register_skill(
         "hands",

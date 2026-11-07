@@ -71,14 +71,20 @@ def register_tools(ctx) -> None:
     ctx.register_tool(
         name="hands_screenshot",
         toolset="hands",
-        schema={"type": "object", "properties": {}, "additionalProperties": False},
+        schema={
+            "name": "hands_screenshot",
+            "description": "Capture a screenshot from the selected paired device.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
         handler=screenshot,
-        description="Capture a screenshot from the selected paired device.",
     )
     ctx.register_tool(
         name="hands_devices",
         toolset="hands",
-        schema={"type": "object", "properties": {}, "additionalProperties": False},
+        schema={
+            "name": "hands_devices",
+            "description": "List paired Hands devices and their status.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
         handler=devices,
-        description="List paired Hands devices and their status.",
     )

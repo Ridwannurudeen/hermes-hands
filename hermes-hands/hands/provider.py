@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 from agent.terminal_env_provider import TerminalEnvironmentProvider
 
-from .environment import HandsEnvironment
+from .environment import HandsEnvironment, ProbeEnvironment
 
 
 class HandsProvider(TerminalEnvironmentProvider):
@@ -34,6 +34,14 @@ class HandsProvider(TerminalEnvironmentProvider):
         return "~"
 
     @property
+    def strip_env_keys(self) -> frozenset:
+        """The relay seed, which ``hermes hands setup`` writes to the profile's .env: it derives the
+        relay's signing key and the local bearer that queues jobs on devices. Core strips these keys
+        from every subprocess it spawns, so a ``server`` command cannot read it
+        (agent/terminal_env_registry.py:71-85, tools/environments/local.py:333-370)."""
+        return frozenset({"HANDS_RELAY_SEED"})
+
+    @property
     def env_description(self) -> str:
         return "a device paired with Hermes Hands, or the gateway host for the server target"
 
@@ -49,5 +57,8 @@ class HandsProvider(TerminalEnvironmentProvider):
         image: Optional[str] = None,
         container_config: Optional[dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> HandsEnvironment:
+    ) -> HandsEnvironment | ProbeEnvironment:
+        # The id core's prompt builder creates its backend probe with (agent/prompt_builder.py:851).
+        if task_id == "prompt-backend-probe":
+            return ProbeEnvironment(cwd=cwd, timeout=timeout)
         return HandsEnvironment(self._ctx, cwd=cwd, timeout=timeout)

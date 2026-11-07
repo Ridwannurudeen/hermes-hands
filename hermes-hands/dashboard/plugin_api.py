@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import sys
 
 from fastapi import APIRouter, Request
@@ -80,7 +81,15 @@ async def _relay_call(request: Request, handler: str, **extra) -> Response:
         return _response(served)
     principal = getattr(request.state, "token_principal", None)
     body = await request.body()
-    reply = await getattr(served, handler)(principal, request.headers, request.url.path, body, **extra)
+    try:
+        reply = await getattr(served, handler)(
+            principal, request.headers, request.url.path, body, **extra
+        )
+    except sqlite3.Error:
+        logger.warning("hermes-hands: the relay could not use its store", exc_info=True)
+        return JSONResponse(
+            {"error": "store_down", "detail": hands.messages.RELAY_STORE_DOWN}, status_code=503
+        )
     if reply.devices_changed is not None:
         # Best effort: the pane's 2 s /ui/state poll is the main path (plugin_events.py:66-88).
         broadcast_plugin_event(_PROVIDER, "devices.changed", reply.devices_changed)

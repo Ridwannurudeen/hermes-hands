@@ -10,7 +10,8 @@ the drain thread stops about 300 ms after exit, and output still in flight then 
 process tree (``base.py:785-798``). Timeouts are core's: the device gets a later deadline, so
 ``poll()`` stays None past core's and core returns 124 with ``hermes_timed_out`` itself. With an
 ``inline_limit`` (terminal-tool calls only), output past it keeps its first and last halves around a
-note naming the device's full log (PLAN-v3 §1.4 Output).
+note naming the device's full log (PLAN-v3 §1.4 Output). Once the job is queued, losing the relay
+never reads as "nothing ran": the job is cancelled best effort and the note says it may still run.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ class RemoteProcessHandle:
         login: bool,
         timeout: int,
         inline_limit: int | None = None,
+        stdin: str | None = None,
     ):
         read_fd, write_fd = os.pipe()
         self._stdout = os.fdopen(read_fd, "r", encoding="utf-8-sig", errors="replace")
@@ -60,7 +62,7 @@ class RemoteProcessHandle:
         worker = contextvars.copy_context()
         threading.Thread(
             target=worker.run,
-            args=(self._run, device, script, login, timeout),
+            args=(self._run, device, script, login, timeout, stdin),
             name=f"hermes-hands-{device}",
             daemon=True,
         ).start()
@@ -139,11 +141,15 @@ class RemoteProcessHandle:
             self._write(f"\n{messages.output_omitted(self._omitted, job_id)}\n")
         self._write_bytes(bytes(self._tail))
 
-    def _run(self, device: str, script: str, login: bool, timeout: int) -> None:
+    def _run(self, device: str, script: str, login: bool, timeout: int, stdin: str | None) -> None:
         returncode, job_id, notice = UNREACHABLE, None, None
         try:
             job_id = client.start_job(
-                device, script=script, login=login, timeout=timeout + DEVICE_TIMEOUT_GRACE
+                device,
+                script=script,
+                login=login,
+                timeout=timeout + DEVICE_TIMEOUT_GRACE,
+                stdin=stdin,
             )
             with self._lock:
                 self._job_id = job_id
@@ -163,7 +169,12 @@ class RemoteProcessHandle:
                     )
                     return
         except client.HandsError as exc:
-            notice = str(exc)
+            if job_id is None:
+                notice = str(exc)
+            else:
+                logger.warning("hermes-hands: lost the relay during job %s: %s", job_id, exc)
+                self._cancel(job_id)
+                notice = messages.contact_lost(device)
         finally:
             self._flush_tail(job_id)
             if notice:

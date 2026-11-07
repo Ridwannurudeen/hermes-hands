@@ -48,4 +48,44 @@ def test_pair_accepts_base_and_plugin_prefix_urls(monkeypatch, capsys):
         "https://hands.example.com/api/plugins/hermes-hands/pair",
         "https://hands.example.com/api/plugins/hermes-hands/pair",
     ]
-    assert "use the base URL, e.g. https://hands.example.com" in capsys.readouterr().err
+    assert "unknown, expired or already used" in capsys.readouterr().err
+
+
+def test_pair_refuses_insecure_non_loopback_url(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "get_or_create", lambda: (_ for _ in ()).throw(AssertionError("must validate first")))
+    assert cli._pair("http://hands.example.com", "laptop", "code") == 1
+    assert "https" in capsys.readouterr().err
+    for url in ("http://localhost:9119", "http://127.0.0.1:9119", "http://[::1]:9119"):
+        monkeypatch.setattr(cli, "get_or_create", lambda: (b"p" * 32, b"q" * 32))
+        monkeypatch.setattr(cli.httpx, "post", lambda *args, **kwargs: types.SimpleNamespace(status_code=500, text="error"))
+        assert cli._pair(url, "laptop", "code") == 1
+
+
+def test_pair_reports_httpx_transport_error(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "get_or_create", lambda: (b"p" * 32, b"q" * 32))
+    monkeypatch.setattr(cli.policy, "digest", lambda: "policy")
+    def fail(url, **kwargs):
+        raise cli.httpx.ConnectError("connection refused", request=cli.httpx.Request("POST", url))
+    monkeypatch.setattr(cli.httpx, "post", fail)
+    assert cli._pair("https://hands.example.com", "laptop", "code") == 1
+    error = capsys.readouterr().err
+    assert "https://hands.example.com/api/plugins/hermes-hands/pair" in error
+    assert "connection refused" in error
+
+
+def test_doctor_executes_python_probe_and_names_windowsapps(monkeypatch, capsys):
+    monkeypatch.setattr(cli.executor, "resolve_bash", lambda: "bash.exe")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "git.exe")
+    monkeypatch.setattr(cli.config, "gateway_url", lambda: "")
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    calls = []
+    def run(args, **kwargs):
+        calls.append(args)
+        if "command -v python3" in args[-1]:
+            return types.SimpleNamespace(returncode=0, stdout="/c/Users/u/AppData/Local/Microsoft/WindowsApps/python3\n")
+        return types.SimpleNamespace(returncode=49, stdout="Python was not found\n")
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli._doctor() == 1
+    output = capsys.readouterr().out
+    assert "WindowsApps alias" in output
+    assert any('python3 -c "import sys; print(sys.version)"' in call[-1] for call in calls)

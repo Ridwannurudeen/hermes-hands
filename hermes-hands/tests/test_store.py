@@ -1,3 +1,4 @@
+import sqlite3
 import time
 
 import pytest
@@ -73,10 +74,36 @@ def test_device_listing_and_revoke_frees_the_name(hands_db):
     assert set(listed) == {"device_id", "name", "os", "home", "last_seen", "online", "policy_ok"}
     assert listed["online"] and listed["policy_ok"] and listed["device_id"] == device_id
     assert store.device_by_id(device_id)["public_key"] == b"k" * 32
+    assert store.revoked_key(device_id) is None
     assert store.revoke("laptop") is True
     assert store.revoke("laptop") is False
     assert store.get_device("laptop") is None and store.device_by_id(device_id) is None
-    _pair("laptop")
+    assert store.list_devices() == []
+    assert store.revoked_key(device_id) == b"k" * 32  # the tombstone keeps the key
+    again = _pair("laptop")
+    assert [d["device_id"] for d in store.list_devices()] == [again]
+    assert store.revoked_key(again) is None and store.revoked_key(device_id) == b"k" * 32
+
+
+def test_revoke_keeps_a_tombstone_in_a_hands_db_from_before_tombstones(hands_db):
+    """An existing hands.db (no revoked_devices table) is migrated in place on first use."""
+    conn = sqlite3.connect(hands_db / "hands.db")
+    conn.execute(
+        "CREATE TABLE devices (device_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,"
+        " public_key TEXT NOT NULL, os TEXT NOT NULL, home TEXT NOT NULL,"
+        " policy_hash TEXT NOT NULL, reported_policy_hash TEXT NOT NULL,"
+        " policy_ok INTEGER NOT NULL DEFAULT 1, paired_at INTEGER NOT NULL,"
+        " last_seen INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO devices VALUES ('d1', 'laptop', ?, 'Linux', '/h', 'p0', 'p0', 1, 0, 0)",
+        (protocol.b64u(b"k" * 32),),
+    )
+    conn.commit()
+    conn.close()
+    assert store.get_device("laptop")["device_id"] == "d1"
+    assert store.revoke("laptop") is True
+    assert store.revoked_key("d1") == b"k" * 32 and store.get_device("laptop") is None
 
 
 def test_offline_after_last_seen(hands_db, monkeypatch):

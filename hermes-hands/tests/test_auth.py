@@ -62,11 +62,26 @@ def test_stale_or_forged_bearer_is_refused(provider):
     )  # a forgery burns nothing
 
 
-def test_unpaired_device_gets_the_unknown_scope(provider):
+def test_only_a_revoked_key_gets_the_revoked_scope(provider):
     device = Device()
     store.revoke("laptop")
-    principal = provider.verify_token(token=bearer(device))
-    assert principal.scopes == (relay.SCOPE_UNKNOWN,) and principal.principal == device.device_id
+    assert provider.verify_token(token=bearer(device)) == TokenPrincipal(
+        principal=device.device_id, provider="hermes-hands", scopes=(relay.SCOPE_REVOKED,)
+    )
+    other_private, _ = protocol.generate_keypair()
+    assert provider.verify_token(token=bearer(device, private=other_private)) is None
+    assert provider.verify_token(token=bearer(device, ts=int(time.time()) - 301)) is None
+
+
+def test_unknown_or_unverifiable_device_bearers_get_no_principal(provider):
+    """C12: core's seam lets any principal through every token route, so nothing Hands cannot
+    verify may get one (the gateway drain bypass)."""
+    forged = "hands1.attacker.0.AAAAAAAAAAAAAAAAAAAAAA." + "A" * 86
+    assert protocol.parse_bearer(forged) is not None
+    assert provider.verify_token(token=forged) is None
+    never_paired = Device()
+    never_paired.device_id = "0123456789abcdef"
+    assert provider.verify_token(token=bearer(never_paired)) is None
 
 
 def test_pairing_code_until_used(provider):

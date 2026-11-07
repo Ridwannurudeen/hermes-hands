@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import queue
 import re
 import shutil
@@ -17,6 +18,7 @@ import psutil
 MAX_OUTPUT = 64 * 1024 * 1024
 CHUNK_SIZE = 16 * 1024
 PIPE_DRAIN_GRACE = 0.2
+OUTPUT_QUEUE_SIZE = 8
 _PROBED: dict[str, tuple[int, int, int]] = {}  # file identity for candidates whose probe passed
 
 
@@ -85,7 +87,50 @@ def _terminate(proc: subprocess.Popen, start_time: float) -> None:
             pass
 
 
-def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "job", on_start=None, on_exit=None) -> Iterator[bytes]:
+def terminate_recorded(pid: int, start_time: float) -> None:
+    try:
+        process = psutil.Process(pid)
+        current = process.create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return
+    if abs(current - start_time) > 0.01:
+        return
+    if os.name == "nt":
+        taskkill = shutil.which("taskkill")
+        if taskkill:
+            subprocess.run([taskkill, "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
+        else:
+            process.kill()
+    else:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def record_path(job_id: str) -> Path:
+    return Path.home() / ".hermes-hands" / "out" / f"{job_id}.process.json"
+
+
+def record_process(job_id: str, pid: int, start_time: float) -> None:
+    path = record_path(job_id)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(json.dumps({"pid": pid, "create_time": start_time}), encoding="utf-8")
+    if os.name != "nt":
+        path.chmod(0o600)
+
+
+def reap_recorded_processes() -> None:
+    out_dir = Path.home() / ".hermes-hands" / "out"
+    if not out_dir.exists():
+        return
+    for path in out_dir.glob("*.process.json"):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        terminate_recorded(int(record["pid"]), float(record["create_time"]))
+        path.unlink(missing_ok=True)
+
+
+def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "job", stdin: str | None = None, on_start=None, on_exit=None) -> Iterator[bytes]:
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job_id):
         raise ValueError("invalid job id")
     bash = resolve_bash()
@@ -98,66 +143,109 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
         script_path = Path(script_file.name)
     args = [bash, *( ["-l"] if login else []), str(script_path)]
     kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {"start_new_session": True}
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kwargs)
+    stdin_path = None
+    if stdin is not None:
+        with tempfile.NamedTemporaryFile("wb", dir=script_dir, delete=False) as stdin_file:
+            stdin_file.write(stdin.encode("utf-8"))
+            stdin_path = Path(stdin_file.name)
+        stdin_handle = stdin_path.open("rb")
+    else:
+        stdin_handle = subprocess.DEVNULL
+    env = None
+    if os.name == "nt":
+        env = dict(os.environ)
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+    try:
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=stdin_handle, env=env, **kwargs)
+    finally:
+        if stdin_path is not None:
+            stdin_handle.close()
     created = psutil.Process(proc.pid).create_time()
     if on_start:
+        record_process(job_id, proc.pid, created)
         on_start(proc, created)
-    chunks: queue.Queue[bytes | None] = queue.Queue()
+    chunks: queue.Queue[bytes | None] = queue.Queue(maxsize=OUTPUT_QUEUE_SIZE)
+    deadline = time.monotonic() + timeout
+    total = 0
+    capped = threading.Event()
+    exited = threading.Event()
+
+    def kill_at_deadline() -> None:
+        if proc.poll() is None:
+            _terminate(proc, created)
+
+    timer = threading.Timer(max(0, deadline - time.monotonic()), kill_at_deadline)
+    timer.daemon = True
+    timer.start()
 
     def read_output() -> None:
+        nonlocal total
         while True:
             chunk = proc.stdout.read1(CHUNK_SIZE)
             if not chunk:
-                chunks.put(None)
+                while True:
+                    try:
+                        chunks.put(None, timeout=0.05)
+                        return
+                    except queue.Full:
+                        if exited.is_set():
+                            return
+            available = MAX_OUTPUT - total
+            if len(chunk) > available:
+                chunk = chunk[:available]
+                capped.set()
+            total += len(chunk)
+            while True:
+                try:
+                    chunks.put(chunk, timeout=0.05)
+                    break
+                except queue.Full:
+                    if exited.is_set():
+                        return
+            if capped.is_set():
+                _terminate(proc, created)
                 return
-            chunks.put(chunk)
 
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
     output_path = Path.home() / ".hermes-hands" / "out" / f"{job_id}.log"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + timeout
-    total = 0
     try:
         with output_path.open("wb") as log:
-            exited_at = None
             while True:
                 now = time.monotonic()
-                if proc.poll() is not None and exited_at is None:
-                    exited_at = now
-                if exited_at is not None and now - exited_at >= PIPE_DRAIN_GRACE:
-                    break
-                if exited_at is None and now >= deadline:
+                if now >= deadline and proc.poll() is None:
                     _terminate(proc, created)
                     if on_exit:
                         on_exit(124)
                     yield b"[device timeout]\n"
                     return
                 try:
-                    wait_until = deadline if exited_at is None else exited_at + PIPE_DRAIN_GRACE
-                    chunk = chunks.get(timeout=min(0.1, max(0.01, wait_until - now)))
+                    chunk = chunks.get(timeout=PIPE_DRAIN_GRACE if proc.poll() is not None else 0.1)
                 except queue.Empty:
+                    if proc.poll() is not None:
+                        break
                     continue
                 if chunk is None:
                     break
-                available = MAX_OUTPUT - total
-                if available <= 0:
-                    _terminate(proc, created)
-                    yield b"[output truncated at 64 MiB]\n"
-                    return
-                chunk = chunk[:available]
-                total += len(chunk)
                 log.write(chunk)
                 yield chunk
-                if total >= MAX_OUTPUT:
-                    _terminate(proc, created)
-                    yield b"[output truncated at 64 MiB]\n"
-                    return
+            if capped.is_set():
+                if on_exit:
+                    on_exit(125)
+                yield b"[output truncated at 64 MiB]\n"
+                return
         proc.wait(timeout=max(0.1, deadline - time.monotonic()))
         if on_exit:
             on_exit(proc.returncode)
     finally:
+        exited.set()
+        timer.cancel()
         if proc.poll() is None:
             _terminate(proc, created)
             proc.wait()
         script_path.unlink(missing_ok=True)
+        if stdin_path is not None:
+            stdin_path.unlink(missing_ok=True)
+        record_path(job_id).unlink(missing_ok=True)

@@ -23,8 +23,9 @@ class FakeRelay:
         self.release = threading.Event()
         self.release.set()
 
-    def start_job(self, device, *, script, login, timeout):
+    def start_job(self, device, *, script, login, timeout, stdin=None):
         self.started.append((device, script, login, timeout))
+        self.stdin = stdin
         if self.start_error is not None:
             raise self.start_error
         return "job1"
@@ -123,13 +124,29 @@ def test_refused_start_says_why_and_returns_255(fake):
     assert read_to_eof(proc) == b"hands: laptop is offline, so nothing ran."
 
 
-def test_relay_lost_mid_command_keeps_partial_output(fake):
-    fake(
-        [{"chunks": ["partial"], "next": 1, "done": False}, client.HandsError("hands: relay down")]
+def test_stdin_goes_to_the_relay_beside_the_script(fake):
+    relay = fake([{"chunks": [], "next": 0, "done": True, "returncode": 0}])
+    proc = RemoteProcessHandle("laptop", "cat > f", login=False, timeout=5, stdin="sudo text\n")
+    assert wait_exit(proc) == 0
+    assert relay.started == [("laptop", "cat > f", False, 5 + DEVICE_TIMEOUT_GRACE)]
+    assert relay.stdin == "sudo text\n"
+
+
+def test_relay_lost_mid_command_keeps_partial_output_and_never_says_nothing_ran(fake):
+    """C23: once the job exists the command may be running, so it is cancelled best effort and the
+    note says so, instead of the relay-down text that says nothing ran."""
+    relay = fake(
+        [
+            {"chunks": ["partial"], "next": 1, "done": False},
+            client.RelayUnavailable(messages.RELAY_DOWN),
+        ]
     )
     proc = RemoteProcessHandle("laptop", "make", login=False, timeout=5)
     assert wait_exit(proc) == 255
-    assert read_to_eof(proc) == b"partial\nhands: relay down"
+    output = read_to_eof(proc).decode("utf-8")
+    assert output == "partial\n" + messages.contact_lost("laptop")
+    assert "nothing ran" not in output
+    assert relay.cancelled == ["job1"]
 
 
 def test_relay_failure_without_returncode_is_255_with_reason(fake):
@@ -207,11 +224,11 @@ def test_inline_limit_tail_comes_before_a_relay_notice(fake):
     fake(
         [
             {"chunks": ["a" * 9000], "next": 1, "done": False},
-            client.HandsError("hands: relay down"),
+            client.HandsError(messages.RELAY_LOST),
         ]
     )
     proc = RemoteProcessHandle("laptop", "yes", login=False, timeout=5, inline_limit=8192)
     output = read_to_eof(proc, timeout=5).decode("utf-8")
     assert wait_exit(proc) == 255
-    assert output.endswith("a" * 4096 + "\nhands: relay down")
+    assert output.endswith("a" * 4096 + "\n" + messages.contact_lost("laptop"))
     assert messages.output_omitted(9000 - 8192, "job1") in output

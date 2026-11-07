@@ -9,9 +9,9 @@ from . import config
 from .protocol import canonical_json, policy_hash
 
 DEFAULTS = [
-    r"\bhermes-hands\b",
+    r"\bhermes-?hands\s+unpair\b|\bpipx\s+uninstall\s+hermes-?hands\b|^\s*hermeshands\s*$",
     r"\.hermes-hands(?:[/\\]|\b)",
-    r"\b(?:taskkill|Stop-Process|kill)\b.*(?:hermes-hands|\$PPID|\b(?:PID|pid)\b)",
+    r"\b(?:taskkill|Stop-Process|kill)\b.*(?:\$PPID|<agent-pid>)",
     r"\b(?:schtasks\s+/(?:End|Delete)|Stop-ScheduledTask|Unregister-ScheduledTask)\b.*HermesHands",
     r"\bsudo\b",
     r"(?:rm\s+-rf\s+(?:/(?:\s|$)|~(?:[/\s]|$))|\bRemove-Item\b.*(?:[A-Za-z]:\\|[/\\])(?:\s|$).*?-Recurse)",
@@ -47,9 +47,10 @@ def digest() -> str:
 
 
 def refusal(script: str) -> str | None:
+    normalized = re.sub(r"['\"\\]", "", script)
     for pattern in patterns():
         active_pattern = pattern.replace("<agent-pid>", str(os.getpid()))
-        if re.search(active_pattern, script, re.IGNORECASE):
+        if re.search(active_pattern, script, re.IGNORECASE) or re.search(active_pattern, normalized, re.IGNORECASE):
             return pattern
     return None
 

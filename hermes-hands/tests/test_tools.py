@@ -5,6 +5,8 @@ import types
 import os
 import time
 
+import pytest
+
 from hands import store
 
 
@@ -92,6 +94,35 @@ def test_screenshot_returns_media_line(monkeypatch, tmp_path):
     assert outside.exists()
     if symlink is not None:
         assert symlink.is_symlink()
+
+
+def test_the_model_gets_each_tool_with_a_description_and_parameters(monkeypatch, tmp_path):
+    """The definitions core sends the model (``registry.get_definitions``, then the schema sanitizer,
+    model_tools.py:521) carry the description and parameters, and nothing else at the function level."""
+    pytest.importorskip("tools.registry")
+    from hermes_cli.plugins import PluginContext, PluginManager
+    from hermes_cli.plugins_manifest import PluginManifest
+    from tools.registry import registry
+    from tools.schema_sanitizer import sanitize_tool_schemas
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    manager = PluginManager()
+    names = {"hands_screenshot", "hands_devices"}
+    importlib.import_module("hands.tools").register_tools(
+        PluginContext(PluginManifest(name="hermes-hands", kind="backend"), manager)
+    )
+    try:
+        definitions = sanitize_tool_schemas(registry.get_definitions(names))
+    finally:
+        for name in names:
+            registry.deregister(name, scope=manager.scope_key)
+    assert {definition["function"]["name"] for definition in definitions} == names
+    for definition in definitions:
+        function = definition["function"]
+        assert set(function) == {"name", "description", "parameters"}
+        assert function["description"]
+        assert function["parameters"]["type"] == "object"
+        assert function["parameters"]["properties"] == {}
 
 
 def test_screenshot_errors_are_json(monkeypatch):

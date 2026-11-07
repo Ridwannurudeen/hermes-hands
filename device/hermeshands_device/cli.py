@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import platform
 import re
@@ -25,15 +26,29 @@ def _pair(url: str, name: str, code: str) -> int:
     base_url = url.rstrip("/")
     if base_url.endswith(API):
         base_url = base_url[: -len(API)].rstrip("/")
+    parsed_url = urlparse(base_url)
+    loopback = parsed_url.hostname == "localhost"
+    if parsed_url.hostname:
+        try:
+            loopback = loopback or ipaddress.ip_address(parsed_url.hostname).is_loopback
+        except ValueError:
+            pass
+    if parsed_url.scheme != "https" and not (parsed_url.scheme == "http" and loopback):
+        print("Pairing requires an https URL unless the gateway host is loopback", file=sys.stderr)
+        return 1
     pair_url = base_url + API + "/pair"
     private, public = get_or_create()
     body = {"name": name, "os": platform.platform(), "home": str(Path.home()), "public_key": b64u(public), "policy_hash": policy.digest(), "protocol": PROTOCOL_VERSION}
     body["sig"] = b64u(sign(private, canonical_json(body)))
-    response = httpx.post(pair_url, content=canonical_json(body), headers={"Authorization": f"Bearer {code}", "Content-Type": "application/json"}, timeout=30)
+    try:
+        response = httpx.post(pair_url, content=canonical_json(body), headers={"Authorization": f"Bearer {code}", "Content-Type": "application/json"}, timeout=30)
+    except httpx.HTTPError as exc:
+        print(f"Pairing request to {pair_url} failed: {exc}", file=sys.stderr)
+        return 1
     if response.status_code != 200:
         print(f"Pairing failed: HTTP {response.status_code} {response.text}", file=sys.stderr)
         if response.status_code == 401:
-            print("Check the gateway URL: use the base URL, e.g. https://hands.example.com", file=sys.stderr)
+            print("The pairing code is unknown, expired or already used, or the dashboard was not restarted after setup.", file=sys.stderr)
         return 1
     try:
         data = response.json()
@@ -61,10 +76,23 @@ def _doctor() -> int:
     if not bash:
         failures.append("Git Bash")
     if bash:
-        probe = subprocess.run([bash, "-c", "command -v python3 || command -v python"], capture_output=True, text=True, encoding="utf-8", timeout=5)
-        print(f"python in bash: {probe.stdout.strip() or 'missing'}")
-        if probe.returncode:
-            failures.append("python in Git Bash")
+        python_found = False
+        for command in ("python3", "python"):
+            probe = subprocess.run([bash, "-c", f'command -v {command}'], capture_output=True, text=True, encoding="utf-8", timeout=5)
+            executable = probe.stdout.strip()
+            if not executable:
+                continue
+            version = subprocess.run([bash, "-c", f'{command} -c "import sys; print(sys.version)"'], capture_output=True, text=True, encoding="utf-8", timeout=5)
+            if version.returncode == 0 and version.stdout.strip():
+                print(f"python in bash: {executable} ({version.stdout.strip().splitlines()[0]})")
+                python_found = True
+                continue
+            if "windowsapps" in executable.lower():
+                print(f"python in bash: {executable} is the WindowsApps alias and did not run")
+            else:
+                print(f"python in bash: {executable} did not run ({version.stdout.strip() or version.stderr.strip()})")
+        if not python_found:
+            failures.append("working Python in Git Bash")
     git_bash = shutil.which("git")
     print(f"git: {git_bash or 'missing'}")
     if sys.platform == "win32" and not git_bash:

@@ -174,6 +174,7 @@ def rig(hands_db, tmp_path, monkeypatch):
         home=home,
         device_home=hands.environment.device_path(str(home)),
         agent=agent,
+        transport=transport,
         keys=provider.keys,
         forgeries=forgeries,
         delivered=delivered,
@@ -331,6 +332,114 @@ def test_revoke_mid_command_stops_the_device(rig):
     assert not rig.agent.thread.is_alive()
     assert isinstance(rig.agent.error, PermissionError) and str(rig.agent.error) == "unknown_device"
     until(lambda: not alive(tree), what="the device to kill its running work")
+
+
+def test_file_contents_never_meet_the_device_deny_list(rig):
+    """W1 (C15): write_file content travels as the job's stdin, so text that mentions sudo or
+    shutdown is data the device writes, not a command its deny-list refuses."""
+    files = ShellFileOperations(rig.environment())
+    content = "run sudo apt install git\npool.shutdown(wait=True)\n"
+    written = files.write_file(f"{rig.device_home}/notes.md", content)
+    assert written.error is None and written.verified is True, written.to_dict()
+    assert (rig.home / "notes.md").read_bytes() == content.encode("utf-8")
+
+
+def lose_an_output_fetch(rig, monkeypatch, *, restart: bool) -> dict:
+    """The gateway's second /local/output request fails with a transport error; with ``restart``
+    the dashboard restarted first, so the relay that answers next has no jobs."""
+    hands = rig.hands
+    real_post = hands.client._http.post
+    seen = {"output": 0, "cancel": 0, "tree": []}
+
+    def post(route, **kwargs):
+        if route == "/local/cancel":
+            seen["cancel"] += 1
+        if route == "/local/output":
+            seen["output"] += 1
+            if seen["output"] == 2:
+                seen["tree"] = rig.agent.job_tree()
+                if restart:
+                    hands.relay._relay = None
+                raise httpx.ConnectError("connection refused")
+        return real_post(route, **kwargs)
+
+    monkeypatch.setattr(hands.client._http, "post", post)
+    monkeypatch.setattr(hands.client, "_RETRY_DELAY", 0)
+    return seen
+
+
+def test_one_lost_output_fetch_does_not_end_the_command(rig, monkeypatch):
+    """C23: a transport error while the relay is up is retried, never reported as nothing ran."""
+    env = rig.environment()
+    assert env.execute("true")["returncode"] == 0
+    seen = lose_an_output_fetch(rig, monkeypatch, restart=False)
+    result = env.execute("echo started; sleep 2; echo finished", timeout=60, bounded_capture=True)
+    assert result["returncode"] == 0, result
+    assert result["output"].splitlines()[-2:] == ["started", "finished"]
+    assert seen["output"] >= 3 and seen["cancel"] == 0
+
+
+def test_relay_restart_mid_command_stops_it_on_the_device(rig, monkeypatch):
+    """C9 and C23: after a dashboard restart the gateway says the command may still be running,
+    and the device stops it on the relay's cancel: true reply instead of running it to the end."""
+    env = rig.environment()
+    assert env.execute("true")["returncode"] == 0
+    seen = lose_an_output_fetch(rig, monkeypatch, restart=True)
+    script = (
+        "echo started; for i in 1 2 3 4 5 6; do sleep 1; echo tick $i; done; echo done > marker.txt"
+    )
+    began = time.monotonic()
+    result = env.execute(script, timeout=60, bounded_capture=True)
+    assert result["returncode"] == 255, result
+    assert rig.hands.messages.contact_lost("laptop") in result["output"]
+    assert "nothing ran" not in result["output"]
+    assert seen["cancel"] == 1 and seen["tree"]
+    until(lambda: not alive(seen["tree"]), what="the device to stop the job on cancel: true")
+    time.sleep(max(0.0, began + 8 - time.monotonic()))  # past the script's own end
+    assert not (rig.home / "marker.txt").exists()
+
+
+def test_going_offline_mid_command_cancels_the_job_on_the_device(rig, monkeypatch):
+    """C9: a job the relay gives up on (here the device missed its heartbeats) is cancelled on the
+    device, even though a quiet command never posts a result that could carry cancel: true."""
+    env = rig.environment()
+    assert env.execute("true")["returncode"] == 0
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.update(env.execute("sleep 20", timeout=30)))
+    worker.start()
+    until(lambda: len(rig.agent.job_tree()) > 1, what="the device to start sleep")
+    tree = rig.agent.job_tree()
+    monkeypatch.setattr(rig.hands.store, "OFFLINE_AFTER", -1)
+    worker.join(20)
+    monkeypatch.setattr(rig.hands.store, "OFFLINE_AFTER", 20)
+    assert outcome["returncode"] == 255
+    assert rig.hands.messages.went_offline("laptop") in outcome["output"]
+    until(lambda: not alive(tree), what="the relay's cancel to stop the job on the device")
+
+
+def test_agent_restart_fails_the_running_job_at_once(rig):
+    """W3 (C48): a new serve process reports a new instance, so the job the old one picked fails at
+    once with a message that it may have partly run, instead of at the gateway's timeout."""
+    env = rig.environment()
+    assert env.execute("true")["returncode"] == 0
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.update(env.execute("sleep 20", timeout=30)))
+    worker.start()
+    until(lambda: len(rig.agent.job_tree()) > 1, what="the device to start sleep")
+    tree = rig.agent.job_tree()
+    rig.agent.stop()
+    began = time.monotonic()
+    restarted = Agent(rig.transport)
+    try:
+        worker.join(25)
+        assert outcome["returncode"] == 255, outcome
+        assert rig.hands.messages.agent_restarted("laptop") in outcome["output"]
+        assert time.monotonic() - began < 15, "the gateway waited for its timeout"
+        assert env.execute("echo new agent")["output"].strip() == "new agent"
+    finally:
+        restarted.stop()
+        for process in alive(tree):
+            process.kill()
 
 
 def test_background_job_follows_the_device_across_a_switch(rig):

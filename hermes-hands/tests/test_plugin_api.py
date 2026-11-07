@@ -3,6 +3,8 @@ the plugin package is imported the way the plugin loader does (``hermes_plugins.
 dashboard file on its own, and requests go through the real token-auth middleware."""
 
 import functools
+import secrets
+import sqlite3
 import sys
 import time
 
@@ -152,16 +154,84 @@ def test_device_and_local_routes_end_to_end(plugin):
     assert device_on_local.status_code == 401
 
     hands.store.revoke("laptop")
-    gone = api.post(
-        base + "/device/poll",
-        content=body,
-        headers=signed(device_id, private, base + "/device/poll", body),
-    )
+    forged = f"hands1.{device_id}.0.AAAAAAAAAAAAAAAAAAAAAA." + "A" * 86
+    for _ in range(20):  # C47: unsigned noise from the same address cannot use up the stop signal
+        noise = api.post(
+            base + "/device/poll", content=body, headers={"Authorization": f"Bearer {forged}"}
+        )
+        assert noise.status_code == 401 and noise.json()["error"] == "unauthenticated"
+    headers = signed(device_id, private, base + "/device/poll", body)
+    gone = api.post(base + "/device/poll", content=body, headers=headers)
     assert gone.status_code == 401 and gone.json()["error"] == "unknown_device"
-    assert "X-Hands-Signature" not in gone.headers
+    nonce = protocol.parse_bearer(headers["Authorization"].split(" ", 1)[1]).nonce
+    assert gone.headers["X-Hands-Nonce"] == nonce
+    assert protocol.verify_request(  # W4: signed, so the device can trust it and stop
+        provider.keys.relay_public,
+        gone.headers["X-Hands-Signature"],
+        protocol.R2D,
+        int(gone.headers["X-Hands-Ts"]),
+        nonce,
+        "POST",
+        base + "/device/poll",
+        gone.content,
+    )
 
     ui = api.get(base + "/ui/state")
     assert ui.status_code == 200 and ui.json() == {"relay": True, "devices": [], "alerts": []}
+
+
+def test_a_forged_device_bearer_cannot_drain_the_gateway(plugin, monkeypatch, tmp_path):
+    """C12: core's seam lets any principal through every token route, and core's drain route never
+    checks which provider vouched, so a hands1 bearer Hands cannot verify must get core's 401."""
+    drain = pytest.importorskip("plugins.dashboard_auth.drain")
+    actions = pytest.importorskip("hermes_cli.web_routers.actions")
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    secret = secrets.token_urlsafe(32)
+    monkeypatch.setenv("HERMES_DASHBOARD_DRAIN_SECRET", secret)
+    ctx = RegisterCtx()
+    drain.register(ctx)
+    [drain_provider] = [obj for kind, obj in ctx.calls if kind == "auth"]
+    try:
+        assert token_auth.is_token_route("/api/gateway/drain")
+        api = make_app(load_plugin_api())
+        api.app.include_router(actions.router)
+        forged = "hands1.attacker.0.AAAAAAAAAAAAAAAAAAAAAA." + "A" * 86
+        for action in ("drain", "cancel"):
+            refused = api.post(
+                "/api/gateway/drain",
+                headers={"Authorization": f"Bearer {forged}"},
+                json={"action": action},
+            )
+            assert refused.status_code == 401, refused.text
+        assert not (home / ".drain_request.json").exists()
+        allowed = api.post(
+            "/api/gateway/drain",
+            headers={"Authorization": f"Bearer {secret}"},
+            json={"action": "cancel"},
+        )
+        assert allowed.status_code == 200  # the route is reachable: the 401 is the seam's
+    finally:
+        registry.unregister_global_provider(drain_provider.name, drain_provider)
+
+
+def test_a_store_error_in_a_relay_handler_is_a_json_refusal(plugin, monkeypatch, caplog):
+    """C23: an unreadable hands.db is a hands: refusal the gateway can show, not a plain 500."""
+    ctx, hands, provider = plugin
+
+    def broken():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(hands.store, "list_devices", broken)
+    reply = make_app(load_plugin_api()).post(
+        "/api/plugins/hermes-hands/local/state",
+        headers={"Authorization": f"Bearer {provider.keys.local_bearer}"},
+        json={},
+    )
+    assert reply.status_code == 503
+    assert reply.json() == {"error": "store_down", "detail": hands.messages.RELAY_STORE_DOWN}
+    assert "could not use its store" in caplog.text
 
 
 def test_gateway_copy_stays_inert(plugin):

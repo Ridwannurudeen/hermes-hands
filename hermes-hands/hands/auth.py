@@ -3,9 +3,12 @@ gateway's local bearer (``hermes_cli/dashboard_auth/base.py:92-161``, ``token_au
 
 ``verify_token`` sees only the token string, so a device bearer proves identity and freshness here
 (signature, 300 s window). Its nonce is burned by the relay only after the request signature also
-verified (``relay.Relay._device``), so holding a bearer without the device key cannot burn one. An
-unpaired but well-formed device bearer gets a ``hands:unknown`` principal so the handler can answer
-``401 unknown_device``, which tells the device to stop.
+verified (``relay.Relay._device``), so holding a bearer without the device key cannot burn one. A
+fresh bearer signed by a revoked device's key (its tombstone) gets a ``hands:revoked`` principal so
+the relay can answer a signed ``401 unknown_device``, which tells the device to stop. Any other
+bearer, an unknown device_id included, gets None: core's token seam asks every provider about every
+token route and lets any principal through (``token_auth.py:57-86``), so a principal minted for a
+token Hands cannot verify would open other plugins' token routes, such as core's drain route.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from hermes_cli.dashboard_auth import (
 )
 
 from . import protocol, store
-from .relay import PROVIDER, SCOPE_DEVICE, SCOPE_LOCAL, SCOPE_PAIR, SCOPE_UNKNOWN, Keys
+from .relay import PROVIDER, SCOPE_DEVICE, SCOPE_LOCAL, SCOPE_PAIR, SCOPE_REVOKED, Keys
 
 
 class HandsTokenProvider(DashboardAuthProvider):
@@ -73,14 +76,16 @@ class HandsTokenProvider(DashboardAuthProvider):
 
     def _verify_device(self, bearer: protocol.Bearer) -> Optional[TokenPrincipal]:
         device = store.device_by_id(bearer.device_id)
-        if device is None:
-            return TokenPrincipal(
-                principal=bearer.device_id, provider=PROVIDER, scopes=(SCOPE_UNKNOWN,)
-            )
+        if device is not None:
+            public_key, scope = device["public_key"], SCOPE_DEVICE
+        else:
+            public_key, scope = store.revoked_key(bearer.device_id), SCOPE_REVOKED
+            if public_key is None:
+                return None
         now = int(time.time())
         message = protocol.bearer_message(bearer.device_id, bearer.ts, bearer.nonce)
         if not protocol.fresh(bearer.ts, now) or not protocol.verify(
-            device["public_key"], bearer.sig, message
+            public_key, bearer.sig, message
         ):
             return None
-        return TokenPrincipal(principal=bearer.device_id, provider=PROVIDER, scopes=(SCOPE_DEVICE,))
+        return TokenPrincipal(principal=bearer.device_id, provider=PROVIDER, scopes=(scope,))

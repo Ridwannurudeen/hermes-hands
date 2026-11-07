@@ -34,9 +34,10 @@ jobs:
           python -c 'import sys,tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb")).get("tool", {}).get("uv", {}).get("override-dependencies", [])))' hermes-agent/pyproject.toml > "$RUNNER_TEMP/core-overrides.txt"
           python -m uv venv .venv
           python -m uv pip install --python .venv --override "$RUNNER_TEMP/core-overrides.txt" -e ./hermes-agent pytest pytest-asyncio ruamel.yaml
+          python -c 'import os,sys; p=".venv/Scripts" if os.name == "nt" else ".venv/bin"; open(os.environ["GITHUB_PATH"], "a", encoding="utf-8").write(os.path.abspath(p)+os.linesep)'
       - name: Validate plugin and doctor
         shell: bash
-        working-directory: hermes-hands
+        working-directory: hermes-hands/hermes-hands
         env:
           HERMES_HOME: ${{ runner.temp }}/hermes-home
           PYTHONPATH: ${{ github.workspace }}/hermes-agent
@@ -45,11 +46,11 @@ jobs:
           python -m hermes_cli.main plugins doctor . --ci
       - name: Run plugin tests
         shell: bash
-        working-directory: hermes-hands
+        working-directory: hermes-hands/hermes-hands
         env:
           HERMES_AGENT_REPO: ${{ github.workspace }}/hermes-agent
           PYTHONPATH: ${{ github.workspace }}/hermes-agent
-        run: python -m pytest tests -q
+        run: python -m pytest tests ../device/tests -q
       - name: Validate catalog shape
         shell: bash
         run: |

@@ -202,3 +202,49 @@ def test_output_cap(monkeypatch, tmp_path):
     assert output.startswith(b"12345")
     assert b"truncated" in output
     assert (tmp_path / ".hermes-hands/out/job.log").read_bytes() == b"12345"
+
+
+def test_stdin_is_staged_byte_exact_and_removed(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert b"".join(executor.run("cat", stdin="hello \u4e2d\u6587\n", timeout=5)) == "hello \u4e2d\u6587\n".encode()
+    assert not list((tmp_path / ".hermes-hands/out").glob("tmp*"))
+
+
+def test_output_cap_reports_nonzero_exit(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(executor, "MAX_OUTPUT", 5)
+    exits = []
+    list(executor.run("printf 123456789", timeout=5, on_exit=exits.append))
+    assert exits == [125]
+
+
+def test_reader_queue_is_bounded():
+    assert 0 < executor.OUTPUT_QUEUE_SIZE < 1024
+
+
+def test_recorded_process_is_reaped_and_record_removed(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    killed = []
+    monkeypatch.setattr(executor, "terminate_recorded", lambda pid, created: killed.append((pid, created)))
+    executor.record_process("old-job", 1234, 5678.5)
+    record = executor.record_path("old-job")
+    assert record.exists()
+    executor.reap_recorded_processes()
+    assert killed == [(1234, 5678.5)]
+    assert not record.exists()
+
+
+def test_reaped_process_start_time_mismatch_does_not_kill(monkeypatch):
+    calls = []
+    monkeypatch.setattr(executor.psutil, "Process", lambda pid: type("Process", (), {"create_time": lambda self: 1.0, "kill": lambda self: calls.append(pid)})())
+    monkeypatch.setattr(executor.os, "name", "nt")
+    executor.terminate_recorded(1234, 2.0)
+    assert calls == []

@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from . import config
@@ -51,15 +53,28 @@ def get_or_create() -> tuple[bytes, bytes]:
             keyring = None
     if not keyring:
         config.ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-        config.KEY_PATH.write_text(json.dumps({"private_key": b64u(private), "public_key": b64u(public)}), encoding="utf-8")
+        value = json.dumps({"private_key": b64u(private), "public_key": b64u(public)})
         if os.name == "nt":
             icacls = shutil.which("icacls")
             if not icacls:
-                config.KEY_PATH.unlink(missing_ok=True)
                 raise RuntimeError("icacls is required to protect the device key")
-            username = os.environ["USERNAME"]
-            subprocess.run([icacls, str(config.KEY_PATH), "/inheritance:r", "/grant:r", f"{username}:F"], check=True, capture_output=True, text=True, encoding="utf-8")
+            whoami = os.path.join(os.environ["SystemRoot"], "System32", "whoami.exe")
+            sid_output = subprocess.run([whoami, "/user", "/fo", "csv", "/nh"], check=True, capture_output=True).stdout
+            sid_match = re.search(rb"S-1-\d+(?:-\d+)+", sid_output)
+            if not sid_match:
+                raise RuntimeError("could not determine the current user's SID")
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=config.ROOT, suffix=".tmp", delete=False) as temp_file:
+                temp_file.write(value)
+                temp_path = Path(temp_file.name)
+            try:
+                subprocess.run([icacls, str(temp_path), "/inheritance:r", "/grant:r", f"*{sid_match.group().decode('ascii')}:F"], check=True, capture_output=True)
+                os.replace(temp_path, config.KEY_PATH)
+            except (OSError, subprocess.SubprocessError) as exc:
+                temp_path.unlink(missing_ok=True)
+                config.KEY_PATH.unlink(missing_ok=True)
+                raise RuntimeError("could not protect the device key with icacls") from exc
         else:
+            config.KEY_PATH.write_text(value, encoding="utf-8")
             config.KEY_PATH.chmod(0o600)
     return private, public
 
@@ -67,6 +82,9 @@ def get_or_create() -> tuple[bytes, bytes]:
 def remove() -> None:
     keyring = _keyring()
     if keyring:
-        if keyring.get_password(SERVICE, "device-private") is not None:
-            keyring.delete_password(SERVICE, "device-private")
+        try:
+            if keyring.get_password(SERVICE, "device-private") is not None:
+                keyring.delete_password(SERVICE, "device-private")
+        except keyring.errors.KeyringError:
+            logger.warning("Keyring unavailable while removing device key")
     config.KEY_PATH.unlink(missing_ok=True)

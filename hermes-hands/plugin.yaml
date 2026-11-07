@@ -16,7 +16,7 @@ provides_tools: [hands_screenshot, hands_devices]
 provides_hooks: []
 requires_env: []
 config_schema:
-  HANDS_RELAY_SEED: {type: secret, description: "Relay signing seed. Written once by hermes hands setup."}
+  HANDS_RELAY_SEED: {type: secret, env: HANDS_RELAY_SEED, description: "Relay signing seed. Written once by hermes hands setup."}
   default_target: {type: str, default: server, description: "Target for conversations that have not chosen one. server = this machine, as before."}
   dashboard_url: {type: str, default: "http://127.0.0.1:9119", description: "Loopback address of the dashboard that hosts the relay."}
   owner_ids: {type: list, default: [], description: "platform:user_id entries allowed to pair, revoke and switch targets from a chat. hermes hands setup fills this. Empty: the platform's allow_admin_from list for that chat scope, else local surfaces only."}

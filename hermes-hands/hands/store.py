@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS devices (
     paired_at INTEGER NOT NULL,
     last_seen INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS revoked_devices (
+    device_id TEXT PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    revoked_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS pairing_codes (
     code_hash TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -203,9 +208,24 @@ def record_seen(
     return None if row is None else bool(row["policy_ok"])
 
 
-def revoke(name: str) -> bool:
-    """Delete the device and its public key; its next request is answered ``unknown_device``."""
+def revoked_key(device_id: str) -> bytes | None:
+    """The public key a revoked device signs with (its tombstone), else None."""
     with _db() as conn:
+        row = conn.execute(
+            "SELECT public_key FROM revoked_devices WHERE device_id = ?", (device_id,)
+        ).fetchone()
+    return None if row is None else protocol.unb64u(row["public_key"])
+
+
+def revoke(name: str) -> bool:
+    """Delete the device, keeping its id and public key as a tombstone so the relay can answer its
+    next request with a signed ``unknown_device``; the name is free to pair again."""
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO revoked_devices (device_id, public_key, revoked_at)"
+            " SELECT device_id, public_key, ? FROM devices WHERE name = ?",
+            (int(time.time()), name),
+        )
         return conn.execute("DELETE FROM devices WHERE name = ?", (name,)).rowcount > 0
 
 

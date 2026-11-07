@@ -212,36 +212,40 @@ def test_concurrent_copies_of_one_request_get_through_once(hub):
     assert sorted(refusal is None for refusal in outcomes) == [False] * 7 + [True]
 
 
-def test_unknown_device_is_unsigned_logged_and_rate_limited(hub, caplog):
+def bearer_nonce(headers) -> str:
+    return protocol.parse_bearer(headers["authorization"].split(" ", 1)[1]).nonce
+
+
+def test_revoked_device_gets_a_signed_unknown_device_every_time(hub, caplog):
+    """W4 and C47: the stop signal is relay-signed over the request's nonce, so the device can
+    trust it, and no per-address budget can turn it into a 429."""
     device = Device()
     store.revoke("laptop")
-    principal, headers, path, raw = device.request(
-        "/device/heartbeat", {"policy_hash": "p0", "os": "x", "home": "y"}
-    )
-    unknown = Principal(device.device_id, scopes=(relay.SCOPE_UNKNOWN,))
+    revoked = Principal(device.device_id, scopes=(relay.SCOPE_REVOKED,))
     caplog.set_level("WARNING", logger=relay.logger.name)
-    reply = run(hub.device_heartbeat(unknown, headers, path, raw, PEER))
-    assert (reply.status, body(reply)["error"]) == (401, "unknown_device")
-    assert "X-Hands-Signature" not in reply.headers
-    assert PEER in caplog.text
-    reply = run(hub.device_heartbeat(principal, headers, path, raw, PEER))  # revoked after auth
-    assert body(reply)["error"] == "unknown_device"
-    for _ in range(relay._UNKNOWN_LIMIT - 2):
-        assert run(hub.device_heartbeat(unknown, headers, path, raw, PEER)).status == 401
-    limited = run(hub.device_heartbeat(unknown, headers, path, raw, PEER))
-    assert (limited.status, body(limited)["error"]) == (429, "rate_limited")
-    assert run(hub.device_heartbeat(unknown, headers, path, raw, "198.51.100.1")).status == 401
-    assert "rate-limiting unknown_device replies to " + PEER in caplog.text
+    beat = {"policy_hash": "p0", "os": "x", "home": "y"}
+    for _ in range(15):
+        _, headers, path, raw = device.request("/device/heartbeat", beat)
+        reply = run(hub.device_heartbeat(revoked, headers, path, raw, PEER))
+        assert reply.status == 401
+        assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "unknown_device"
+    assert f"revoked device {device.device_id} called from {PEER}" in caplog.text
+    # Revoked after the token seam vouched for the device: the same signed reply.
+    reply, path, headers = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    assert reply.status == 401
+    assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "unknown_device"
+    # The request itself must still be signed by the tombstoned key; a forgery gets nothing signed.
+    _, headers, path, raw = device.request("/device/poll", {"wait": 0}, tamper=True)
+    forged = run(hub.device_poll(revoked, headers, path, raw, PEER))
+    assert body(forged)["error"] == "bad_signature" and "X-Hands-Signature" not in forged.headers
 
 
-def test_unknown_device_window_resets(hub, monkeypatch):
-    clock = [1000.0]
-    monkeypatch.setattr(relay.time, "monotonic", lambda: clock[0])
-    for _ in range(relay._UNKNOWN_LIMIT):
-        assert hub._unknown(PEER).status == 401
-    assert hub._unknown(PEER).status == 429
-    clock[0] += relay._UNKNOWN_WINDOW + 1
-    assert hub._unknown(PEER).status == 401
+def test_revoked_between_the_checks_still_gets_the_signed_stop(hub, monkeypatch):
+    device = Device()
+    monkeypatch.setattr(store, "record_seen", lambda *args, **kwargs: None)
+    reply, path, headers = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    assert reply.status == 401
+    assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "unknown_device"
 
 
 def test_local_routes_refuse_forwarded_and_foreign_principals(hub):
@@ -289,7 +293,51 @@ def test_policy_change_fails_running_job_and_refuses_device(hub):
     reply, path, _ = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
     assert reply.status == 409
     store.accept_policy("laptop")
+    reply, path, _ = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    assert verified(hub, reply, path)["target_job_id"] == job_id  # W2: the failed job is cancelled
     assert device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})[0].status == 204
+
+
+def test_a_poll_carrying_an_unaccepted_policy_hash_is_refused_until_accepted(hub):
+    """Rejected finding 2: a job reply to a poll that carries a hash means that hash is accepted,
+    so the device can refuse work under an edited deny-list."""
+    device = Device()
+    queued = body(local(hub, "local_exec", {"device": "laptop", "script": "true", "timeout": 5}))[
+        "job_id"
+    ]
+    reply, path, headers = device_call(
+        hub, device, "device_poll", "/device/poll", {"wait": 0, "policy_hash": "edited"}
+    )
+    assert reply.status == 409
+    assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "policy_changed"
+    out = body(local(hub, "local_output", {"job_id": queued, "after": 0, "wait": 0}))
+    assert (out["done"], out["error"]) == (True, messages.policy_changed("laptop"))
+    store.accept_policy("laptop")
+    job_id = body(local(hub, "local_exec", {"device": "laptop", "script": "true", "timeout": 5}))[
+        "job_id"
+    ]
+    reply, path, _ = device_call(
+        hub, device, "device_poll", "/device/poll", {"wait": 0, "policy_hash": "edited"}
+    )
+    assert reply.status == 200 and verified(hub, reply, path)["job_id"] == job_id
+    assert device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})[0].status == 204
+
+
+def test_a_refusal_ends_polls_parked_under_the_old_hash(hub):
+    """A poll that began under the old hash must not hand out a job after the owner accepts a new
+    one: its 200 would tell the device the old hash is still accepted."""
+    device = Device()
+    parked = started(
+        lambda: device_call(
+            hub, device, "device_poll", "/device/poll", {"wait": 10, "policy_hash": "p0"}
+        )
+    )
+    until_waiting(hub, device.device_id)
+    begun = time.monotonic()
+    beat = {"policy_hash": "edited", "os": "x", "home": "y", "agent_version": "0.1.0"}
+    assert device_call(hub, device, "device_heartbeat", "/device/heartbeat", beat)[0].status == 409
+    reply, _, _ = parked()
+    assert reply.status == 204 and time.monotonic() - begun < 5
 
 
 def test_cancel_queues_a_cancel_job_and_drops_late_output(hub):
@@ -326,6 +374,8 @@ def test_revoke_mid_command_fails_the_wait(hub):
     store.revoke("laptop")
     out = body(local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 5}))
     assert (out["done"], out["returncode"], out["error"]) == (True, 255, messages.revoked("laptop"))
+    [cancel] = hub._queues[device.device_id]  # the revoked device stops on its signed 401 anyway
+    assert (cancel["type"], cancel["target_job_id"]) == ("cancel", job_id)
 
 
 def test_device_going_offline_fails_the_wait(hub, monkeypatch):
@@ -344,6 +394,9 @@ def test_device_going_offline_fails_the_wait(hub, monkeypatch):
         255,
         messages.went_offline("laptop"),
     )
+    reply, path, _ = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    cancel = verified(hub, reply, path)  # W2: the device stops it when it is back
+    assert (cancel["type"], cancel["target_job_id"]) == ("cancel", job_id)
 
 
 def test_screenshot_job_and_size_cap(hub):
@@ -365,6 +418,8 @@ def test_screenshot_job_and_size_cap(hub):
     assert reply.status == 413
     out = body(local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 0}))
     assert (out["returncode"], out["error"]) == (255, messages.SCREENSHOT_TOO_LARGE)
+    reply, path, _ = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    assert verified(hub, reply, path)["target_job_id"] == job_id
 
 
 def test_abandoned_jobs_are_cancelled(hub, monkeypatch):
@@ -378,6 +433,92 @@ def test_abandoned_jobs_are_cancelled(hub, monkeypatch):
     reply, path, _ = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
     assert verified(hub, reply, path)["target_job_id"] == job_id
     assert local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 0}).status == 404
+
+
+def test_exec_job_carries_stdin_and_both_texts_are_bounded(hub, monkeypatch):
+    """W1: stdin travels beside the script, never inside it, under the same bound."""
+    device = Device()
+    request = {"device": "laptop", "script": "cat", "timeout": 5, "stdin": "run sudo apt\n"}
+    job_id = body(local(hub, "local_exec", request))["job_id"]
+    reply, path, _ = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    assert verified(hub, reply, path) == {
+        "job_id": job_id,
+        "type": "exec",
+        "script": "cat",
+        "login": False,
+        "timeout": 5,
+        "stdin": "run sudo apt\n",
+    }
+    monkeypatch.setattr(relay, "MAX_JOB_TEXT", 4)
+    for field in ("script", "stdin"):
+        refused = local(
+            hub, "local_exec", {"device": "laptop", "timeout": 5, "script": "true", field: "12345"}
+        )
+        assert (refused.status, body(refused)["detail"]) == (413, messages.JOB_TOO_LARGE)
+    fits = {"device": "laptop", "script": "true", "timeout": 5, "stdin": "1234"}
+    assert local(hub, "local_exec", fits).status == 200
+
+
+def test_agent_restart_fails_its_picked_jobs_at_once(hub):
+    """W3: a new agent instance means the old process's picked jobs are lost; they fail with an
+    honest message and a cancel, while a job it never picked goes to the new agent."""
+    device = Device()
+    beat = {"policy_hash": "p0", "os": "x", "home": "y", "agent_version": "0.1.0"}
+    device_call(hub, device, "device_heartbeat", "/device/heartbeat", {**beat, "instance": "a1"})
+    exec_request = {"device": "laptop", "script": "sleep 9", "timeout": 30}
+    picked = body(local(hub, "local_exec", exec_request))["job_id"]
+    device_call(hub, device, "device_poll", "/device/poll", {"wait": 0, "instance": "a1"})
+    device_call(hub, device, "device_heartbeat", "/device/heartbeat", {**beat, "instance": "a1"})
+    device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    assert not hub._jobs[picked].done  # same instance, or none sent: nothing changes
+    waiting = body(local(hub, "local_exec", exec_request))["job_id"]
+    # The new agent's poll gets the job the old one never picked, then the cancel for the other.
+    reply, path, _ = device_call(
+        hub, device, "device_poll", "/device/poll", {"wait": 0, "instance": "b2"}
+    )
+    assert verified(hub, reply, path)["job_id"] == waiting
+    out = body(local(hub, "local_output", {"job_id": picked, "after": 0, "wait": 0}))
+    assert (out["done"], out["returncode"], out["error"]) == (
+        True,
+        relay.UNREACHABLE,
+        messages.agent_restarted("laptop"),
+    )
+    reply, path, _ = device_call(
+        hub, device, "device_poll", "/device/poll", {"wait": 0, "instance": "b2"}
+    )
+    assert verified(hub, reply, path)["target_job_id"] == picked
+    assert not hub._jobs[waiting].done
+
+
+def test_restart_seen_in_a_heartbeat_ends_the_old_agents_parked_poll(hub):
+    device = Device()
+    beat = {"policy_hash": "p0", "os": "x", "home": "y", "agent_version": "0.1.0"}
+    stale = started(
+        lambda: device_call(
+            hub, device, "device_poll", "/device/poll", {"wait": 10, "instance": "a1"}
+        )
+    )
+    until_waiting(hub, device.device_id)
+    device_call(hub, device, "device_heartbeat", "/device/heartbeat", {**beat, "instance": "b2"})
+    reply, _, _ = stale()
+    assert reply.status == 204  # it never takes a job meant for the new agent
+
+
+def test_a_newer_poll_supersedes_an_older_parked_one(hub):
+    """C48: a poll still parked from a dropped connection must not take the next job."""
+    device = Device()
+    stale = started(lambda: device_call(hub, device, "device_poll", "/device/poll", {"wait": 10}))
+    until_waiting(hub, device.device_id)
+    begun = time.monotonic()
+    fresh = started(lambda: device_call(hub, device, "device_poll", "/device/poll", {"wait": 10}))
+    reply, _, _ = stale()
+    assert (reply.status, reply.body) == (204, b"") and time.monotonic() - begun < 5
+    until_waiting(hub, device.device_id)
+    job_id = body(local(hub, "local_exec", {"device": "laptop", "script": "true", "timeout": 5}))[
+        "job_id"
+    ]
+    reply, path, _ = fresh()
+    assert verified(hub, reply, path)["job_id"] == job_id
 
 
 def pair_request(device_private, device_public, code, **overrides):
@@ -489,8 +630,7 @@ def test_start_runs_the_heartbeat_on_a_daemon_thread(hands_db, monkeypatch):
 
     monkeypatch.setattr(relay.threading, "Thread", FakeThread)
     hub = relay.Relay(relay.derive_keys(SEED))
+    assert store.relay_alive() is False
     hub.start()
     assert threads == [(hub._heartbeat_loop, "hermes-hands-relay", True)]
-    assert store.relay_alive() is False
-    hub._beat()
-    assert store.relay_alive() is True
+    assert store.relay_alive() is True  # written before the first reply, not by the thread

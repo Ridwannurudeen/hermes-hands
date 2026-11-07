@@ -21,7 +21,9 @@ RELAY_LOST = (
 )
 FORWARDED = "hands: local relay routes refuse proxied requests."
 UNAUTHENTICATED = "hands: this request is not signed by a paired device."
-UNKNOWN_DEVICE_WIRE = "hands: this device is not paired with the gateway (revoked or never paired)."
+UNKNOWN_DEVICE_WIRE = (
+    "hands: this device was revoked on the gateway. Pair it again with a new /hands pair code."
+)
 POLICY_CHANGED_WIRE = (
     "hands: the device deny-list changed since pairing; the owner must run /hands accept-policy."
 )
@@ -36,8 +38,12 @@ STORE_DOWN = (
     "conversation's target is unknown and nothing ran anywhere. See the gateway log."
 )
 REPLAYED = "hands: this request was already used once."
-RATE_LIMITED = (
-    "hands: too many requests from unpaired devices at this address; try again in a minute."
+JOB_TOO_LARGE = (
+    "hands: the command or its input is longer than 16 million characters, so nothing ran."
+)
+RELAY_STORE_DOWN = (
+    "hands: the relay cannot read the Hermes Hands store (plugin-data/hermes-hands/hands.db) "
+    "and refused this request. See the dashboard log."
 )
 
 
@@ -82,6 +88,29 @@ def revoked(name: str) -> str:
 
 def cancelled(name: str) -> str:
     return f"hands: the command on {name} was cancelled."
+
+
+def agent_restarted(name: str) -> str:
+    return (
+        f"hands: the device agent on {name} restarted while the command ran, so it may have partly "
+        f"run there and any output above is partial. Check {name} before running it again."
+    )
+
+
+def contact_lost(name: str) -> str:
+    return (
+        f"hands: contact with the relay was lost after the command started on {name}, so it may "
+        f"still be running there and any output above is partial. Check {name} before running it "
+        f"again."
+    )
+
+
+def ambiguous_pid(pid: int, targets: list[str]) -> str:
+    return (
+        f"hands: background jobs with pid {pid} run on {' and '.join(targets)}, so Hermes "
+        f"Hands cannot tell which one to stop and stopped neither. Stop it with a terminal "
+        f"command on the right target."
+    )
 
 
 def pair_name_taken(name: str) -> str:
