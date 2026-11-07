@@ -30,6 +30,17 @@ def test_real_bash_execution(monkeypatch, tmp_path):
     assert chunks.strip() == b"hi"
 
 
+def test_large_script_runs_from_temp_file_and_is_removed(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    script = "printf x\n" * 100_000
+    assert b"".join(executor.run(script, timeout=10)) == b"x" * 100_000
+    assert not list((tmp_path / ".hermes-hands/out").glob("*.sh"))
+
+
 def test_timeout_kills_process(monkeypatch, tmp_path):
     monkeypatch.setattr(executor, "resolve_bash", lambda: shutil.which("bash"))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)

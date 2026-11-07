@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import tempfile
 import time
 from pathlib import Path
 from typing import Iterator
@@ -80,7 +81,12 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
     bash = resolve_bash()
     if not bash:
         raise RuntimeError("Git Bash was not found or failed its probe")
-    args = [bash, "-l", "-c", script] if login else [bash, "-c", script]
+    script_dir = Path.home() / ".hermes-hands" / "out"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", suffix=".sh", dir=script_dir, delete=False) as script_file:
+        script_file.write(script)
+        script_path = Path(script_file.name)
+    args = [bash, *( ["-l"] if login else []), str(script_path)]
     kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {"start_new_session": True}
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, **kwargs)
     created = psutil.Process(proc.pid).create_time()
@@ -141,3 +147,4 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
         if proc.poll() is None:
             _terminate(proc, created)
             proc.wait()
+        script_path.unlink(missing_ok=True)
