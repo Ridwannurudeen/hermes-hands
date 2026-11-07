@@ -120,9 +120,9 @@ The device connects out and does not open a listening port. Ed25519 signatures a
 
 The gateway stores the relay seed through Hermes's declared secret configuration, and stores device public keys and pairing metadata in the plugin database. It does not store device private keys. The device stores its Ed25519 private key in the OS keyring when the `keyring` extra is installed; otherwise it uses `~/.hermes-hands/device.json`. The keyring service is `hermes-hands` and the entry username is `device-private`. On Windows, the fallback file is restricted with an owner only ACL.
 
-Device output logs are written under `~/.hermes-hands/out/`. They are not deleted automatically. Device temporary shell and cwd files matched by the janitor are removed after 24 hours, with cleanup at startup and hourly. Delete output logs with `rm -rf ~/.hermes-hands/out` or remove selected files there.
+Device output logs are written under `~/.hermes-hands/out/` and the device agent deletes them after 7 days. Hermes's temporary shell and cwd files on the device are removed after 24 hours. Both run when `serve` starts and then hourly. Delete output logs sooner with `rm -rf ~/.hermes-hands/out` or remove selected files there.
 
-Screenshots are written on the gateway under `$HERMES_HOME/cache/hermes-hands/` (or the configured Hermes home cache directory). They are not deleted automatically. Remove them with `rm` or delete the files in that directory.
+Screenshots are written on the gateway under `$HERMES_HOME/cache/hermes-hands/`. Each new screenshot first removes screenshots in that folder older than 24 hours. Remove them sooner by deleting the files in that folder.
 
 ## Latency
 
