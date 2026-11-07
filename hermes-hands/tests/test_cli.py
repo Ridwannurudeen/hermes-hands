@@ -1,3 +1,4 @@
+import argparse
 import sys
 import types
 
@@ -70,3 +71,44 @@ def test_doctor_reports_each_deployment_check(monkeypatch, capsys):
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 4
     assert all(line.startswith("PASS ") for line in lines)
+
+
+def test_pair_cli_mints_code_and_prints_device_command(monkeypatch, capsys):
+    hermes_cli = types.ModuleType("hermes_cli")
+    hermes_cli.__path__ = []
+    config = types.ModuleType("hermes_cli.config")
+    config.load_config_readonly = lambda: {"dashboard": {"public_url": "https://hands.example.com"}}
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name: "pair-code")
+    ctx = Context()
+    cli.register_cli(ctx)
+    parser = argparse.ArgumentParser()
+    ctx.setup_fn(parser)
+    args = parser.parse_args(["pair", "my laptop"])
+
+    ctx.handler(args)
+
+    assert capsys.readouterr().out == (
+        "Pair code: pair-code\n"
+        "Run on the device: hermes-hands pair https://hands.example.com --name 'my laptop' --code pair-code\n"
+    )
+
+
+def test_pair_cli_falls_back_to_dashboard_url(monkeypatch, capsys):
+    hermes_cli = types.ModuleType("hermes_cli")
+    hermes_cli.__path__ = []
+    config = types.ModuleType("hermes_cli.config")
+    config.load_config_readonly = lambda: {}
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name: "pair-code")
+    ctx = Context()
+    ctx.config["dashboard_url"] = "http://127.0.0.1:9119"
+    cli.register_cli(ctx)
+    parser = argparse.ArgumentParser()
+    ctx.setup_fn(parser)
+
+    ctx.handler(parser.parse_args(["pair", "laptop"]))
+
+    assert "hermes-hands pair http://127.0.0.1:9119 --name laptop --code pair-code" in capsys.readouterr().out

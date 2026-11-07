@@ -1,4 +1,5 @@
 import json
+import types
 
 from hermeshands_device import cli, config
 from hermeshands_device.protocol import b64u
@@ -24,3 +25,27 @@ def test_status_and_policy_cli(monkeypatch, tmp_path, capsys):
     assert cli.main(["policy", "reset"]) == 0
     assert cli.main(["policy", "show"]) == 0
     assert "sudo" in capsys.readouterr().out
+
+
+def test_pair_accepts_base_and_plugin_prefix_urls(monkeypatch, capsys):
+    requests = []
+    monkeypatch.setattr(cli, "get_or_create", lambda: (b"p" * 32, b"q" * 32))
+    monkeypatch.setattr(cli.policy, "digest", lambda: "policy")
+    monkeypatch.setattr(
+        cli.httpx,
+        "post",
+        lambda url, **kwargs: requests.append(url)
+        or types.SimpleNamespace(status_code=401, text='{"detail":"Unauthorized"}'),
+    )
+
+    for url in (
+        "https://hands.example.com/",
+        "https://hands.example.com/api/plugins/hermes-hands/",
+    ):
+        assert cli._pair(url, "laptop", "code") == 1
+
+    assert requests == [
+        "https://hands.example.com/api/plugins/hermes-hands/pair",
+        "https://hands.example.com/api/plugins/hermes-hands/pair",
+    ]
+    assert "use the base URL, e.g. https://hands.example.com" in capsys.readouterr().err

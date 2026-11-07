@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import shlex
 from urllib.parse import urlsplit
 
 import httpx
@@ -20,6 +21,8 @@ def register_cli(ctx) -> None:
         revoke.add_argument("--yes", action="store_true")
         commands.add_parser("setup")
         commands.add_parser("doctor")
+        pair = commands.add_parser("pair")
+        pair.add_argument("name")
 
     def handler(args):
         action = args.hands_action
@@ -31,6 +34,19 @@ def register_cli(ctx) -> None:
         if action == "devices":
             for device in store.list_devices():
                 print(f"{device['name']}: {'online' if device['online'] else 'offline'}")
+            return
+        if action == "pair":
+            from hermes_cli.config import load_config_readonly
+
+            name = args.name
+            code = store.mint_pairing_code(name)
+            dashboard = (load_config_readonly() or {}).get("dashboard") or {}
+            gateway_url = (
+                dashboard.get("public_url")
+                or ctx.get_config("dashboard_url", default="http://127.0.0.1:9119")
+            )
+            command = f"hermes-hands pair {gateway_url} --name {shlex.quote(name)} --code {shlex.quote(code)}"
+            print(f"Pair code: {code}\nRun on the device: {command}")
             return
         if action == "revoke":
             if not args.yes and input(f"Revoke {args.name}? [y/N] ").strip().lower() != "y":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -10,6 +11,7 @@ from . import config
 from .protocol import b64u, generate_keypair, unb64u
 
 SERVICE = "hermes-hands"
+logger = logging.getLogger(__name__)
 
 
 def _keyring():
@@ -22,9 +24,17 @@ def _keyring():
 
 
 def get_or_create() -> tuple[bytes, bytes]:
+    if config.KEY_PATH.exists():
+        value = json.loads(config.KEY_PATH.read_text(encoding="utf-8-sig"))
+        return unb64u(value["private_key"]), unb64u(value["public_key"])
     keyring = _keyring()
     if keyring:
-        value = keyring.get_password(SERVICE, "device-private")
+        try:
+            value = keyring.get_password(SERVICE, "device-private")
+        except keyring.errors.KeyringError:
+            logger.warning("Keyring unavailable; using protected device key file")
+            keyring = None
+            value = None
         if value:
             private = unb64u(value)
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -32,13 +42,14 @@ def get_or_create() -> tuple[bytes, bytes]:
 
             public = Ed25519PrivateKey.from_private_bytes(private).public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
             return private, public
-    elif config.KEY_PATH.exists():
-        value = json.loads(config.KEY_PATH.read_text(encoding="utf-8-sig"))
-        return unb64u(value["private_key"]), unb64u(value["public_key"])
     private, public = generate_keypair()
     if keyring:
-        keyring.set_password(SERVICE, "device-private", b64u(private))
-    else:
+        try:
+            keyring.set_password(SERVICE, "device-private", b64u(private))
+        except keyring.errors.KeyringError:
+            logger.warning("Keyring unavailable; using protected device key file")
+            keyring = None
+    if not keyring:
         config.ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
         config.KEY_PATH.write_text(json.dumps({"private_key": b64u(private), "public_key": b64u(public)}), encoding="utf-8")
         if os.name == "nt":

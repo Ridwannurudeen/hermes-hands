@@ -22,18 +22,24 @@ API = "/api/plugins/hermes-hands"
 
 
 def _pair(url: str, name: str, code: str) -> int:
+    base_url = url.rstrip("/")
+    if base_url.endswith(API):
+        base_url = base_url[: -len(API)].rstrip("/")
+    pair_url = base_url + API + "/pair"
     private, public = get_or_create()
     body = {"name": name, "os": platform.platform(), "home": str(Path.home()), "public_key": b64u(public), "policy_hash": policy.digest(), "protocol": PROTOCOL_VERSION}
     body["sig"] = b64u(sign(private, canonical_json(body)))
-    response = httpx.post(url.rstrip("/") + API + "/pair", content=canonical_json(body), headers={"Authorization": f"Bearer {code}", "Content-Type": "application/json"}, timeout=30)
+    response = httpx.post(pair_url, content=canonical_json(body), headers={"Authorization": f"Bearer {code}", "Content-Type": "application/json"}, timeout=30)
     if response.status_code != 200:
         print(f"Pairing failed: HTTP {response.status_code} {response.text}", file=sys.stderr)
+        if response.status_code == 401:
+            print("Check the gateway URL: use the base URL, e.g. https://hands.example.com", file=sys.stderr)
         return 1
     try:
         data = response.json()
         relay_key = unb64u(data["relay_public_key"])
         response_ts, response_nonce = int(response.headers["X-Hands-Ts"]), response.headers["X-Hands-Nonce"]
-        response_path = urlparse(url.rstrip("/") + API + "/pair").path
+        response_path = urlparse(pair_url).path
         valid_signature = verify_request(relay_key, response.headers["X-Hands-Signature"], R2D, response_ts, response_nonce, "POST", response_path, response.content)
     except (KeyError, ValueError, TypeError):
         valid_signature = False
@@ -43,7 +49,7 @@ def _pair(url: str, name: str, code: str) -> int:
     if not re.fullmatch(r"[a-z0-9-]{1,40}", data.get("device_id", "")) or len(relay_key) != 32 or not fresh(response_ts, int(time.time())) or not valid_signature:
         print("Pairing failed: invalid relay signature", file=sys.stderr)
         return 1
-    config.save({"gateway_url": url.rstrip("/") + API, "device_id": data["device_id"], "relay_public_key": data["relay_public_key"]})
+    config.save({"gateway_url": base_url + API, "device_id": data["device_id"], "relay_public_key": data["relay_public_key"]})
     print(f"Paired as {data['device_id']}")
     return 0
 
