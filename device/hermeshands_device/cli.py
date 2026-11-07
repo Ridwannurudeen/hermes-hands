@@ -16,6 +16,7 @@ import httpx
 from . import config, executor, policy
 from .keys import get_or_create, remove as remove_key
 from .protocol import PROTOCOL_VERSION, R2D, b64u, canonical_json, fresh, sign, unb64u, verify_request
+from . import service
 
 API = "/api/plugins/hermes-hands"
 
@@ -91,6 +92,9 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--allow-screen", action="store_true")
     subs.add_parser("status")
     subs.add_parser("doctor")
+    install_service = subs.add_parser("install-service")
+    install_service.add_argument("--dry-run", action="store_true")
+    install_service.add_argument("--remove", action="store_true")
     pol = subs.add_parser("policy")
     pol.add_argument("action", choices=("show", "reset"))
     subs.add_parser("unpair")
@@ -111,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "doctor":
         return _doctor()
+    if args.command == "install-service":
+        return service.install(dry_run=args.dry_run, remove=args.remove)
     if args.command == "policy":
         if args.action == "show":
             policy.show()

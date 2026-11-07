@@ -11,7 +11,7 @@ def test_config_round_trip_and_paths(tmp_path, monkeypatch):
     assert config.gateway_url() == "https://example.test/api/plugins/hermes-hands"
     assert config.device_id() == "device-1"
     assert config.relay_public_key() == b"k" * 32
-    assert json.loads(config.CONFIG_PATH.read_text(encoding="utf-8"))["device_id"] == "device-1"
+    assert json.loads(config.CONFIG_PATH.read_text(encoding="utf-8-sig"))["device_id"] == "device-1"
 
 
 def test_status_and_policy_cli(monkeypatch, tmp_path, capsys):

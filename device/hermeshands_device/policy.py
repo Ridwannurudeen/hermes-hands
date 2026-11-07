@@ -25,7 +25,7 @@ DEFAULTS = [
 
 def patterns() -> list[str]:
     if config.POLICY_PATH.exists():
-        deny = json.loads(config.POLICY_PATH.read_text(encoding="utf-8"))["deny"]
+        deny = json.loads(config.POLICY_PATH.read_text(encoding="utf-8-sig"))["deny"]
     else:
         deny = DEFAULTS.copy()
     return deny

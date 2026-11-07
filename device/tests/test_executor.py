@@ -57,7 +57,7 @@ def test_grandchild_killed_on_posix(monkeypatch, tmp_path):
     chunks = b"".join(executor.run("sleep 30 & echo $!; wait", timeout=0.2))
     child_pid = int(chunks.splitlines()[0])
     with pytest.raises(ProcessLookupError):
-        os.kill(child_pid, 0)
+        os.kill(child_pid, 0)  # windows-footgun: ok -- POSIX-only test for killpg behavior
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows taskkill tree behavior")

@@ -33,7 +33,7 @@ def get_or_create() -> tuple[bytes, bytes]:
             public = Ed25519PrivateKey.from_private_bytes(private).public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
             return private, public
     elif config.KEY_PATH.exists():
-        value = json.loads(config.KEY_PATH.read_text(encoding="utf-8"))
+        value = json.loads(config.KEY_PATH.read_text(encoding="utf-8-sig"))
         return unb64u(value["private_key"]), unb64u(value["public_key"])
     private, public = generate_keypair()
     if keyring:

@@ -70,7 +70,7 @@ def _terminate(proc: subprocess.Popen, start_time: float) -> None:
             proc.kill()
     else:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok -- POSIX-only branch
         except ProcessLookupError:
             pass
 

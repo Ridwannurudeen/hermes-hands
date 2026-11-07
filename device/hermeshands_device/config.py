@@ -13,7 +13,7 @@ OUT_DIR = ROOT / "out"
 
 def load() -> dict:
     if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     return {}
 
 
