@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import platform
+import random
 import threading
 import time
 from pathlib import Path
@@ -12,7 +14,9 @@ import httpx
 
 from . import __version__, config, executor, policy, screen
 from .keys import get_or_create
-from .protocol import D2R, R2D, canonical_json, fresh, make_bearer, new_nonce, sign_request, verify_request
+from .protocol import D2R, R2D, canonical_json, fresh, make_bearer, new_nonce, request_message, sign_request, verify
+
+logger = logging.getLogger(__name__)
 
 
 class DeviceLoop:
@@ -46,15 +50,29 @@ class DeviceLoop:
             raise PermissionError("device authentication failed")
         if response.status_code == 204:
             return {}
-        ts, nonce = int(response.headers["X-Hands-Ts"]), response.headers["X-Hands-Nonce"]
-        if not fresh(ts, int(time.time())) or not verify_request(config.relay_public_key(), response.headers["X-Hands-Signature"], R2D, ts, nonce, "POST", urlparse(config.gateway_url()).path.rstrip("/") + endpoint, response.content):
-            raise PermissionError("invalid relay signature")
+        if response.status_code == 409:
+            if response.json().get("error") == "policy_changed":
+                self._cancel_all()
+                logger.warning("Relay policy changed; cancelling running jobs and backing off")
+                raise PermissionError("policy_changed")
+            raise ValueError(f"unexpected relay status {response.status_code}")
+        if response.status_code != 200:
+            raise ValueError(f"unexpected relay status {response.status_code}")
+        try:
+            ts = int(response.headers["X-Hands-Ts"])
+            nonce = response.headers["X-Hands-Nonce"]
+            request_nonce = response.request.headers["X-Hands-Nonce"]
+            signature = response.headers["X-Hands-Signature"]
+            path = urlparse(config.gateway_url()).path.rstrip("/") + endpoint
+            valid = nonce == request_nonce and fresh(ts, int(time.time())) and verify(
+                config.relay_public_key(), signature.encode("ascii"), request_message(R2D, ts, nonce, "POST", path, response.content)
+            )
+        except (KeyError, ValueError, UnicodeEncodeError, httpx.RequestNotRead):
+            valid = False
+        if not valid:
+            logger.warning("Dropping invalid relay reply for %s", endpoint)
+            raise PermissionError("invalid relay response")
         payload = response.json()
-        if response.status_code == 409 and payload.get("error") == "policy_changed":
-            self._cancel_all()
-            failure = PermissionError("policy_changed")
-            self.fatal.append(failure)
-            raise failure
         return payload
 
     def _cancel_all(self) -> None:
@@ -109,7 +127,10 @@ class DeviceLoop:
                     _terminate(target[0], target[1])
                 self._result(job_id, seq, done=True, returncode=0)
         except PermissionError as exc:
-            if str(exc) in {"unknown_device", "policy_changed"}:
+            if str(exc) == "unknown_device":
+                return
+            if str(exc) == "policy_changed":
+                self.stop_event.wait(30)
                 return
             self._result(job_id, seq, done=True, returncode=1, error=str(exc))
         except Exception as exc:
@@ -150,6 +171,7 @@ class DeviceLoop:
             except PermissionError as exc:
                 if str(exc) == "unknown_device":
                     raise
-                time.sleep(2)
+                time.sleep(random.uniform(1, 3))
             except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError):
-                time.sleep(2)
+                logger.warning("Device poll failed; retrying")
+                time.sleep(random.uniform(1, 3))

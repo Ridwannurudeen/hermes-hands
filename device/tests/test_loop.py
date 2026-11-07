@@ -4,7 +4,7 @@ import threading
 import httpx
 
 from hermeshands_device import loop, config
-from hermeshands_device.protocol import generate_keypair
+from hermeshands_device.protocol import R2D, generate_keypair, sign_request
 
 
 def test_loop_rejects_bad_signature(monkeypatch):
@@ -25,6 +25,45 @@ def test_loop_rejects_bad_signature(monkeypatch):
             raise AssertionError("bad signature accepted")
     finally:
         agent.client.close()
+
+
+def test_loop_requires_reply_nonce_to_match_request(monkeypatch):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
+    monkeypatch.setattr(config, "device_id", lambda: "device-1")
+    monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    body = b'{"job_id":"x","type":"exec","script":"echo bad"}'
+    ts = int(time.time())
+
+    def handler(request):
+        path = "/api/plugins/hermes-hands/device/poll"
+        return httpx.Response(200, content=body, request=request, headers={
+            "X-Hands-Ts": str(ts), "X-Hands-Nonce": "different",
+            "X-Hands-Signature": sign_request(private, R2D, ts, "different", "POST", path, body),
+        })
+
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(handler))
+    try:
+        try:
+            agent._verify_response(agent._post("/device/poll", {"wait": 25}), "/device/poll")
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("reply with an unrelated nonce accepted")
+    finally:
+        agent.client.close()
+
+
+def test_loop_204_is_no_job_and_non_200_is_not_parsed():
+    agent = object.__new__(loop.DeviceLoop)
+    assert agent._verify_response(httpx.Response(204), "/device/poll") == {}
+    try:
+        agent._verify_response(httpx.Response(202, json={"job_id": "x", "type": "exec"}), "/device/poll")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("non-200 reply accepted as a job")
 
 
 def test_loop_posts_seq_ordered_chunks(monkeypatch):
