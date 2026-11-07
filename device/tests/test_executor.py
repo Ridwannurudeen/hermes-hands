@@ -21,6 +21,26 @@ def test_windowsapps_which_candidate_rejected(monkeypatch, tmp_path):
     assert executor.resolve_bash() is None
 
 
+def test_resolve_bash_probes_each_candidate_once(monkeypatch, tmp_path):
+    bash = tmp_path / "bash.exe"
+    bash.write_bytes(b"")
+    monkeypatch.setattr(executor, "_PROBED", set())
+    monkeypatch.setattr(executor.os, "name", "nt")
+    monkeypatch.setenv("HERMES_HANDS_BASH", str(bash))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "none"))
+    monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    probes = []
+    monkeypatch.setattr(
+        executor.subprocess, "run", lambda args, **kwargs: probes.append(args) or subprocess.CompletedProcess(args, 0)
+    )
+    assert executor.resolve_bash() == executor.resolve_bash() == str(bash)
+    assert probes == [[str(bash), "-c", "exit 0"]]
+    bash.unlink()
+    assert executor.resolve_bash() is None  # a bash that went away is still noticed
+
+
 def test_real_bash_execution(monkeypatch, tmp_path):
     bash = executor.resolve_bash()
     if not bash:

@@ -101,7 +101,6 @@ class Device:
 @pytest.fixture
 def wired(hands_db, monkeypatch):
     """A Relay reachable through ``client``; returns ``(hub, keys)``."""
-    monkeypatch.setattr(relay, "_TICK", 0.01)
     keys = relay.derive_keys(SEED)
     hub = relay.Relay(keys)
 

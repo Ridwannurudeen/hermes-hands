@@ -197,6 +197,33 @@ def test_loop_posts_seq_ordered_chunks(monkeypatch):
     assert posted[-1][1]["done"] is True
 
 
+def test_loop_sends_output_read_after_exit_with_done(monkeypatch):
+    posted = []
+    agent = object.__new__(loop.DeviceLoop)
+    agent.processes = {}
+    agent.running = {}
+    exited = []
+
+    class Process:
+        def poll(self):
+            return 3 if exited else None
+
+    def run(*args, on_start, on_exit, **kwargs):
+        on_start(Process(), 0.0)
+        yield b"running "
+        exited.append(True)
+        yield b"after "
+        yield b"exit"
+        on_exit(3)
+
+    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.executor, "run", run)
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((seq, kwargs)))
+    agent._run_job({"job_id": "job", "type": "exec", "script": "echo hi"})
+    assert posted == [(0, {"chunk": "running "}), (1, {"chunk": "after exit", "done": True, "returncode": 3})]
+
+
 def test_loop_allows_core_background_pid_liveness_probe(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.stop_event = threading.Event()
@@ -211,7 +238,7 @@ def test_loop_allows_core_background_pid_liveness_probe(monkeypatch):
     monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter((b"0\n",)))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
     agent._run_job({"job_id": "probe", "type": "exec", "script": script})
-    assert posted == [{"chunk": "0\n"}, {"done": True, "returncode": 0}]
+    assert posted == [{"chunk": "0\n"}, {"chunk": "", "done": True, "returncode": 0}]
 
 
 def test_loop_refuses_denied_commands_even_when_preceded_by_background_probe(monkeypatch):
@@ -298,7 +325,7 @@ def test_policy_change_cancels_jobs_without_stopping_agent(monkeypatch):
     monkeypatch.setattr(loop.executor, "run", lambda *a, **kw: iter(()))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
     agent._run_job({"job_id": "later", "type": "exec", "script": "echo hi"})
-    assert posted == [{"done": True, "returncode": 0}]
+    assert posted == [{"chunk": "", "done": True, "returncode": 0}]
 
 
 def test_stopping_during_result_delivery_does_not_escape_job_thread(monkeypatch):

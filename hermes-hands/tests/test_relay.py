@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import threading
+import time
 
 import pytest
 
@@ -13,8 +14,7 @@ PEER = "203.0.113.7"
 
 
 @pytest.fixture
-def hub(hands_db, monkeypatch):
-    monkeypatch.setattr(relay, "_TICK", 0.01)
+def hub(hands_db):
     return relay.Relay(relay.derive_keys(SEED))
 
 
@@ -114,6 +114,59 @@ def test_exec_round_trip_in_seq_order(hub):
 def test_poll_times_out_with_204(hub):
     reply, _, _ = device_call(hub, Device(), "device_poll", "/device/poll", {"wait": 0})
     assert (reply.status, reply.body) == (204, b"")
+
+
+def started(call):
+    """``call`` on a thread, so in an event loop of its own; returns a join giving its result."""
+    out = []
+    thread = threading.Thread(target=lambda: out.append(call()), daemon=True)
+    thread.start()
+
+    def join():
+        thread.join(15)
+        return out[0]
+
+    return join
+
+
+def until_waiting(hub, key):
+    deadline = time.monotonic() + 5
+    while key not in hub._waiters:
+        assert time.monotonic() < deadline, f"nothing waited on {key}"
+        time.sleep(0.005)
+
+
+def test_waiting_poll_wakes_when_a_job_is_queued(hub):
+    device = Device()
+    poll = started(lambda: device_call(hub, device, "device_poll", "/device/poll", {"wait": 10}))
+    until_waiting(hub, device.device_id)
+    begun = time.monotonic()
+    job_id = body(local(hub, "local_exec", {"device": "laptop", "script": "true", "timeout": 5}))[
+        "job_id"
+    ]
+    reply, path, _ = poll()
+    assert verified(hub, reply, path)["job_id"] == job_id
+    assert time.monotonic() - begun < 5  # woken by the job, not the 10 s deadline
+    assert hub._waiters == {}
+
+
+def test_waiting_output_wakes_on_a_result_that_carries_a_chunk_with_done(hub, monkeypatch):
+    monkeypatch.setattr(relay, "_LIVENESS_EVERY", 30)  # only a wake can end the wait early
+    device = Device()
+    job_id = body(
+        local(hub, "local_exec", {"device": "laptop", "script": "echo hi", "timeout": 5})
+    )["job_id"]
+    device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    output = started(
+        lambda: body(local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 10}))
+    )
+    until_waiting(hub, job_id)
+    begun = time.monotonic()
+    post_result(hub, device, job_id, 0, "hi\n", done=True, returncode=4)
+    out = output()
+    assert (out["chunks"], out["next"], out["done"], out["returncode"]) == (["hi\n"], 1, True, 4)
+    assert time.monotonic() - begun < 5  # woken by the result, not the 10 s deadline
+    assert hub._waiters == {}
 
 
 def test_device_request_signature_is_checked_unsigned(hub):

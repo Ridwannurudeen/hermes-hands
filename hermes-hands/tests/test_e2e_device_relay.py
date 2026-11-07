@@ -153,7 +153,6 @@ def rig(hands_db, tmp_path, monkeypatch):
     provider = dict(ctx.calls)["auth"]
     hands = sys.modules["hermes_plugins.hermes_hands.hands"]  # imported by register()
     monkeypatch.setattr(hands.relay.Relay, "start", lambda self: None)  # no heartbeat thread
-    monkeypatch.setattr(hands.relay, "_TICK", 0.01)
     monkeypatch.setattr(hands.relay, "MAX_POLL_WAIT", 1)  # the agent's 25 s long-poll, shortened
 
     code = hands.store.mint_pairing_code("laptop")

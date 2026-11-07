@@ -36,7 +36,6 @@ def plugin(hands_db, monkeypatch):
     package.register(ctx)
     hands = sys.modules["hermes_plugins.hermes_hands.hands"]
     monkeypatch.setattr(hands.relay.Relay, "start", lambda self: None)
-    monkeypatch.setattr(hands.relay, "_TICK", 0.01)
     provider = dict((kind, obj) for kind, obj in ctx.calls if kind == "auth")["auth"]
     yield ctx, hands, provider
     registry.unregister_global_provider(provider.name, provider)

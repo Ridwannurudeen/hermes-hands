@@ -52,7 +52,6 @@ MAX_POLL_WAIT = 25
 MAX_OUTPUT_WAIT = 20
 MAX_PNG_BYTES = 2 * 1024 * 1024
 _MAX_PNG_B64 = 4 * -(-MAX_PNG_BYTES // 3)
-_TICK = 0.05
 _LIVENESS_EVERY = 1.0
 _ABANDONED_AFTER = 60  # seconds without a gateway fetch: the caller is gone, cancel the job
 _HEARTBEAT_EVERY = 5
@@ -151,6 +150,8 @@ class Relay:
             str, tuple[float, int]
         ] = {}  # client address -> (window start, count)
         self._refused: set[str] = set()  # devices currently refused for a changed deny-list
+        # Long-polls waiting for a change, by device id (a queued job) or job id (output, the end).
+        self._waiters: dict[str, set[tuple[asyncio.AbstractEventLoop, asyncio.Future]]] = {}
 
     # --- lifecycle -----------------------------------------------------------------------------
     def start(self) -> None:
@@ -192,9 +193,9 @@ class Relay:
             {"X-Hands-Ts": str(ts), "X-Hands-Nonce": nonce, "X-Hands-Signature": signature},
         )
 
-    @staticmethod
-    def _finish_locked(job: _Job, returncode: int, error: str) -> None:
+    def _finish_locked(self, job: _Job, returncode: int, error: str) -> None:
         job.done, job.returncode, job.error = True, returncode, error
+        self._wake_locked(job.job_id)
 
     def _cancel_locked(self, job: _Job) -> None:
         if job.done:
@@ -203,6 +204,7 @@ class Relay:
         if job.picked:
             cancel = {"job_id": secrets.token_hex(8), "type": "cancel", "target_job_id": job.job_id}
             self._queues.setdefault(job.device_id, deque()).append(cancel)
+            self._wake_locked(job.device_id)
 
     def _fail_device(self, device_id: str, error: str) -> None:
         with self._lock:
@@ -211,18 +213,47 @@ class Relay:
                 if job.device_id == device_id and not job.done:
                     self._finish_locked(job, UNREACHABLE, error)
 
-    def _pop(self, device_id: str) -> dict | None:
-        with self._lock:
-            queue = self._queues.get(device_id)
-            while queue:
-                payload = queue.popleft()
-                if payload["type"] == "cancel":
-                    return payload
-                job = self._jobs.get(payload["job_id"])
-                if job is not None and not job.done:
-                    job.picked = True
-                    return payload
+    def _pop_locked(self, device_id: str) -> dict | None:
+        queue = self._queues.get(device_id)
+        while queue:
+            payload = queue.popleft()
+            if payload["type"] == "cancel":
+                return payload
+            job = self._jobs.get(payload["job_id"])
+            if job is not None and not job.done:
+                job.picked = True
+                return payload
         return None
+
+    # --- long-poll wakeups --------------------------------------------------------------------
+    def _waiter_locked(self, key: str) -> tuple[asyncio.AbstractEventLoop, asyncio.Future]:
+        """Register a wait on ``key`` in the same lock hold as the caller's check of the state it
+        waits for, so a change made after that check always wakes it. The future belongs to the
+        caller's own event loop (the dashboard's, or one per request under a test client), and any
+        thread wakes it through that loop."""
+        loop = asyncio.get_running_loop()
+        waiter = (loop, loop.create_future())
+        self._waiters.setdefault(key, set()).add(waiter)
+        return waiter
+
+    async def _wait(self, key: str, waiter, timeout: float) -> None:
+        """Until ``key`` is woken or ``timeout`` passes; the caller then checks the state again."""
+        try:
+            await asyncio.wait([waiter[1]], timeout=timeout)
+        finally:
+            with self._lock:
+                waiting = self._waiters.get(key)
+                if waiting is not None:
+                    waiting.discard(waiter)
+                    if not waiting:
+                        del self._waiters[key]
+
+    def _wake_locked(self, key: str) -> None:
+        for loop, future in self._waiters.pop(key, ()):
+            try:
+                loop.call_soon_threadsafe(future.set_result, None)
+            except RuntimeError:
+                pass  # that loop has closed, so nothing waits there any more
 
     def _take_locked(self, job: _Job, after: int) -> dict:
         """Chunks from seq ``after`` on (older ones are freed); the job is dropped once done is handed out."""
@@ -413,14 +444,19 @@ class Relay:
         refusal = self._seen_refusal(ok, device, path, nonce, peer)
         if refusal is not None:
             return refusal
-        deadline = time.monotonic() + wait
+        device_id, deadline = device["device_id"], time.monotonic() + wait
         while True:
-            job = self._pop(device["device_id"])
+            with self._lock:
+                job = self._pop_locked(device_id)
+                remaining = deadline - time.monotonic()
+                waiter = (
+                    None if job is not None or remaining <= 0 else self._waiter_locked(device_id)
+                )
             if job is not None:
                 return self._signed(200, job, path, nonce)
-            if time.monotonic() >= deadline:
+            if waiter is None:
                 return Reply(204)
-            await asyncio.sleep(_TICK)
+            await self._wait(device_id, waiter, remaining)
 
     async def device_result(self, principal, headers, path: str, body: bytes, peer: str) -> Reply:
         device, nonce, refusal = await asyncio.to_thread(
@@ -471,6 +507,7 @@ class Relay:
                     job.received += 1
                 if job.final_seq is not None and job.received > job.final_seq:
                     job.done = True
+                self._wake_locked(job_id)
         return self._signed(200, {"ok": True, "cancel": False}, path, nonce)
 
     async def device_heartbeat(
@@ -540,6 +577,7 @@ class Relay:
         with self._lock:
             self._jobs[job_id] = _Job(job_id, device["device_id"], name)
             self._queues.setdefault(device["device_id"], deque()).append(payload)
+            self._wake_locked(device["device_id"])
         return Reply.json(200, {"job_id": job_id})
 
     async def local_output(self, principal, headers, path: str, body: bytes) -> Reply:
@@ -562,11 +600,12 @@ class Relay:
                 job.last_fetch = time.monotonic()
                 if job.done or job.received > after or job.last_fetch >= deadline:
                     return Reply.json(200, self._take_locked(job, after))
-            if time.monotonic() >= next_check:
+                waiter = None if job.last_fetch >= next_check else self._waiter_locked(job_id)
+            if waiter is None:
                 await asyncio.to_thread(self._check_device, job)
                 next_check = time.monotonic() + _LIVENESS_EVERY
                 continue
-            await asyncio.sleep(_TICK)
+            await self._wait(job_id, waiter, min(deadline, next_check) - time.monotonic())
 
     async def local_cancel(self, principal, headers, path: str, body: bytes) -> Reply:
         refusal = self._local_refusal(principal, headers)

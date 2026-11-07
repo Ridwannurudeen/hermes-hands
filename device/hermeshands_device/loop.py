@@ -127,11 +127,17 @@ class DeviceLoop:
                 if refused:
                     self._result(job_id, seq, chunk=f"Policy refused command matching: {refused}\n", done=True, returncode=126)
                     return
-                exit_code = [0]
+                exit_code, tail = [0], b""
                 for chunk in executor.run(job["script"], login=job.get("login", False), timeout=job.get("timeout", 120), job_id=job_id, on_start=lambda proc, started: self.processes.__setitem__(job_id, (proc, started)), on_exit=lambda code: exit_code.__setitem__(0, code)):
+                    process = self.processes.get(job_id)
+                    if process is not None and process[0].poll() is not None:
+                        tail += chunk  # read after bash exited: it goes with done, in one result
+                        if len(tail) < executor.CHUNK_SIZE:
+                            continue
+                        chunk, tail = tail, b""
                     self._result(job_id, seq, chunk=chunk.decode("utf-8", errors="replace"))
                     seq += 1
-                self._result(job_id, seq, done=True, returncode=exit_code[0])
+                self._result(job_id, seq, chunk=tail.decode("utf-8", errors="replace"), done=True, returncode=exit_code[0])
             elif job["type"] == "screenshot":
                 image = screen.capture(allow_screen=self.allow_screen)
                 self._result(job_id, seq, done=True, png=image)
