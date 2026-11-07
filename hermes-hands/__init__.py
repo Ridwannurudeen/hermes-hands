@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 
 def register(ctx) -> None:
     """Load-time registration. The relay seed is read here, once, under the plugin manager's home
@@ -26,3 +28,9 @@ def register(ctx) -> None:
     commands.register_commands(ctx)
     cli.register_cli(ctx)
     tools.register_tools(ctx)
+    ctx.register_skill(
+        "hands",
+        Path(__file__).parent / "skills" / "hands" / "SKILL.md",
+        "Work on a paired Hermes Hands device: Git Bash paths on Windows, what hands errors (255, 126)"
+        " mean, and device screenshots.",
+    )
