@@ -14,6 +14,7 @@ blocking work on worker threads (the dashboard event loop is shared).
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 
 from fastapi import APIRouter, Request
@@ -21,16 +22,38 @@ from fastapi.responses import JSONResponse, Response
 from hermes_cli.dashboard_auth import get_provider
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
+_PROVIDER = "hermes-hands"
 _NOT_LOADED = "hands: Hermes Hands is not loaded in this process."
 
 
 def _plugin():
-    """``(token provider, hands package)`` of the plugin loaded in this process, or None."""
-    provider = get_provider("hermes-hands")
-    if provider is None:
+    """``(token provider, hands package)`` of the plugin loaded in this process, or None: also when
+    the registered provider is not ours in this process (another class under the name, or a proxy
+    under ``plugins.isolation: host`` whose package is not importable here)."""
+    try:
+        provider = get_provider(_PROVIDER)
+        if provider is None:
+            return None
+        hands = sys.modules.get(type(provider).__module__.rpartition(".")[0])
+        ours = (
+            hands is not None
+            and provider.name == _PROVIDER
+            and hasattr(hands, "relay")
+            and hasattr(provider, "keys")
+        )
+    except Exception:
+        logger.warning("hermes-hands: plugin routes cannot reach the loaded plugin", exc_info=True)
         return None
-    return provider, sys.modules[type(provider).__module__.rpartition(".")[0]]
+    if not ours:
+        logger.warning(
+            "hermes-hands: the %r token provider here is %s, not this plugin's",
+            _PROVIDER,
+            type(provider).__qualname__,
+        )
+        return None
+    return provider, hands
 
 
 def _in_gateway(request: Request) -> bool:
@@ -46,7 +69,7 @@ def _response(reply) -> Response:
     )
 
 
-async def _relay_call(request: Request, handler: str) -> Response:
+async def _relay_call(request: Request, handler: str, **extra) -> Response:
     plugin = _plugin()
     if plugin is None:
         return JSONResponse({"error": "not_loaded", "detail": _NOT_LOADED}, status_code=503)
@@ -57,8 +80,14 @@ async def _relay_call(request: Request, handler: str) -> Response:
     principal = getattr(request.state, "token_principal", None)
     body = await request.body()
     return _response(
-        await getattr(served, handler)(principal, request.headers, request.url.path, body)
+        await getattr(served, handler)(principal, request.headers, request.url.path, body, **extra)
     )
+
+
+def _peer(request: Request) -> str:
+    """The client address, as core's auth audit takes it (``request_utils.py:20-27``): the ASGI peer,
+    which the server rewrites from X-Forwarded-For only for its trusted proxies."""
+    return request.client.host if request.client else ""
 
 
 @router.post("/pair")
@@ -68,17 +97,17 @@ async def pair(request: Request) -> Response:
 
 @router.post("/device/poll")
 async def device_poll(request: Request) -> Response:
-    return await _relay_call(request, "device_poll")
+    return await _relay_call(request, "device_poll", peer=_peer(request))
 
 
 @router.post("/device/result")
 async def device_result(request: Request) -> Response:
-    return await _relay_call(request, "device_result")
+    return await _relay_call(request, "device_result", peer=_peer(request))
 
 
 @router.post("/device/heartbeat")
 async def device_heartbeat(request: Request) -> Response:
-    return await _relay_call(request, "device_heartbeat")
+    return await _relay_call(request, "device_heartbeat", peer=_peer(request))
 
 
 @router.post("/local/exec")

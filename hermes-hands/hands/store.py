@@ -47,8 +47,7 @@ CREATE TABLE IF NOT EXISTS session_targets (
 );
 CREATE TABLE IF NOT EXISTS session_marks (
     session_key TEXT PRIMARY KEY,
-    last_run TEXT,
-    noted TEXT
+    last_run TEXT
 );
 CREATE TABLE IF NOT EXISTS relay_heartbeat (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -110,17 +109,25 @@ def mint_pairing_code(name: str, ttl: int = 600) -> str:
     return code
 
 
-def pairing_code_name(code: str) -> str | None:
-    """The device name a live (unused, unexpired) pairing code was minted for, else None."""
+def _live_code(conn: sqlite3.Connection, code: str, now: int) -> sqlite3.Row | None:
+    """The live (unused, unexpired) row for ``code``. Every live digest is compared with
+    ``hmac.compare_digest``, so the match is never decided by an SQL equality on the secret."""
     digest = _code_hash(code)
+    match = None
+    rows = conn.execute(
+        "SELECT code_hash, name FROM pairing_codes WHERE used = 0 AND expires_at > ?", (now,)
+    ).fetchall()
+    for row in rows:
+        if hmac.compare_digest(row["code_hash"], digest):
+            match = row
+    return match
+
+
+def pairing_code_name(code: str) -> str | None:
+    """The device name a live pairing code was minted for, else None."""
     with _db() as conn:
-        row = conn.execute(
-            "SELECT code_hash, name FROM pairing_codes WHERE code_hash = ? AND used = 0 AND expires_at > ?",
-            (digest, int(time.time())),
-        ).fetchone()
-    return (
-        row["name"] if row is not None and hmac.compare_digest(row["code_hash"], digest) else None
-    )
+        row = _live_code(conn, code, int(time.time()))
+    return None if row is None else row["name"]
 
 
 def complete_pairing(
@@ -128,13 +135,9 @@ def complete_pairing(
 ) -> str:
     """Burn ``code`` and record the device in one transaction; returns the new device_id."""
     now = int(time.time())
-    digest = _code_hash(code)
     with _db() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT name FROM pairing_codes WHERE code_hash = ? AND used = 0 AND expires_at > ?",
-            (digest, now),
-        ).fetchone()
+        row = _live_code(conn, code, now)
         if row is None:
             raise PairingError(401, "bad_code")
         if row["name"] != name:
@@ -142,7 +145,7 @@ def complete_pairing(
         if conn.execute("SELECT 1 FROM devices WHERE name = ?", (name,)).fetchone() is not None:
             raise PairingError(409, "name_taken", name)
         device_id = secrets.token_hex(8)
-        conn.execute("UPDATE pairing_codes SET used = 1 WHERE code_hash = ?", (digest,))
+        conn.execute("UPDATE pairing_codes SET used = 1 WHERE code_hash = ?", (row["code_hash"],))
         conn.execute(
             "INSERT INTO devices (device_id, name, public_key, os, home, policy_hash, reported_policy_hash,"
             " policy_ok, paired_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
@@ -235,22 +238,22 @@ def get_session_target(session_key: str) -> str | None:
     return None if row is None else row["target"]
 
 
-def get_session_marks(session_key: str) -> tuple[str | None, str | None]:
-    """``(target the session's last command ran on, target its last target note named)``. The
-    terminal backend is rebuilt every turn, so these outlive it."""
+def get_last_run(session_key: str) -> str | None:
+    """The target the session's last command ran on. It outlives the terminal backend object (the
+    idle reaper, a gateway restart), so a cwd recorded on another target is never reused."""
     with _db() as conn:
         row = conn.execute(
-            "SELECT last_run, noted FROM session_marks WHERE session_key = ?", (session_key,)
+            "SELECT last_run FROM session_marks WHERE session_key = ?", (session_key,)
         ).fetchone()
-    return (None, None) if row is None else (row["last_run"], row["noted"])
+    return None if row is None else row["last_run"]
 
 
-def set_session_marks(session_key: str, last_run: str | None, noted: str | None) -> None:
+def set_last_run(session_key: str, target: str) -> None:
     with _db() as conn:
         conn.execute(
-            "INSERT INTO session_marks (session_key, last_run, noted) VALUES (?, ?, ?)"
-            " ON CONFLICT(session_key) DO UPDATE SET last_run = excluded.last_run, noted = excluded.noted",
-            (session_key, last_run, noted),
+            "INSERT INTO session_marks (session_key, last_run) VALUES (?, ?)"
+            " ON CONFLICT(session_key) DO UPDATE SET last_run = excluded.last_run",
+            (session_key, target),
         )
 
 

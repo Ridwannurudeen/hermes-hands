@@ -6,6 +6,7 @@ import pytest
 
 from hands import handle as handle_module
 from hands.handle import DEVICE_TIMEOUT_GRACE, RemoteProcessHandle
+from hands.relay import UNREACHABLE
 
 client = handle_module.client
 
@@ -82,7 +83,8 @@ def test_write_end_closes_before_exit_is_visible(fake):
     )
     relay.release.clear()
     proc = RemoteProcessHandle("laptop", "echo hi", login=True, timeout=30)
-    assert proc.poll() is None and proc.returncode is None and proc.wait(timeout=0.05) is None
+    assert proc.poll() is None and proc.returncode is None
+    assert proc.wait(timeout=0.05) == UNREACHABLE  # still running: an int, as the Protocol says
     assert not hasattr(proc, "pid")
     relay.release.set()
     assert wait_exit(proc) == 3

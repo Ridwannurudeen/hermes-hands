@@ -57,8 +57,11 @@ class RemoteProcessHandle:
     def poll(self) -> int | None:
         return self._returncode if self._done.is_set() else None
 
-    def wait(self, timeout: float | None = None) -> int | None:
-        self._done.wait(timeout=timeout)
+    def wait(self, timeout: float | None = None) -> int:
+        """The exit code; ``UNREACHABLE`` if it is still running after ``timeout`` (the Protocol's
+        ``-> int``, base_output.py:275, where Popen would raise TimeoutExpired)."""
+        if not self._done.wait(timeout=timeout):
+            return UNREACHABLE
         return self._returncode
 
     def kill(self) -> None:

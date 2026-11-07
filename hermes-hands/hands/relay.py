@@ -1,10 +1,11 @@
 """The relay: per-device job queues, long-polls, ordered results and signed replies.
 
 It lives in the ``hermes dashboard`` process only: ``dashboard/plugin_api.py`` calls :func:`serve` on
-the first request, and only when ``app.state.gateway_runner`` is None. Device-route replies are signed
-R2D with the relay key; the R2D nonce is the request's bearer nonce, which binds a reply to the request
-it answers. ``/local/*`` serves the gateway's loopback client (``client.py``). Framework-free: handlers
-take ``(principal, headers, path, body)`` and return a :class:`Reply`.
+the first request, and only when ``app.state.gateway_runner`` is None. Replies to an authenticated
+device are signed R2D with the relay key; the R2D nonce is the request's bearer nonce, which binds a
+reply to the request it answers. Refusals to callers that proved no key are unsigned. ``/local/*``
+serves the gateway's loopback client (``client.py``). Framework-free: handlers take ``(principal,
+headers, path, body)``, device routes also the client address ``peer``, and return a :class:`Reply`.
 """
 
 from __future__ import annotations
@@ -55,6 +56,9 @@ _TICK = 0.05
 _LIVENESS_EVERY = 1.0
 _ABANDONED_AFTER = 60  # seconds without a gateway fetch: the caller is gone, cancel the job
 _HEARTBEAT_EVERY = 5
+_UNKNOWN_LIMIT = 10  # unknown_device replies per client address per window
+_UNKNOWN_WINDOW = 60.0
+_UNKNOWN_TRACKED = 10_000  # addresses remembered before expired windows are dropped
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +143,10 @@ class Relay:
         self._lock = threading.Lock()
         self._jobs: dict[str, _Job] = {}
         self._queues: dict[str, deque] = {}
+        self._nonces = protocol.NonceCache()
+        self._unknown_hits: dict[
+            str, tuple[float, int]
+        ] = {}  # client address -> (window start, count)
 
     # --- lifecycle -----------------------------------------------------------------------------
     def start(self) -> None:
@@ -244,13 +252,16 @@ class Relay:
                 self._finish_locked(job, UNREACHABLE, error)
 
     # --- device routes -------------------------------------------------------------------------
-    def _device(self, principal, headers, path: str, body: bytes):
+    def _device(self, principal, headers, path: str, body: bytes, peer: str):
         """``(device, bearer nonce, None)`` for a verified device request, else ``(None, None, reply)``.
-        The token provider already checked the bearer signature, freshness and nonce; this checks the
-        request signature (X-Hands-Signature) over the same ts and nonce."""
+        The token provider checked the bearer's signature and freshness; this checks the request
+        signature (X-Hands-Signature) over the same ts and nonce, and only then burns the nonce, so a
+        caller without the device key cannot burn one. ``NonceCache.check_and_add`` is atomic, so of
+        two concurrent copies of one request exactly one gets through. Refusals here are unsigned: a
+        caller that has not proven a device key never gets a relay signature."""
         bearer = protocol.parse_bearer(_bearer(headers))
         if _has(principal, SCOPE_UNKNOWN):
-            return None, None, self._unknown(path, bearer.nonce if bearer is not None else None)
+            return None, None, self._unknown(peer)
         if (
             not _has(principal, SCOPE_DEVICE)
             or bearer is None
@@ -259,13 +270,11 @@ class Relay:
             return (
                 None,
                 None,
-                self._signed(
-                    401, {"error": "unauthenticated", "detail": messages.UNAUTHENTICATED}, path
-                ),
+                Reply.json(401, {"error": "unauthenticated", "detail": messages.UNAUTHENTICATED}),
             )
         device = store.device_by_id(bearer.device_id)
         if device is None:
-            return None, None, self._unknown(path, bearer.nonce)
+            return None, None, self._unknown(peer)
         if not protocol.verify_request(
             device["public_key"],
             headers.get("x-hands-signature", ""),
@@ -279,24 +288,44 @@ class Relay:
             return (
                 None,
                 None,
-                self._signed(
-                    401,
-                    {"error": "bad_signature", "detail": messages.UNAUTHENTICATED},
-                    path,
-                    bearer.nonce,
-                ),
+                Reply.json(401, {"error": "bad_signature", "detail": messages.UNAUTHENTICATED}),
             )
+        if not self._nonces.check_and_add(bearer.nonce, int(time.time())):
+            return None, None, Reply.json(401, {"error": "replayed", "detail": messages.REPLAYED})
         return device, bearer.nonce, None
 
-    def _unknown(self, path: str, nonce: str | None = None) -> Reply:
-        return self._signed(
-            401, {"error": "unknown_device", "detail": messages.UNKNOWN_DEVICE_WIRE}, path, nonce
+    def _unknown(self, peer: str) -> Reply:
+        """``401 unknown_device`` (the device stops on it), unsigned, at most ``_UNKNOWN_LIMIT`` per
+        client address per window; logged here because a forged bearer leaves no token-auth audit row."""
+        now = time.monotonic()
+        with self._lock:
+            start, count = self._unknown_hits.get(peer, (now, 0))
+            if now - start > _UNKNOWN_WINDOW:
+                start, count = now, 0
+            self._unknown_hits[peer] = (start, count + 1)
+            if len(self._unknown_hits) > _UNKNOWN_TRACKED:
+                self._unknown_hits = {
+                    ip: hit
+                    for ip, hit in self._unknown_hits.items()
+                    if now - hit[0] <= _UNKNOWN_WINDOW
+                }
+                if len(self._unknown_hits) > _UNKNOWN_TRACKED:
+                    self._unknown_hits.clear()
+        if count >= _UNKNOWN_LIMIT:
+            if count == _UNKNOWN_LIMIT:
+                logger.warning("hermes-hands: rate-limiting unknown_device replies to %s", peer)
+            return Reply.json(429, {"error": "rate_limited", "detail": messages.RATE_LIMITED})
+        logger.warning(
+            "hermes-hands: unknown_device from %s (unpaired or revoked device bearer)", peer
         )
+        return Reply.json(401, {"error": "unknown_device", "detail": messages.UNKNOWN_DEVICE_WIRE})
 
-    def _seen_refusal(self, ok: bool | None, device: dict, path: str, nonce: str) -> Reply | None:
+    def _seen_refusal(
+        self, ok: bool | None, device: dict, path: str, nonce: str, peer: str
+    ) -> Reply | None:
         """The reply for a device whose ``record_seen`` came back unknown or policy-refused, else None."""
         if ok is None:
-            return self._unknown(path, nonce)
+            return self._unknown(peer)
         if not ok:
             self._fail_device(device["device_id"], messages.policy_changed(device["name"]))
             return self._signed(
@@ -309,7 +338,7 @@ class Relay:
 
     async def pair(self, principal, headers, path: str, body: bytes) -> Reply:
         if not _has(principal, SCOPE_PAIR):
-            return self._signed(401, {"error": "bad_code", "detail": messages.PAIR_BAD_CODE}, path)
+            return Reply.json(401, {"error": "bad_code", "detail": messages.PAIR_BAD_CODE})
         try:
             request = json.loads(body)
             fields = {k: v for k, v in request.items() if k != "sig"}
@@ -354,9 +383,9 @@ class Relay:
             path,
         )
 
-    async def device_poll(self, principal, headers, path: str, body: bytes) -> Reply:
+    async def device_poll(self, principal, headers, path: str, body: bytes, peer: str) -> Reply:
         device, nonce, refusal = await asyncio.to_thread(
-            self._device, principal, headers, path, body
+            self._device, principal, headers, path, body, peer
         )
         if refusal is not None:
             return refusal
@@ -367,7 +396,7 @@ class Relay:
                 400, {"error": "bad_request", "detail": messages.BAD_REQUEST}, path, nonce
             )
         ok = await asyncio.to_thread(store.record_seen, device["device_id"])
-        refusal = self._seen_refusal(ok, device, path, nonce)
+        refusal = self._seen_refusal(ok, device, path, nonce, peer)
         if refusal is not None:
             return refusal
         deadline = time.monotonic() + wait
@@ -379,9 +408,9 @@ class Relay:
                 return Reply(204)
             await asyncio.sleep(_TICK)
 
-    async def device_result(self, principal, headers, path: str, body: bytes) -> Reply:
+    async def device_result(self, principal, headers, path: str, body: bytes, peer: str) -> Reply:
         device, nonce, refusal = await asyncio.to_thread(
-            self._device, principal, headers, path, body
+            self._device, principal, headers, path, body, peer
         )
         if refusal is not None:
             return refusal
@@ -404,7 +433,7 @@ class Relay:
         ok = await asyncio.to_thread(
             store.record_seen, device["device_id"], policy_hash=policy_hash
         )
-        refusal = self._seen_refusal(ok, device, path, nonce)
+        refusal = self._seen_refusal(ok, device, path, nonce, peer)
         if refusal is not None:
             return refusal
         with self._lock:
@@ -430,9 +459,11 @@ class Relay:
                     job.done = True
         return self._signed(200, {"ok": True, "cancel": False}, path, nonce)
 
-    async def device_heartbeat(self, principal, headers, path: str, body: bytes) -> Reply:
+    async def device_heartbeat(
+        self, principal, headers, path: str, body: bytes, peer: str
+    ) -> Reply:
         device, nonce, refusal = await asyncio.to_thread(
-            self._device, principal, headers, path, body
+            self._device, principal, headers, path, body, peer
         )
         if refusal is not None:
             return refusal
@@ -446,7 +477,7 @@ class Relay:
         ok = await asyncio.to_thread(
             store.record_seen, device["device_id"], policy_hash=policy_hash, os=device_os, home=home
         )
-        refusal = self._seen_refusal(ok, device, path, nonce)
+        refusal = self._seen_refusal(ok, device, path, nonce, peer)
         if refusal is not None:
             return refusal
         return self._signed(200, {"ok": True}, path, nonce)

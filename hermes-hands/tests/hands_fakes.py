@@ -138,7 +138,7 @@ class Agent:
 
     def _call(self, handler, route, payload):
         principal, headers, path, raw = self.device.request(route, payload)
-        return asyncio.run(getattr(self.hub, handler)(principal, headers, path, raw))
+        return asyncio.run(getattr(self.hub, handler)(principal, headers, path, raw, "10.0.0.2"))
 
     def _result(self, job_id, seq, chunk="", done=False, **extra):
         payload = {"job_id": job_id, "seq": seq, "chunk": chunk, "done": done}

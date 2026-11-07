@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import threading
 
 import pytest
 
@@ -8,6 +9,7 @@ from hands import messages, protocol, relay, store
 from hands_fakes import LOCAL, Device, Principal, hands_db  # noqa: F401  (fixture)
 
 SEED = "0f" * 32
+PEER = "203.0.113.7"
 
 
 @pytest.fixture
@@ -52,7 +54,7 @@ def local(hub, handler, payload, headers=None):
 
 def device_call(hub, device, handler, route, payload, **kwargs):
     principal, headers, path, raw = device.request(route, payload, **kwargs)
-    return run(getattr(hub, handler)(principal, headers, path, raw)), path, headers
+    return run(getattr(hub, handler)(principal, headers, path, raw, PEER)), path, headers
 
 
 def post_result(hub, device, job_id, seq, chunk="", done=False, **extra):
@@ -114,32 +116,79 @@ def test_poll_times_out_with_204(hub):
     assert (reply.status, reply.body) == (204, b"")
 
 
-def test_device_request_signature_is_checked(hub):
+def test_device_request_signature_is_checked_unsigned(hub):
     device = Device()
     reply, path, _ = device_call(
         hub, device, "device_poll", "/device/poll", {"wait": 0}, tamper=True
     )
-    assert reply.status == 401 and verified(hub, reply, path)["error"] == "bad_signature"
+    assert (reply.status, body(reply)["error"]) == (401, "bad_signature")
+    assert "X-Hands-Signature" not in reply.headers
     principal, headers, path, raw = device.request("/device/poll", {"wait": 0})
     other = Principal("someone-else", scopes=(relay.SCOPE_DEVICE,))
-    assert run(hub.device_poll(other, headers, path, raw)).status == 401
-    assert run(hub.device_poll(None, headers, path, raw)).status == 401
-    assert run(hub.device_poll(LOCAL, headers, path, raw)).status == 401
+    for wrong in (other, None, LOCAL):
+        refused = run(hub.device_poll(wrong, headers, path, raw, PEER))
+        assert refused.status == 401 and "X-Hands-Signature" not in refused.headers
 
 
-def test_unknown_device_is_told_so_signed(hub):
+def test_bad_signature_does_not_burn_the_nonce_and_replays_fail(hub):
+    device = Device()
+    principal, headers, path, raw = device.request("/device/poll", {"wait": 0})
+    forged = run(hub.device_poll(principal, headers, path, raw + b" ", PEER))
+    assert body(forged)["error"] == "bad_signature"
+    assert run(hub.device_poll(principal, headers, path, raw, PEER)).status == 204
+    replay = run(hub.device_poll(principal, headers, path, raw, PEER))
+    assert (replay.status, body(replay)["error"]) == (401, "replayed")
+    assert "X-Hands-Signature" not in replay.headers
+
+
+def test_concurrent_copies_of_one_request_get_through_once(hub):
+    device = Device()
+    principal, headers, path, raw = device.request("/device/poll", {"wait": 0})
+    start = threading.Barrier(8)
+    outcomes = []
+
+    def attempt():
+        start.wait()
+        outcomes.append(hub._device(principal, headers, path, raw, PEER)[2])
+
+    threads = [threading.Thread(target=attempt) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert sorted(refusal is None for refusal in outcomes) == [False] * 7 + [True]
+
+
+def test_unknown_device_is_unsigned_logged_and_rate_limited(hub, caplog):
     device = Device()
     store.revoke("laptop")
     principal, headers, path, raw = device.request(
         "/device/heartbeat", {"policy_hash": "p0", "os": "x", "home": "y"}
     )
     unknown = Principal(device.device_id, scopes=(relay.SCOPE_UNKNOWN,))
-    reply = run(hub.device_heartbeat(unknown, headers, path, raw))
-    assert reply.status == 401 and verified(hub, reply, path)["error"] == "unknown_device"
-    reply = run(
-        hub.device_heartbeat(principal, headers, path, raw)
-    )  # revoked between auth and handler
-    assert reply.status == 401 and verified(hub, reply, path)["error"] == "unknown_device"
+    caplog.set_level("WARNING", logger=relay.logger.name)
+    reply = run(hub.device_heartbeat(unknown, headers, path, raw, PEER))
+    assert (reply.status, body(reply)["error"]) == (401, "unknown_device")
+    assert "X-Hands-Signature" not in reply.headers
+    assert PEER in caplog.text
+    reply = run(hub.device_heartbeat(principal, headers, path, raw, PEER))  # revoked after auth
+    assert body(reply)["error"] == "unknown_device"
+    for _ in range(relay._UNKNOWN_LIMIT - 2):
+        assert run(hub.device_heartbeat(unknown, headers, path, raw, PEER)).status == 401
+    limited = run(hub.device_heartbeat(unknown, headers, path, raw, PEER))
+    assert (limited.status, body(limited)["error"]) == (429, "rate_limited")
+    assert run(hub.device_heartbeat(unknown, headers, path, raw, "198.51.100.1")).status == 401
+    assert "rate-limiting unknown_device replies to " + PEER in caplog.text
+
+
+def test_unknown_device_window_resets(hub, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(relay.time, "monotonic", lambda: clock[0])
+    for _ in range(relay._UNKNOWN_LIMIT):
+        assert hub._unknown(PEER).status == 401
+    assert hub._unknown(PEER).status == 429
+    clock[0] += relay._UNKNOWN_WINDOW + 1
+    assert hub._unknown(PEER).status == 401
 
 
 def test_local_routes_refuse_forwarded_and_foreign_principals(hub):
@@ -313,10 +362,8 @@ def test_pair_happy_path_and_refusals(hub):
     principal, headers, path, raw = pair_request(private, public, code)
     forged = raw.replace(b'"p0"', b'"p9"')
     assert run(hub.pair(principal, headers, path, forged)).status == 401
-    assert (
-        run(hub.pair(Principal("x", scopes=(relay.SCOPE_DEVICE,)), headers, path, raw)).status
-        == 401
-    )
+    no_code = run(hub.pair(Principal("x", scopes=(relay.SCOPE_DEVICE,)), headers, path, raw))
+    assert no_code.status == 401 and "X-Hands-Signature" not in no_code.headers
     reply = run(hub.pair(principal, headers, path, raw))
     paired = verified(hub, reply, path)
     assert (

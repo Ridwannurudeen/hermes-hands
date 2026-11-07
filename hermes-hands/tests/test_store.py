@@ -107,12 +107,33 @@ def test_session_targets(hands_db):
     assert (store.get_session_target("s1"), store.get_session_target("s2")) == ("server", "laptop")
 
 
-def test_session_marks(hands_db):
-    assert store.get_session_marks("s1") == (None, None)
-    store.set_session_marks("s1", "laptop", None)
-    store.set_session_marks("s1", "server", "server")
-    assert store.get_session_marks("s1") == ("server", "server")
-    assert store.get_session_marks("s2") == (None, None)
+def test_session_last_run(hands_db):
+    assert store.get_last_run("s1") is None
+    store.set_last_run("s1", "laptop")
+    store.set_last_run("s1", "server")
+    assert (store.get_last_run("s1"), store.get_last_run("s2")) == ("server", None)
+
+
+def test_pairing_codes_are_matched_with_compare_digest(hands_db, monkeypatch):
+    codes = [store.mint_pairing_code(name) for name in ("a", "b", "c")]
+    calls = []
+    real = store.hmac.compare_digest
+
+    def spy(left, right):
+        calls.append((left, right))
+        return real(left, right)
+
+    monkeypatch.setattr(store.hmac, "compare_digest", spy)
+    assert store.pairing_code_name(codes[1]) == "b"
+    assert len(calls) == 3  # every live candidate, not an SQL equality on the hash
+    calls.clear()
+    assert store.pairing_code_name("not-a-code") is None and len(calls) == 3
+    calls.clear()
+    store.complete_pairing(
+        codes[2], name="c", public_key="AA", os="Linux", home="/", policy_hash="p"
+    )
+    assert len(calls) == 3
+    assert store.pairing_code_name(codes[2]) is None and store.pairing_code_name(codes[0]) == "a"
 
 
 def test_relay_heartbeat(hands_db, monkeypatch):

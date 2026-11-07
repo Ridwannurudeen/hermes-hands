@@ -9,9 +9,11 @@ else.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
+import sqlite3
 import threading
 
 from gateway.session_context import get_session_env
@@ -20,6 +22,9 @@ from tools.environments.local import LocalEnvironment
 
 from . import messages, store, targets
 from .handle import RemoteProcessHandle
+from .relay import UNREACHABLE
+
+logger = logging.getLogger(__name__)
 
 _DRIVE_PATH = re.compile(r"^([A-Za-z]):[\\/]*(.*)$")
 
@@ -40,9 +45,12 @@ class DeviceEnvironment(BaseEnvironment):
     # write_file/patch content is embedded in the script as a heredoc (base.py:268-272, 702-705).
     _stdin_mode = "heredoc"
 
-    def __init__(self, name: str, *, cwd: str, timeout: int):
+    def __init__(self, name: str, *, cwd: str, timeout: int, home: str | None):
         super().__init__(cwd=cwd, timeout=timeout)
         self.name = name
+        self.home = (
+            home  # the home it reported at pairing, Git Bash form; None for an unknown device
+        )
         self._init_lock = threading.Lock()
         self._session_started = False
 
@@ -82,38 +90,62 @@ class HandsEnvironment(BaseEnvironment):
     ``cwd`` and ``env``, which here are proxies to the current target's sub-environment, and the
     snapshot state it sets up belongs to each sub-environment."""
 
+    # Keeps core from tearing the backend down after every turn (terminal_tool_lifecycle.py:258-271,
+    # agent/chat_completion_helpers.py:2334-2353); the idle reaper and AIAgent.close still clean up.
+    _persistent = True
+
     def __init__(self, ctx, *, cwd: str, timeout: int):
         self._ctx = ctx
         self._requested_cwd = cwd
         self._timeout = timeout
         self._lock = threading.Lock()
         self._subs: dict[str, BaseEnvironment] = {}
-        # Core rebuilds a non-persistent backend every turn (agent/chat_completion_helpers.py:2334-2353)
-        # and /hands use is its own turn, so where the session last ran and which target its last
-        # note named are kept in the store, not on this object.
+        self._store_failure_logged = False
+        # A new object notes the target of its first terminal command. Where the session last ran
+        # comes from the store: this object may be new since then (idle reaper, gateway restart).
+        self._noted_target: str | None = None
         session_key = get_session_env("HERMES_SESSION_KEY", "")
-        self._last_target, self._noted_target = (
-            store.get_session_marks(session_key) if session_key else (None, None)
-        )
+        try:
+            self._last_target = store.get_last_run(session_key) if session_key else None
+        except sqlite3.Error:
+            self._store_failed()
+            self._last_target = None
         # Create the first target now so ``cwd`` is already absolute when core stamps the sandbox
-        # home right after create_environment (terminal_tool_backends.py:213-232, 256).
+        # home right after create_environment (terminal_tool_backends.py:213-233, 256).
         self._current()
 
     # --- target resolution -----------------------------------------------------------------
-    def _target(self) -> str:
-        return targets.resolve_target(
-            session_key=get_session_env("HERMES_SESSION_KEY", ""),
-            in_cron=self._ctx.current_cron_execution() is not None,
-            default_target=str(self._ctx.get_config("default_target", targets.SERVER)),
-        )
+    def _store_failed(self) -> None:
+        if not self._store_failure_logged:
+            self._store_failure_logged = True
+            logger.warning("hermes-hands: the device store is unreadable", exc_info=True)
 
-    def _current(self) -> tuple[str, BaseEnvironment]:
-        target = self._target()
+    def _sub(self, target: str) -> tuple[str, BaseEnvironment]:
         with self._lock:
             sub = self._subs.get(target)
             if sub is None:
                 sub = self._subs[target] = self._create(target)
         return target, sub
+
+    def _resolve(self) -> tuple[str, BaseEnvironment]:
+        """This call's target and its sub-environment; raises ``sqlite3.Error`` if the store is unreadable."""
+        return self._sub(
+            targets.resolve_target(
+                session_key=get_session_env("HERMES_SESSION_KEY", ""),
+                in_cron=self._ctx.current_cron_execution() is not None,
+                default_target=str(self._ctx.get_config("default_target", targets.SERVER)),
+            )
+        )
+
+    def _current(self) -> tuple[str, BaseEnvironment]:
+        """``_resolve`` for core's attribute reads, which must never raise (file_operations.py:238-239,
+        terminal_tool.py:358-362, terminal_tool_backends.py:226): with the store unreadable the server
+        sub-environment answers them, while :meth:`execute` refuses to run anything."""
+        try:
+            return self._resolve()
+        except sqlite3.Error:
+            self._store_failed()
+            return self._sub(targets.SERVER)
 
     def _create(self, target: str) -> BaseEnvironment:
         requested = None if self._requested_cwd == "~" else self._requested_cwd
@@ -126,8 +158,10 @@ class HandsEnvironment(BaseEnvironment):
             cwd = requested or os.getenv("MESSAGING_CWD") or os.getcwd()
             return LocalEnvironment(cwd=cwd, timeout=self._timeout, persistent=persistent)
         device = store.get_device(target)
-        home = device_path(device["home"]) if device is not None else "~"
-        return DeviceEnvironment(target, cwd=requested or home, timeout=self._timeout)
+        home = device_path(device["home"]) if device is not None else None
+        return DeviceEnvironment(
+            target, cwd=requested or home or "~", timeout=self._timeout, home=home
+        )
 
     def _note(self, target: str) -> str:
         if target == targets.SERVER:
@@ -139,31 +173,38 @@ class HandsEnvironment(BaseEnvironment):
 
     # --- delegated surface -----------------------------------------------------------------
     def execute(self, command: str, cwd: str = "", **kwargs) -> dict:
-        target, sub = self._current()
+        note = None
+        try:
+            # Every store read and write happens before the command runs: an error after it would
+            # make the terminal tool retry, i.e. run the command again (terminal_tool.py:1363-1390).
+            target, sub = self._resolve()
+            # Only the foreground terminal tool sets bounded_capture (base.py:679-681); the file tools
+            # parse their raw output, so the note never goes there.
+            if kwargs.get("bounded_capture") and target != self._noted_target:
+                note = self._note(target)
+            session_key = get_session_env("HERMES_SESSION_KEY", "")
+            if session_key and target != self._last_target:
+                store.set_last_run(session_key, target)
+        except sqlite3.Error:
+            self._store_failed()
+            return {"output": messages.STORE_DOWN, "returncode": UNREACHABLE}
         if cwd == "~" or (self._last_target is not None and target != self._last_target):
             # ``~`` is the generic default and a cwd recorded before a switch names the other
             # target's directory: keep this target's own cwd instead.
             cwd = ""
-        # Only the foreground terminal tool sets bounded_capture (base.py:679-681); the file tools
-        # parse their raw output, so the note never goes there.
-        note = bool(kwargs.get("bounded_capture")) and target != self._noted_target
-        if target != self._last_target or note:
-            self._last_target = target
-            if note:
-                self._noted_target = target
-            session_key = get_session_env("HERMES_SESSION_KEY", "")
-            if session_key:
-                store.set_session_marks(session_key, self._last_target, self._noted_target)
+        self._last_target = target
+        if note is not None:
+            self._noted_target = target
         result = sub.execute(command, cwd, **kwargs)
-        if note:
-            result["output"] = f"{self._note(target)}\n{result.get('output', '')}"
+        if note is not None:
+            result["output"] = f"{note}\n{result.get('output', '')}"
         return result
 
     def fetch_file(self, remote_path, local_dest, *, max_bytes: int) -> None:
-        self._current()[1].fetch_file(remote_path, local_dest, max_bytes=max_bytes)
+        self._resolve()[1].fetch_file(remote_path, local_dest, max_bytes=max_bytes)
 
     def fetch_realpath(self, remote_path: str) -> str | None:
-        return self._current()[1].fetch_realpath(remote_path)
+        return self._resolve()[1].fetch_realpath(remote_path)
 
     def get_temp_dir(self) -> str:
         return self._current()[1].get_temp_dir()
@@ -187,6 +228,19 @@ class HandsEnvironment(BaseEnvironment):
     @property
     def uses_host_filesystem(self) -> bool:
         return self._current()[1].uses_host_filesystem
+
+    @property
+    def _hermes_sandbox_home(self) -> str | None:
+        """The current target's home, which core reads to anchor relative file-tool paths and to keep
+        recorded cwds (terminal_tool_config.py:188-201, file_tools_paths.py:281-301,
+        terminal_tool.py:1041-1047): a device's paired home, the server's cwd."""
+        target, sub = self._current()
+        return sub.cwd if target == targets.SERVER else sub.home
+
+    @_hermes_sandbox_home.setter
+    def _hermes_sandbox_home(self, value: str) -> None:
+        """Ignored: core stamps the first target's home once (terminal_tool_backends.py:213-233), and
+        the home has to follow /hands use."""
 
     def cleanup(self):
         with self._lock:

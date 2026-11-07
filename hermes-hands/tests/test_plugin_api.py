@@ -197,9 +197,10 @@ def test_device_and_local_routes_end_to_end(plugin):
         api.post(base + "/device/poll", content=body, headers=replayed_headers).status_code == 204
     )
     replay = api.post(base + "/device/poll", content=body, headers=replayed_headers)
-    assert (
-        replay.status_code == 401 and replay.json()["error"] == "unauthenticated"
-    )  # nonce burned by the seam
+    assert replay.status_code == 401 and replay.json()["error"] == "replayed"
+    bad = signed(device_id, private, base + "/device/poll", body)
+    assert api.post(base + "/device/poll", content=body + b" ", headers=bad).status_code == 401
+    assert api.post(base + "/device/poll", content=body, headers=bad).status_code == 204
     device_on_local = api.post(
         base + "/local/state",
         headers=signed(device_id, private, base + "/local/state", b"{}"),
@@ -214,7 +215,7 @@ def test_device_and_local_routes_end_to_end(plugin):
         headers=signed(device_id, private, base + "/device/poll", body),
     )
     assert gone.status_code == 401 and gone.json()["error"] == "unknown_device"
-    assert "X-Hands-Signature" in gone.headers
+    assert "X-Hands-Signature" not in gone.headers
 
     ui = api.get(base + "/ui/state")
     assert ui.status_code == 200 and ui.json() == {"relay": True, "devices": []}
@@ -227,3 +228,39 @@ def test_gateway_copy_stays_inert(plugin):
     reply = api.post("/api/plugins/hermes-hands/local/state", headers=local, json={})
     assert reply.status_code == 503 and reply.json()["error"] == "relay_elsewhere"
     assert hands.relay._relay is None
+
+
+def test_a_foreign_provider_under_our_name_is_not_loaded(plugin, caplog):
+    ctx, hands, provider = plugin
+    registry.unregister_global_provider(provider.name, provider)
+
+    class Impostor(type(provider)):
+        """Same protocol, another module: its package has no relay."""
+
+    Impostor.__module__ = "somewhere.else"
+    impostor = Impostor(provider.keys)
+    registry.register_global_provider(impostor)
+    try:
+        reply = make_app(load_plugin_api()).post(
+            "/api/plugins/hermes-hands/local/state",
+            headers={"Authorization": f"Bearer {provider.keys.local_bearer}"},
+            json={},
+        )
+        assert reply.status_code == 503 and reply.json()["error"] == "not_loaded"
+        assert "not this plugin's" in caplog.text
+    finally:
+        registry.unregister_global_provider(impostor.name, impostor)
+        registry.register_global_provider(provider)
+
+
+def test_core_discovers_a_hidden_tab_with_a_bundle():
+    from hermes_cli.web_server_dashboard import _discover_dashboard_plugins
+
+    [entry] = [
+        p
+        for p in _discover_dashboard_plugins(search_dirs=[(PLUGIN_DIR.parent, "user")])
+        if p["name"] == "hermes-hands"
+    ]
+    assert entry["tab"].get("hidden") is True and entry["has_api"] is True
+    bundle = PLUGIN_DIR / "dashboard" / entry["entry"]
+    assert bundle.is_file() and 'register("hermes-hands"' in bundle.read_text(encoding="utf-8")

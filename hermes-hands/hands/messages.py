@@ -31,6 +31,14 @@ SCREENSHOT_FAILED = "hands: the device did not send a screenshot."
 PAIR_BAD_CODE = "hands: this pairing code is unknown, expired or already used. Ask the owner for a new /hands pair code."
 PAIR_BAD_SIGNATURE = "hands: the pairing request is not signed by the public key it carries."
 TARGET_NOTE_SERVER = "hands: now on server (the gateway host)"
+STORE_DOWN = (
+    "hands: the Hermes Hands store (plugin-data/hermes-hands/hands.db) is unreadable, so this "
+    "conversation's target is unknown and nothing ran anywhere. See the gateway log."
+)
+REPLAYED = "hands: this request was already used once."
+RATE_LIMITED = (
+    "hands: too many requests from unpaired devices at this address; try again in a minute."
+)
 
 
 def relay_refused(status: int) -> str:

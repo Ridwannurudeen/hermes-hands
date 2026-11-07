@@ -185,25 +185,76 @@ def test_switch_to_server_keeps_each_targets_cwd(laptop, tmp_path):
         env.cleanup()
 
 
-def test_switch_across_turns_ignores_the_other_targets_cwd(laptop):
-    """Core rebuilds the backend every turn and /hands use is a turn of its own."""
+def test_switch_across_new_objects_ignores_the_other_targets_cwd(laptop):
+    """A session outlives its backend object (idle reaper, gateway restart): the next object must not
+    reuse the other target's recorded cwd, and notes its target on its first terminal command."""
     hub, device, home = laptop
     with Agent(hub, device, bash_job):
-        turn1 = HandsEnvironment(Ctx(), cwd="~", timeout=30)
-        device_cwd = turn1.execute("mkdir -p deep && cd deep", bounded_capture=True)["cwd"]
-        turn1.cleanup()
+        first = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        device_cwd = first.execute("mkdir -p deep && cd deep", bounded_capture=True)["cwd"]
+        first.cleanup()
         store.set_session_target("s1", "server")
-        turn2 = HandsEnvironment(Ctx(), cwd="~", timeout=30)
-        on_server = turn2.execute("pwd", cwd=device_cwd, bounded_capture=True)
+        second = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        on_server = second.execute("pwd", cwd=device_cwd, bounded_capture=True)
         note, where = on_server["output"].splitlines()[:2]
         assert note == messages.TARGET_NOTE_SERVER and where.rstrip("/").endswith("srv")
-        assert "hands:" not in turn2.execute("pwd", bounded_capture=True)["output"]
-        turn2.cleanup()
-        turn3 = HandsEnvironment(Ctx(), cwd="~", timeout=30)
-        assert (
-            "hands:" not in turn3.execute("pwd", bounded_capture=True)["output"]
-        )  # same target, noted
-        turn3.cleanup()
+        assert "hands:" not in second.execute("pwd", bounded_capture=True)["output"]
+        second.cleanup()
+        third = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        assert third.execute("pwd", bounded_capture=True)["output"].startswith(messages.TARGET_NOTE_SERVER)
+        third.cleanup()
+
+
+def test_backend_survives_core_per_turn_teardown(laptop):
+    from tools import terminal_tool
+    from tools.terminal_tool_lifecycle import is_persistent_env
+
+    env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+    terminal_tool._active_environments["hands-test"] = env
+    try:
+        assert HandsEnvironment._persistent is True and is_persistent_env("hands-test") is True
+    finally:
+        terminal_tool._active_environments.pop("hands-test", None)
+
+
+def test_sandbox_home_follows_the_target(laptop):
+    from tools.terminal_tool_config import plugin_sandbox_home
+
+    hub, device, home = laptop
+    env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+    env._hermes_sandbox_home = "/stamped/by/core/once"  # what terminal_tool_backends.py:231 does
+    assert env._hermes_sandbox_home == device_path(str(home))
+    if os.name != "nt":
+        assert plugin_sandbox_home(env) == str(home)
+    store.set_session_target("s1", "server")
+    assert env._hermes_sandbox_home == env.cwd
+    assert env._hermes_sandbox_home.rstrip("/\\").endswith("srv")
+    store.set_session_target("s1", "ghost")
+    assert env._hermes_sandbox_home is None and plugin_sandbox_home(env) is None
+
+
+def test_store_failure_never_raises_into_core_and_runs_nothing(laptop, monkeypatch, caplog):
+    import sqlite3
+
+    hub, device, home = laptop
+
+    def broken(session_key):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "get_session_target", broken)
+    caplog.set_level("WARNING", logger="hands.environment")
+    env = HandsEnvironment(Ctx(), cwd="~", timeout=30)  # create_environment must not raise
+    server_cwd = env.cwd
+    assert server_cwd.rstrip("/\\").endswith("srv") and env.is_local is True
+    assert env.uses_host_filesystem is True and isinstance(env.env, dict)
+    assert caplog.text.count("device store is unreadable") == 1  # logged once
+    marker = Path(server_cwd) / "ran"
+    result = env.execute("echo x > ran", bounded_capture=True)
+    assert result == {"output": messages.STORE_DOWN, "returncode": relay.UNREACHABLE}
+    assert not marker.exists()
+    with pytest.raises(sqlite3.Error):
+        env.fetch_realpath("/etc/hostname")  # a media fetch catches it (gateway/media_fetch.py:112-114)
+    assert caplog.text.count("device store is unreadable") == 1
 
 
 def test_cron_runs_on_the_server(laptop):
@@ -224,6 +275,6 @@ def test_unknown_device_fails_closed(wired, monkeypatch):
 
 
 def test_device_run_bash_refuses_piped_stdin(wired):
-    env = DeviceEnvironment("laptop", cwd="~", timeout=5)
+    env = DeviceEnvironment("laptop", cwd="~", timeout=5, home=None)
     with pytest.raises(AssertionError):
         env._run_bash("cat", stdin_data="x")

@@ -39,13 +39,15 @@ def test_protocol_compliance_and_flags():
         provider.start_login(redirect_uri="https://example.test/cb")
 
 
-def test_device_bearer_once_only(provider):
+def test_device_bearer_is_verified_but_its_nonce_is_left_to_the_relay(provider):
     device = Device()
     token = bearer(device)
-    assert provider.verify_token(token=token) == TokenPrincipal(
+    principal = TokenPrincipal(
         principal=device.device_id, provider="hermes-hands", scopes=(relay.SCOPE_DEVICE,)
     )
-    assert provider.verify_token(token=token) is None  # nonce burned
+    assert provider.verify_token(token=token) == principal
+    # Not burned here: the relay burns it once the request signature verified (test_relay).
+    assert provider.verify_token(token=token) == principal
 
 
 def test_stale_or_forged_bearer_is_refused(provider):

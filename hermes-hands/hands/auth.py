@@ -2,9 +2,10 @@
 gateway's local bearer (``hermes_cli/dashboard_auth/base.py:92-161``, ``token_auth.py:49-96``).
 
 ``verify_token`` sees only the token string, so a device bearer proves identity and freshness here
-(signature, 300 s window, nonce burned); each handler then verifies the request signature
-(``relay.Relay._device``). An unpaired but well-formed device bearer gets an ``hands:unknown``
-principal so the handler can answer ``401 unknown_device``, which tells the device to stop.
+(signature, 300 s window). Its nonce is burned by the relay only after the request signature also
+verified (``relay.Relay._device``), so holding a bearer without the device key cannot burn one. An
+unpaired but well-formed device bearer gets a ``hands:unknown`` principal so the handler can answer
+``401 unknown_device``, which tells the device to stop.
 """
 
 from __future__ import annotations
@@ -36,7 +37,6 @@ class HandsTokenProvider(DashboardAuthProvider):
     def __init__(self, keys: Keys | None):
         """``keys`` is None until ``hermes hands setup`` has written the seed: every token is refused."""
         self.keys = keys
-        self._nonces = protocol.NonceCache()
 
     def start_login(self, *, redirect_uri: str) -> LoginStart:
         raise NotImplementedError("Hermes Hands authenticates devices by token only")
@@ -82,7 +82,5 @@ class HandsTokenProvider(DashboardAuthProvider):
         if not protocol.fresh(bearer.ts, now) or not protocol.verify(
             device["public_key"], bearer.sig, message
         ):
-            return None
-        if not self._nonces.check_and_add(bearer.nonce, now):
             return None
         return TokenPrincipal(principal=bearer.device_id, provider=PROVIDER, scopes=(SCOPE_DEVICE,))
