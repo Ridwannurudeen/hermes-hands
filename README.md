@@ -126,7 +126,7 @@ Screenshots are written on the gateway under `$HERMES_HOME/cache/hermes-hands/` 
 
 ## Latency
 
-About 0.6 s per small command (p50 614 ms, p90 798 ms over 30 runs) from a Hermes v0.23.0 gateway in WSL to a Windows 11 laptop on the same machine, network latency excluded.
+About 0.4 s per small command (p50 409 ms, p90 411 ms over 30 runs, measured twice) from a Hermes v0.23.0 gateway in WSL to a Windows 11 laptop on the same machine, network latency excluded. Most of what remains is Hermes's own per command shell wrapper and its exit polling.
 
 ## Why a plugin, not a skill
 
