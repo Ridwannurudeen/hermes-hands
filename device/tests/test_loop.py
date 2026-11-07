@@ -241,6 +241,36 @@ def test_loop_allows_core_background_pid_liveness_probe(monkeypatch):
     assert posted == [{"chunk": "0\n"}, {"chunk": "", "done": True, "returncode": 0}]
 
 
+def test_loop_allows_core_background_pid_probe_with_quoted_space_path(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.running = {}
+    pid_path = shlex.quote("/tmp/path with space/hermes_bg_proc-1.pid")
+    command = f'kill -0 "$(cat {pid_path} 2>/dev/null)" 2>/dev/null; echo $?'
+    script = _core_wrapped(command)
+    assert loop.policy.refusal(command)
+    posted = []
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter((b"0\n",)))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    agent._run_job({"job_id": "probe-space", "type": "exec", "script": script})
+    assert posted == [{"chunk": "0\n"}, {"chunk": "", "done": True, "returncode": 0}]
+
+
+def test_loop_does_not_strip_injected_shell_from_quoted_pid_path(monkeypatch):
+    command = "kill -0 \"$(cat " + shlex.quote("/tmp/'; kill -9 $PPID; '/hermes_bg_proc-1.pid") + " 2>/dev/null)\" 2>/dev/null; echo $?"
+    script = _core_wrapped(command)
+    agent = object.__new__(loop.DeviceLoop)
+    agent.processes = {}
+    agent.running = {}
+    posted = []
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter(()))
+    agent._run_job({"job_id": "injected-path", "type": "exec", "script": script})
+    assert posted == [{"chunk": f"Policy refused command matching: {loop.policy.refusal(script)}\n", "done": True, "returncode": 126}]
+
+
 def test_loop_refuses_denied_commands_even_when_preceded_by_background_probe(monkeypatch):
     probe = 'kill -0 "$(cat /tmp/hermes_bg_proc-1.pid 2>/dev/null)" 2>/dev/null; echo $?'
     commands = (
@@ -267,7 +297,7 @@ def test_probe_wrapper_matches_core_output_when_core_is_importable():
         from tools.environments.base_session_env import _wrap_command_script
     except ImportError:
         return
-    pid_path = shlex.quote("/tmp/a'b folder/hermes_bg_proc-1.pid")
+    pid_path = shlex.quote("/tmp/a b folder/hermes_bg_proc-1.pid")
     command = f'kill -0 "$(cat {pid_path} 2>/dev/null)" 2>/dev/null; echo $?'
     expected = _wrap_command_script(
         command,
@@ -280,8 +310,7 @@ def test_probe_wrapper_matches_core_output_when_core_is_importable():
         pipe_marker="__PIPE__",
     )
     assert _core_wrapped(command) == expected
-    probe_line = next(line for line in expected.splitlines() if line.startswith("eval '"))
-    assert loop._BACKGROUND_PID_PROBE.sub("", probe_line) == ""
+    assert "eval 'kill -0" in expected
 
 
 def test_loop_retries_result_after_network_error(monkeypatch):

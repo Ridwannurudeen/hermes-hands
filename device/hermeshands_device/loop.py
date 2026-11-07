@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 _BACKGROUND_PID_PROBE = re.compile(
     r"(?ms)^eval 'kill -0 \"\$\(cat "
-    r"([^\n;&|$()<>`]*/hermes_bg_[\w-]+\.pid)(?:'\\'')? 2>/dev/null\)\" "
+    r"(('\\'')?[^\n;&|$()<>`']*/hermes_bg_[\w-]+\.pid(?:'\\'')?) 2>/dev/null\)\" "
     r"2>/dev/null; echo \$\?(?:\n\n__hermes_rc=\$\? __hermes_ps=\(\"\$\{PIPESTATUS\[@\]\}\"\); "
     r"\(exit \$__hermes_rc\) && :)?'$"
 )
