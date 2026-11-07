@@ -145,13 +145,19 @@ Two Hermes validator warnings are disclosed: the plugin imports the `hermes_cli.
 
 ## Desktop pane
 
-<!-- PENDING: desktop pane -->
+In Hermes Desktop the plugin adds a **Hands** pane on the right and a status bar chip.
+
+1. The pane shows whether the relay is up, a picker for where the current conversation runs (the server or a paired device), every paired device with its OS, an online dot, last seen time and policy state, and any policy alerts.
+2. The Pair form mints a code and shows the exact device command with a copy button.
+3. The chip reads `hands: <target>` and adds `| relay down` when the relay is unreachable. Clicking it opens the pane.
+
+The pane reads `/ui/state` every two seconds while it is visible and every ten seconds for the chip, and refreshes early on a device change event. Switching targets and pairing go through the same owner checked `/hands` commands as chat. The file uses only the Desktop plugin SDK and passes Hermes's desktop surface check. The pane has not yet been exercised inside the running Desktop app.
 
 ## Windows notes
 
 Windows commands run through Git Bash. The device process itself is Python and does not run Hermes or WSL. Ensure `python` or `python3` resolves inside Git Bash, and install ripgrep if you need its additional search behavior. The policy deny list is not a security boundary against another process running as the same user. Timeouts and cancellation terminate the process tree with Windows process tools.
 
-`search_files` may refuse filename searches rooted at or above the home directory or a filesystem root. Modified time ordering needs ripgrep 14 or GNU find support. Device output is capped at 64 MiB; at most 1 MiB is returned inline for terminal output, with the full log kept on the device.
+Without ripgrep, `search_files` on a device uses find and grep. Hermes only refuses broad searches on its own host filesystem, so on a device a search rooted at the home directory or a drive root runs, slowly. Search the narrowest folder you can. Modified time ordering needs ripgrep 14 or GNU find support. Device output is capped at 64 MiB; at most 1 MiB is returned inline for terminal output, with the full log kept on the device.
 
 ## Limits and known issues
 
