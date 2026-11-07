@@ -2,9 +2,11 @@
 the plugin package is imported the way the plugin loader does (``hermes_plugins.<slug>``), the
 dashboard file on its own, and requests go through the real token-auth middleware."""
 
+import functools
 import sys
 import time
 
+import httpx
 import pytest
 
 pytest.importorskip("fastapi")
@@ -160,7 +162,7 @@ def test_device_and_local_routes_end_to_end(plugin):
     assert "X-Hands-Signature" not in gone.headers
 
     ui = api.get(base + "/ui/state")
-    assert ui.status_code == 200 and ui.json() == {"relay": True, "devices": []}
+    assert ui.status_code == 200 and ui.json() == {"relay": True, "devices": [], "alerts": []}
 
 
 def test_gateway_copy_stays_inert(plugin):
@@ -205,4 +207,89 @@ def test_core_discovers_a_hidden_tab_with_a_bundle():
     ]
     assert entry["tab"].get("hidden") is True and entry["has_api"] is True
     bundle = PLUGIN_DIR / "dashboard" / entry["entry"]
-    assert bundle.is_file() and 'register("hermes-hands"' in bundle.read_text(encoding="utf-8")
+    assert bundle.is_file() and 'register("hermes-hands"' in bundle.read_text(encoding="utf-8-sig")
+
+
+def pair_body(private, public) -> bytes:
+    fields = {
+        "name": "laptop",
+        "os": "Windows-11",
+        "home": "C:\\Users\\r",
+        "public_key": protocol.b64u(public),
+        "policy_hash": "p0",
+        "protocol": protocol.PROTOCOL_VERSION,
+    }
+    signature = protocol.b64u(protocol.sign(private, protocol.canonical_json(fields)))
+    return protocol.canonical_json({**fields, "sig": signature})
+
+
+def point_client(monkeypatch, hands, bearer, handler) -> None:
+    """Rebuild the gateway's loopback client over ``handler`` instead of the network."""
+    with monkeypatch.context() as scoped:
+        transport = httpx.MockTransport(handler)
+        scoped.setattr(httpx, "Client", functools.partial(httpx.Client, transport=transport))
+        hands.client.configure("http://127.0.0.1:9119", bearer)
+
+
+def test_gateway_copy_forwards_ui_state_to_the_relay(plugin, monkeypatch):
+    ctx, hands, provider = plugin
+    api_module = load_plugin_api()
+    dashboard, gateway = make_app(api_module), make_app(api_module, gateway=True)
+
+    def to_dashboard(request):
+        headers = {
+            k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")
+        }
+        reply = dashboard.request(
+            request.method, request.url.path, content=request.content, headers=headers
+        )
+        return httpx.Response(reply.status_code, headers=reply.headers, content=reply.content)
+
+    point_client(monkeypatch, hands, provider.keys.local_bearer, to_dashboard)
+    code = hands.store.mint_pairing_code("laptop")
+    hands.store.complete_pairing(
+        code, name="laptop", public_key="AA", os="Linux", home="/h", policy_hash="p"
+    )
+    forwarded = gateway.get("/api/plugins/hermes-hands/ui/state")
+    assert forwarded.status_code == 200 and forwarded.json()["relay"] is True
+    assert [device["name"] for device in forwarded.json()["devices"]] == ["laptop"]
+
+    def refuse(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    point_client(monkeypatch, hands, provider.keys.local_bearer, refuse)
+    down = gateway.get("/api/plugins/hermes-hands/ui/state")
+    assert down.status_code == 200
+    assert down.json() == {"relay": False, "devices": [], "detail": hands.messages.RELAY_DOWN}
+
+
+def test_handlers_broadcast_devices_changed(plugin, monkeypatch):
+    ctx, hands, provider = plugin
+    api_module = load_plugin_api()
+    events = []
+    monkeypatch.setattr(api_module, "broadcast_plugin_event", lambda *event: events.append(event))
+    api = make_app(api_module)
+    base = "/api/plugins/hermes-hands"
+    private, public = protocol.generate_keypair()
+    code = hands.store.mint_pairing_code("laptop")
+    paired = api.post(
+        base + "/pair",
+        content=pair_body(private, public),
+        headers={"Authorization": f"Bearer {code}"},
+    )
+    assert paired.status_code == 200, paired.text
+    assert events == [("hermes-hands", "devices.changed", {"reason": "paired", "device": "laptop"})]
+    device_id = paired.json()["device_id"]
+    beat = protocol.canonical_json(
+        {"policy_hash": "edited", "os": "x", "home": "y", "agent_version": "0.1.0"}
+    )
+    for _ in range(2):
+        refused = api.post(
+            base + "/device/heartbeat",
+            content=beat,
+            headers=signed(device_id, private, base + "/device/heartbeat", beat),
+        )
+        assert refused.status_code == 409
+    assert events[1:] == [
+        ("hermes-hands", "devices.changed", {"reason": "policy_changed", "device": "laptop"})
+    ]

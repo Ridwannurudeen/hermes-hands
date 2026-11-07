@@ -2,9 +2,12 @@
 ContextVar): the device side is a fake agent that runs each job with a local bash, through a real
 Relay and the loopback client. Skipped when Hermes is not importable."""
 
+import json
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -15,7 +18,7 @@ pytest.importorskip("tools.environments.base")
 pytest.importorskip("gateway.session_context")
 pytest.importorskip("agent.terminal_env_provider")
 
-from hands import messages, relay, store  # noqa: E402
+from hands import environment, messages, relay, store  # noqa: E402
 from hands.environment import DeviceEnvironment, HandsEnvironment, device_path  # noqa: E402
 from hands.provider import HandsProvider  # noqa: E402
 from hands_fakes import Agent, Device, hands_db, wired  # noqa: E402,F401  (fixtures)
@@ -34,15 +37,18 @@ def bash_job(job):
         return "", 0
     args = [BASH, *(["-l"] if job["login"] else []), "-c", job["script"]]
     env = {**os.environ, "HANDS_FAKE_DEVICE": "device"}
-    done = subprocess.run(
-        args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        env=env,
-        timeout=60,
-    )
-    return done.stdout.decode("utf-8", "replace"), done.returncode
+    # A file, not a pipe: a job that backgrounds a process (core's launcher) returns when bash does.
+    with tempfile.TemporaryFile() as output:
+        done = subprocess.run(
+            args,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            timeout=60,
+        )
+        output.seek(0)
+        return output.read().decode("utf-8", "replace"), done.returncode
 
 
 class Ctx:
@@ -201,7 +207,9 @@ def test_switch_across_new_objects_ignores_the_other_targets_cwd(laptop):
         assert "hands:" not in second.execute("pwd", bounded_capture=True)["output"]
         second.cleanup()
         third = HandsEnvironment(Ctx(), cwd="~", timeout=30)
-        assert third.execute("pwd", bounded_capture=True)["output"].startswith(messages.TARGET_NOTE_SERVER)
+        assert third.execute("pwd", bounded_capture=True)["output"].startswith(
+            messages.TARGET_NOTE_SERVER
+        )
         third.cleanup()
 
 
@@ -253,7 +261,9 @@ def test_store_failure_never_raises_into_core_and_runs_nothing(laptop, monkeypat
     assert result == {"output": messages.STORE_DOWN, "returncode": relay.UNREACHABLE}
     assert not marker.exists()
     with pytest.raises(sqlite3.Error):
-        env.fetch_realpath("/etc/hostname")  # a media fetch catches it (gateway/media_fetch.py:112-114)
+        env.fetch_realpath(
+            "/etc/hostname"
+        )  # a media fetch catches it (gateway/media_fetch.py:112-114)
     assert caplog.text.count("device store is unreadable") == 1
 
 
@@ -275,6 +285,132 @@ def test_unknown_device_fails_closed(wired, monkeypatch):
 
 
 def test_device_run_bash_refuses_piped_stdin(wired):
-    env = DeviceEnvironment("laptop", cwd="~", timeout=5, home=None)
+    env = DeviceEnvironment("laptop", cwd="~", timeout=5, home=None, inline_limit=1024)
     with pytest.raises(AssertionError):
         env._run_bash("cat", stdin_data="x")
+
+
+def x_runs(output: str) -> int:
+    return sum(len(run) for run in re.findall(r"x{100,}", output))
+
+
+def test_inline_output_limit_applies_to_terminal_calls_only(laptop):
+    hub, device, home = laptop
+    ctx = Ctx()
+    ctx.config["inline_output_limit_bytes"] = 8192
+    command = "printf '%40000s' '' | tr ' ' x"
+    with Agent(hub, device, bash_job):
+        env = HandsEnvironment(ctx, cwd="~", timeout=30)
+        terminal = env.execute(command, bounded_capture=True)
+        assert "bytes of output omitted here (inline_output_limit_bytes)" in terminal["output"]
+        assert 4000 < x_runs(terminal["output"]) <= 8192
+        assert terminal["cwd"] == device_path(str(home))  # core's cwd marker survived in the tail
+        assert x_runs(env.execute(command)["output"]) == 40000  # file reads keep every byte
+
+
+def test_gateway_home_prefix_maps_to_the_device_home(wired, monkeypatch):
+    monkeypatch.setattr(environment, "_gateway_home", lambda: "/home/gw")
+    env = DeviceEnvironment("laptop", cwd="~", timeout=5, home="/c/Users/r b", inline_limit=8192)
+    assert env._map_home("cat '/home/gw/a b.txt'") == "cat '/c/Users/r b/a b.txt'"
+    assert env._map_home("cd /home/gw && ls") == "cd /c/Users/r b && ls"
+    for untouched in ("cat /home/gwx/a", "cat /srv/home/gw/a", "cat x/home/gw/a", "echo ~/home/gw"):
+        assert env._map_home(untouched) == untouched
+    same = DeviceEnvironment("laptop", cwd="~", timeout=5, home="/home/gw", inline_limit=8192)
+    assert same._map_home("cat /home/gw/a") == "cat /home/gw/a"
+
+
+def test_a_gateway_home_path_from_the_file_tools_lands_in_the_device_home(laptop, monkeypatch):
+    from tools.file_operations import ShellFileOperations
+
+    hub, device, home = laptop
+    monkeypatch.setattr(environment, "_gateway_home", lambda: "/home/gw")
+    with Agent(hub, device, bash_job):
+        env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        written = ShellFileOperations(env).write_file("/home/gw/mapped notes.txt", "mapped\n")
+        assert written.error is None and written.verified is True, written.to_dict()
+    assert (home / "mapped notes.txt").read_bytes() == b"mapped\n"
+
+
+@pytest.fixture
+def file_tools_on_laptop(laptop, tmp_path, monkeypatch):
+    """Core's own write_file/patch tools with terminal.backend: hands, the laptop chosen."""
+    from agent import terminal_env_registry
+    from tools import file_tools, terminal_tool
+
+    hub, device, home = laptop
+    provider = HandsProvider(Ctx())
+    previous = terminal_env_registry.snapshot_registration("hands")
+    terminal_env_registry.register_provider(provider)
+    monkeypatch.setenv("TERMINAL_ENV", "hands")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes home"))
+    with Agent(hub, device, bash_job):
+        yield file_tools, home
+    for key, env in list(terminal_tool._active_environments.items()):
+        if isinstance(env, HandsEnvironment):
+            terminal_tool._active_environments.pop(key, None)
+            env.cleanup()
+    file_tools.clear_file_ops_cache()
+    terminal_env_registry.restore_registration("hands", provider, previous)
+
+
+def test_file_tools_absolute_and_relative_paths_land_on_the_device(file_tools_on_laptop):
+    file_tools, home = file_tools_on_laptop
+    spaced = f"{device_path(str(home))}/My Projects/notes v1.txt"
+    result = json.loads(file_tools.write_file_tool(spaced, "abs\n", task_id="t1"))
+    assert not result.get("error"), result
+    assert (home / "My Projects" / "notes v1.txt").read_bytes() == b"abs\n"
+    result = json.loads(file_tools.write_file_tool("rel dir/rel notes.txt", "rel", task_id="t1"))
+    assert not result.get("error"), result
+    assert (home / "rel dir" / "rel notes.txt").read_bytes() == b"rel"
+    patched = json.loads(
+        file_tools.patch_tool(mode="replace", path=spaced, old_string="abs", new_string="patched", task_id="t1")
+    )
+    assert not patched.get("error"), patched
+    assert (home / "My Projects" / "notes v1.txt").read_bytes() == b"patched\n"
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="core expands ~ with the host's os.path (file_tools_paths.py:46-49), so on a Windows "
+    "gateway it is a Windows path; the gateway runs on Linux (covered there and by the mapping tests)",
+)
+def test_file_tools_tilde_path_lands_in_the_device_home(file_tools_on_laptop, monkeypatch):
+    import hermes_constants
+
+    file_tools, home = file_tools_on_laptop
+    monkeypatch.setattr(hermes_constants, "get_subprocess_home", lambda env=None: "/home/gateway-user")
+    result = json.loads(file_tools.write_file_tool("~/tilde notes.txt", "tilde\n", task_id="t1"))
+    assert not result.get("error"), result
+    assert (home / "tilde notes.txt").read_bytes() == b"tilde\n"
+    patched = json.loads(
+        file_tools.patch_tool(
+            mode="replace", path="~/tilde notes.txt", old_string="tilde", new_string="mapped", task_id="t1"
+        )
+    )
+    assert not patched.get("error"), patched
+    assert (home / "tilde notes.txt").read_bytes() == b"mapped\n"
+
+
+def test_background_job_follows_its_target_across_a_switch(laptop):
+    from tools.process_registry import process_registry
+
+    hub, device, home = laptop
+    with Agent(hub, device, bash_job) as agent:
+        env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        session = process_registry.spawn_via_env(
+            env, "echo bg on ${HANDS_FAKE_DEVICE:-server}; sleep 30", task_id="bg-test"
+        )
+        assert session.pid is not None
+        store.set_session_target("s1", "server")  # /hands use server
+        assert env.execute("echo ${HANDS_FAKE_DEVICE:-server}")["output"].strip() == "server"
+        deadline = time.monotonic() + 20
+        while "bg on device" not in process_registry.poll(session.id)["output_preview"]:
+            assert time.monotonic() < deadline, "the registry's poll never reached the device"
+            time.sleep(0.2)
+        seen = len(agent.jobs)
+        process_registry.kill_process(session.id)
+        assert any(f"kill {session.pid} 2>/dev/null" in job["script"] for job in agent.jobs[seen:])
+        deadline = time.monotonic() + 10
+        while not process_registry.get(session.id).exited:
+            assert time.monotonic() < deadline, "the background job was not marked killed"
+            time.sleep(0.1)

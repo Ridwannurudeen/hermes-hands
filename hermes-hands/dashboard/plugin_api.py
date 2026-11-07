@@ -20,6 +20,7 @@ import sys
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from hermes_cli.dashboard_auth import get_provider
+from hermes_cli.plugin_events import broadcast_plugin_event
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -79,9 +80,11 @@ async def _relay_call(request: Request, handler: str, **extra) -> Response:
         return _response(served)
     principal = getattr(request.state, "token_principal", None)
     body = await request.body()
-    return _response(
-        await getattr(served, handler)(principal, request.headers, request.url.path, body, **extra)
-    )
+    reply = await getattr(served, handler)(principal, request.headers, request.url.path, body, **extra)
+    if reply.devices_changed is not None:
+        # Best effort: the pane's 2 s /ui/state poll is the main path (plugin_events.py:66-88).
+        broadcast_plugin_event(_PROVIDER, "devices.changed", reply.devices_changed)
+    return _response(reply)
 
 
 def _peer(request: Request) -> str:

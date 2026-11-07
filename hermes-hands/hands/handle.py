@@ -8,7 +8,9 @@ queues the script at the relay and long-polls its output into an OS pipe whose r
 the drain thread stops about 300 ms after exit, and output still in flight then would be lost
 (``base.py:549-594``). There is deliberately no ``pid``: core's backstop kills ``pid`` as a host
 process tree (``base.py:785-798``). Timeouts are core's: the device gets a later deadline, so
-``poll()`` stays None past core's and core returns 124 with ``hermes_timed_out`` itself.
+``poll()`` stays None past core's and core returns 124 with ``hermes_timed_out`` itself. With an
+``inline_limit`` (terminal-tool calls only), output past it keeps its first and last halves around a
+note naming the device's full log (PLAN-v3 §1.4 Output).
 """
 
 from __future__ import annotations
@@ -18,18 +20,29 @@ import logging
 import os
 import threading
 
-from . import client
+from . import client, messages
 from .relay import UNREACHABLE
 
 DEVICE_TIMEOUT_GRACE = 15  # seconds the device waits past core's deadline before its own 124
+# Core's cwd and exit-status marker lines end every command's output (base_session_env.py:40-79):
+# the kept tail always has room for them, however small inline_output_limit_bytes is set.
+MIN_INLINE_LIMIT = 8192
 
 logger = logging.getLogger(__name__)
 
 
 class RemoteProcessHandle:
-    def __init__(self, device: str, script: str, *, login: bool, timeout: int):
+    def __init__(
+        self,
+        device: str,
+        script: str,
+        *,
+        login: bool,
+        timeout: int,
+        inline_limit: int | None = None,
+    ):
         read_fd, write_fd = os.pipe()
-        self._stdout = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
+        self._stdout = os.fdopen(read_fd, "r", encoding="utf-8-sig", errors="replace")
         self._write_fd = write_fd
         self._returncode: int | None = None
         self._done = threading.Event()
@@ -38,6 +51,12 @@ class RemoteProcessHandle:
         self._killed = False
         self._reader_gone = False
         self._wrote = False
+        if inline_limit is not None:
+            inline_limit = max(inline_limit, MIN_INLINE_LIMIT)
+        self._head_left = None if inline_limit is None else inline_limit - inline_limit // 2
+        self._tail_cap = 0 if inline_limit is None else inline_limit // 2
+        self._tail = bytearray()
+        self._omitted = 0
         worker = contextvars.copy_context()
         threading.Thread(
             target=worker.run,
@@ -84,9 +103,11 @@ class RemoteProcessHandle:
             )
 
     def _write(self, text: str) -> None:
-        if not text or self._killed or self._reader_gone:
+        self._write_bytes(text.encode("utf-8"))
+
+    def _write_bytes(self, data: bytes) -> None:
+        if not data or self._killed or self._reader_gone:
             return
-        data = text.encode("utf-8")
         try:
             while data:
                 data = data[os.write(self._write_fd, data) :]
@@ -98,8 +119,28 @@ class RemoteProcessHandle:
         """A hands: line after the command's own output, on a line of its own."""
         self._write(("\n" if self._wrote else "") + text)
 
+    def _emit(self, text: str) -> None:
+        """Command output: straight through, or within the inline limit as head plus a rolling tail."""
+        data = text.encode("utf-8")
+        if self._head_left is None:
+            self._write_bytes(data)
+            return
+        head, rest = data[: self._head_left], data[self._head_left :]
+        self._head_left -= len(head)
+        self._write_bytes(head)
+        self._tail += rest
+        excess = len(self._tail) - self._tail_cap
+        if excess > 0:
+            self._omitted += excess
+            del self._tail[:excess]
+
+    def _flush_tail(self, job_id: str | None) -> None:
+        if self._omitted:
+            self._write(f"\n{messages.output_omitted(self._omitted, job_id)}\n")
+        self._write_bytes(bytes(self._tail))
+
     def _run(self, device: str, script: str, login: bool, timeout: int) -> None:
-        returncode = UNREACHABLE
+        returncode, job_id, notice = UNREACHABLE, None, None
         try:
             job_id = client.start_job(
                 device, script=script, login=login, timeout=timeout + DEVICE_TIMEOUT_GRACE
@@ -113,18 +154,20 @@ class RemoteProcessHandle:
             while True:
                 out = client.job_output(job_id, after)
                 for chunk in out["chunks"]:
-                    self._write(chunk)
+                    self._emit(chunk)
                 after = out["next"]
                 if out["done"]:
-                    if out.get("error"):
-                        self._write_notice(str(out["error"]))
+                    notice = out.get("error")
                     returncode = (
                         UNREACHABLE if out.get("returncode") is None else int(out["returncode"])
                     )
                     return
         except client.HandsError as exc:
-            self._write_notice(str(exc))
+            notice = str(exc)
         finally:
+            self._flush_tail(job_id)
+            if notice:
+                self._write_notice(str(notice))
             os.close(self._write_fd)  # EOF reaches the drain thread before poll() reports the exit
             self._returncode = returncode
             self._done.set()

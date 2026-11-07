@@ -379,10 +379,36 @@ def test_pair_happy_path_and_refusals(hub):
     assert run(hub.pair(principal, headers, path, b"not json")).status == 400
 
 
-def test_state_lists_devices(hub):
-    Device()
+def test_state_lists_devices_and_policy_alerts(hub):
+    device = Device()
     state = body(local(hub, "local_state", {}))
     assert state["relay"] is True and [d["name"] for d in state["devices"]] == ["laptop"]
+    assert state["alerts"] == []
+    store.record_seen(device.device_id, policy_hash="edited")
+    assert body(local(hub, "local_state", {}))["alerts"] == [messages.policy_changed("laptop")]
+
+
+def test_device_list_changes_are_flagged_once_for_the_pane(hub):
+    private, public = protocol.generate_keypair()
+    paired = run(hub.pair(*pair_request(private, public, store.mint_pairing_code("laptop"))))
+    assert paired.devices_changed == {"reason": "paired", "device": "laptop"}
+    device_id = body(paired)["device_id"]
+    edited = Device("desk")
+    edited.policy_hash = "edited"
+    beat = {"policy_hash": "edited", "os": "x", "home": "y"}
+    first, _, _ = device_call(hub, edited, "device_heartbeat", "/device/heartbeat", beat)
+    again, _, _ = device_call(hub, edited, "device_heartbeat", "/device/heartbeat", beat)
+    assert first.status == again.status == 409
+    assert first.devices_changed == {"reason": "policy_changed", "device": "desk"}
+    assert again.devices_changed is None  # still refused: no new event
+    assert store.device_by_id(device_id) is not None
+    store.accept_policy("desk")
+    accepted, _, _ = device_call(hub, edited, "device_heartbeat", "/device/heartbeat", beat)
+    assert accepted.status == 200 and accepted.devices_changed is None
+    edited.policy_hash = "edited again"
+    beat["policy_hash"] = "edited again"
+    third, _, _ = device_call(hub, edited, "device_heartbeat", "/device/heartbeat", beat)
+    assert third.devices_changed == {"reason": "policy_changed", "device": "desk"}
 
 
 def test_serve_refuses_without_seed_or_outside_dashboard(hands_db, monkeypatch):

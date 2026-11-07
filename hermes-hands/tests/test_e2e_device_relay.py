@@ -130,6 +130,7 @@ def rig(hands_db, tmp_path, monkeypatch):
     package = load_plugin_package()
     api = make_app(load_plugin_api(), base_url=GATEWAY)
     forgeries: list = []  # each answers one device poll instead of the dashboard
+    delivered: list = []  # every job the relay handed the device
 
     def dashboard(request: httpx.Request) -> httpx.Response:
         if request.url.path == API + "/device/poll" and forgeries:
@@ -140,6 +141,8 @@ def rig(hands_db, tmp_path, monkeypatch):
         reply = api.request(
             request.method, request.url.path, content=request.content, headers=headers
         )
+        if request.url.path == API + "/device/poll" and reply.status_code == 200:
+            delivered.append(json.loads(reply.content))
         return httpx.Response(reply.status_code, headers=reply.headers, content=reply.content)
 
     transport = httpx.MockTransport(dashboard)
@@ -174,6 +177,7 @@ def rig(hands_db, tmp_path, monkeypatch):
         agent=agent,
         keys=provider.keys,
         forgeries=forgeries,
+        delivered=delivered,
         environment=environment,
     )
     agent.stop()
@@ -187,7 +191,7 @@ def rig(hands_db, tmp_path, monkeypatch):
 def test_pairing_then_terminal_and_file_writes(rig):
     device = rig.hands.store.get_device("laptop")
     assert device["home"] == str(rig.home) and device["online"] and device["policy_ok"]
-    saved = json.loads(device_config.CONFIG_PATH.read_text(encoding="utf-8"))
+    saved = json.loads(device_config.CONFIG_PATH.read_text(encoding="utf-8-sig"))
     assert saved["device_id"] == device["device_id"]
     assert device_protocol.unb64u(saved["relay_public_key"]) == rig.keys.relay_public
     assert device_config.KEY_PATH.exists()  # keyring disabled: the key file
@@ -303,7 +307,9 @@ def test_policy_change_is_refused_until_accepted(rig):
         and rig.hands.messages.policy_changed("laptop") in again["output"]
     )
     # The agent must keep polling while refused, or accept-policy cannot bring it back.
-    assert not rig.agent.loop.stop_event.is_set(), "the device agent stopped itself on policy_changed"
+    assert not rig.agent.loop.stop_event.is_set(), (
+        "the device agent stopped itself on policy_changed"
+    )
     assert rig.hands.store.accept_policy("laptop")
     accepted = env.execute("echo accepted", timeout=15)
     assert accepted["returncode"] == 0 and accepted["output"].strip() == "accepted", accepted
@@ -326,3 +332,43 @@ def test_revoke_mid_command_stops_the_device(rig):
     assert not rig.agent.thread.is_alive()
     assert isinstance(rig.agent.error, PermissionError) and str(rig.agent.error) == "unknown_device"
     until(lambda: not alive(tree), what="the device to kill its running work")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="device bug: executor.run reads its stdout pipe to EOF, and core's launcher backgrounds a "
+    "subshell that inherits that pipe, so the launch blocks until core's 10 s spawn timeout and the "
+    "resulting cancel tree-kills the background job",
+)
+def test_background_job_follows_the_device_across_a_switch(rig):
+    """U22: core's process registry launches, polls and kills through the environment it launched
+    with (process_registry.py:1271-1300, 1418-1466, 2245-2246); after /hands use server those calls
+    must still reach the device."""
+    from tools.process_registry import process_registry
+
+    env = rig.environment()
+    assert env.execute("true")["returncode"] == 0
+    started = time.monotonic()
+    session = process_registry.spawn_via_env(
+        env, "echo started; sleep 45", task_id="e2e-bg", timeout=10
+    )
+    assert session.pid is not None
+    assert time.monotonic() - started < 8, (
+        "the launch waited for the background job instead of returning"
+    )
+    rig.hands.store.set_session_target("s1", "server")  # /hands use server
+    until(
+        lambda: "started" in process_registry.poll(session.id)["output_preview"],
+        what="the registry to read the job's log on the device",
+    )
+    time.sleep(4)  # past core's 10 s launch timeout: the job must still be running on the device
+    assert not process_registry.get(session.id).exited, process_registry.poll(session.id)
+    seen = len(rig.delivered)
+    process_registry.kill_process(session.id)
+    until(
+        lambda: any(
+            f"kill {session.pid} 2>/dev/null" in job.get("script", "")
+            for job in rig.delivered[seen:]
+        ),
+        what="the kill to reach the device",
+    )

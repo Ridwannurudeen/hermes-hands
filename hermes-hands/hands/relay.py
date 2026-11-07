@@ -94,6 +94,9 @@ class Reply:
     status: int
     body: bytes = b""
     headers: dict[str, str] = field(default_factory=dict)
+    # Set when the device list changed (paired, newly refused): plugin_api.py broadcasts it as
+    # ``plugin.hermes-hands.devices.changed`` so the Desktop pane refreshes before its next poll.
+    devices_changed: dict | None = None
 
     @classmethod
     def json(cls, status: int, obj: dict) -> "Reply":
@@ -147,6 +150,7 @@ class Relay:
         self._unknown_hits: dict[
             str, tuple[float, int]
         ] = {}  # client address -> (window start, count)
+        self._refused: set[str] = set()  # devices currently refused for a changed deny-list
 
     # --- lifecycle -----------------------------------------------------------------------------
     def start(self) -> None:
@@ -328,12 +332,20 @@ class Relay:
             return self._unknown(peer)
         if not ok:
             self._fail_device(device["device_id"], messages.policy_changed(device["name"]))
-            return self._signed(
+            reply = self._signed(
                 409,
                 {"error": "policy_changed", "detail": messages.POLICY_CHANGED_WIRE},
                 path,
                 nonce,
             )
+            with self._lock:
+                newly = device["device_id"] not in self._refused
+                self._refused.add(device["device_id"])
+            if newly:
+                reply.devices_changed = {"reason": "policy_changed", "device": device["name"]}
+            return reply
+        with self._lock:
+            self._refused.discard(device["device_id"])
         return None
 
     async def pair(self, principal, headers, path: str, body: bytes) -> Reply:
@@ -377,11 +389,13 @@ class Relay:
             return self._signed(
                 exc.status, {"error": exc.error, "detail": _pairing_detail(exc)}, path
             )
-        return self._signed(
+        reply = self._signed(
             200,
             {"device_id": device_id, "relay_public_key": protocol.b64u(self._keys.relay_public)},
             path,
         )
+        reply.devices_changed = {"reason": "paired", "device": name}
+        return reply
 
     async def device_poll(self, principal, headers, path: str, body: bytes, peer: str) -> Reply:
         device, nonce, refusal = await asyncio.to_thread(
@@ -575,8 +589,10 @@ class Relay:
         return Reply.json(200, await self.state())
 
     async def state(self) -> dict:
-        """What ``/local/state`` and ``/ui/state`` show: the relay is up, and every paired device."""
-        return {"relay": True, "devices": await asyncio.to_thread(store.list_devices)}
+        """What ``/local/state`` and ``/ui/state`` show: the relay is up, every paired device, and an
+        alert for each device refused for a changed deny-list."""
+        devices = await asyncio.to_thread(store.list_devices)
+        return {"relay": True, "devices": devices, "alerts": messages.alerts(devices)}
 
 
 _relay: Relay | None = None

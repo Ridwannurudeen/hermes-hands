@@ -194,6 +194,9 @@ class RegisterCtx:
     def register_tool(self, *, name, **kwargs):
         self.calls.append(("tool", name))
 
+    def register_skill(self, name, path, description="", frontmatter=None):
+        self.calls.append(("skill", name))
+
 
 def load_plugin_package():
     """``hermes_plugins.hermes_hands`` exactly as plugins_loader.py:811-837 imports it."""

@@ -103,3 +103,17 @@ def target_note(name: str, device_os: str | None, home: str | None) -> str:
     if device_os.lower().startswith("windows"):
         return f"hands: now on {name} ({device_os}, Git Bash, home {home}; use /c/... paths)"
     return f"hands: now on {name} ({device_os}, home {home})"
+
+
+def output_omitted(omitted: int, job_id: str | None) -> str:
+    return (
+        f"[hands: {omitted} bytes of output omitted here (inline_output_limit_bytes); the full output "
+        f"is in ~/.hermes-hands/out/{job_id}.log on the device, which the device deny-list keeps "
+        f"from the agent]"
+    )
+
+
+def alerts(devices: list[dict]) -> list[str]:
+    """What /hands status and the Desktop pane show for devices the relay refuses. Hermes has no public
+    way for a plugin to message the owner unprompted, so the alert waits to be looked at."""
+    return [policy_changed(device["name"]) for device in devices if not device["policy_ok"]]

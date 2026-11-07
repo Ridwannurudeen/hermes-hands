@@ -5,6 +5,7 @@ import time
 import pytest
 
 from hands import handle as handle_module
+from hands import messages
 from hands.handle import DEVICE_TIMEOUT_GRACE, RemoteProcessHandle
 from hands.relay import UNREACHABLE
 
@@ -179,3 +180,38 @@ def test_closed_reader_does_not_break_the_worker(fake):
     proc.stdout.close()
     relay.release.set()
     assert wait_exit(proc) == 0
+
+
+def test_inline_limit_keeps_head_and_tail_around_a_note(fake):
+    fake(
+        [
+            {"chunks": ["a" * 6000, "b" * 6000], "next": 2, "done": False},
+            {"chunks": ["c" * 6000], "next": 3, "done": True, "returncode": 0},
+        ]
+    )
+    proc = RemoteProcessHandle("laptop", "yes", login=False, timeout=5, inline_limit=8192)
+    output = read_to_eof(proc, timeout=5).decode("utf-8")  # read as core's drain does: concurrently
+    assert wait_exit(proc) == 0
+    note = messages.output_omitted(18000 - 8192, "job1")
+    assert output == "a" * 4096 + f"\n{note}\n" + "c" * 4096
+
+
+def test_inline_limit_has_a_floor_and_leaves_short_output_alone(fake):
+    fake([{"chunks": ["x" * 8000], "next": 1, "done": True, "returncode": 0}])
+    proc = RemoteProcessHandle("laptop", "yes", login=False, timeout=5, inline_limit=10)
+    assert read_to_eof(proc, timeout=5) == b"x" * 8000  # under the floor of handle.MIN_INLINE_LIMIT
+    assert wait_exit(proc) == 0
+
+
+def test_inline_limit_tail_comes_before_a_relay_notice(fake):
+    fake(
+        [
+            {"chunks": ["a" * 9000], "next": 1, "done": False},
+            client.HandsError("hands: relay down"),
+        ]
+    )
+    proc = RemoteProcessHandle("laptop", "yes", login=False, timeout=5, inline_limit=8192)
+    output = read_to_eof(proc, timeout=5).decode("utf-8")
+    assert wait_exit(proc) == 255
+    assert output.endswith("a" * 4096 + "\nhands: relay down")
+    assert messages.output_omitted(9000 - 8192, "job1") in output
