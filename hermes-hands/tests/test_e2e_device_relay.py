@@ -334,12 +334,6 @@ def test_revoke_mid_command_stops_the_device(rig):
     until(lambda: not alive(tree), what="the device to kill its running work")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="device bug: executor.run reads its stdout pipe to EOF, and core's launcher backgrounds a "
-    "subshell that inherits that pipe, so the launch blocks until core's 10 s spawn timeout and the "
-    "resulting cancel tree-kills the background job",
-)
 def test_background_job_follows_the_device_across_a_switch(rig):
     """U22: core's process registry launches, polls and kills through the environment it launched
     with (process_registry.py:1271-1300, 1418-1466, 2245-2246); after /hands use server those calls

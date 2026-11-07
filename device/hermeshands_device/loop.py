@@ -5,6 +5,7 @@ import json
 import logging
 import platform
 import random
+import re
 import threading
 import time
 from pathlib import Path
@@ -17,6 +18,13 @@ from .keys import get_or_create
 from .protocol import D2R, R2D, canonical_json, fresh, make_bearer, new_nonce, sign_request, verify_request
 
 logger = logging.getLogger(__name__)
+
+_BACKGROUND_PID_PROBE = re.compile(
+    r"(?ms)^eval 'kill -0 \"\$\(cat "
+    r"([^\n;&|$()<>`]*/hermes_bg_[\w-]+\.pid)(?:'\\'')? 2>/dev/null\)\" "
+    r"2>/dev/null; echo \$\?(?:\n\n__hermes_rc=\$\? __hermes_ps=\(\"\$\{PIPESTATUS\[@\]\}\"\); "
+    r"\(exit \$__hermes_rc\) && :)?'$"
+)
 
 
 class DeviceLoop:
@@ -113,7 +121,9 @@ class DeviceLoop:
         job_id, seq = job["job_id"], 0
         try:
             if job["type"] == "exec":
-                refused = policy.refusal(job["script"])
+                script = job["script"]
+                policy_script = _BACKGROUND_PID_PROBE.sub("", script)
+                refused = policy.refusal(policy_script)
                 if refused:
                     self._result(job_id, seq, chunk=f"Policy refused command matching: {refused}\n", done=True, returncode=126)
                     return

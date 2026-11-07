@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import shlex
 
-from . import store
+from . import messages, store
 
 
 def _ids(value: object) -> set[str]:
@@ -59,7 +59,9 @@ def register_commands(ctx) -> None:
             devices = store.list_devices()
             relay = "up" if store.relay_alive() else "down"
             target = store.get_session_target(session_key) if session_key else None
-            return f"Hands: relay {relay}; target {target or ctx.get_config('default_target', default='server')}; {len(devices)} device(s)."
+            status = f"Hands: relay {relay}; target {target or ctx.get_config('default_target', default='server')}; {len(devices)} device(s)."
+            alerts = messages.alerts(devices)
+            return "\n".join([status, *alerts])
         if action == "devices" and len(args) == 1:
             devices = store.list_devices()
             if not devices:

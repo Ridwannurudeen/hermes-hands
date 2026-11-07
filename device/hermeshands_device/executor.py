@@ -16,6 +16,7 @@ import psutil
 
 MAX_OUTPUT = 64 * 1024 * 1024
 CHUNK_SIZE = 16 * 1024
+PIPE_DRAIN_GRACE = 0.2
 
 
 def _is_stub(path: str) -> bool:
@@ -110,21 +111,24 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
     total = 0
     try:
         with output_path.open("wb") as log:
+            exited_at = None
             while True:
-                if time.monotonic() >= deadline:
+                now = time.monotonic()
+                if proc.poll() is not None and exited_at is None:
+                    exited_at = now
+                if exited_at is not None and now - exited_at >= PIPE_DRAIN_GRACE:
+                    break
+                if exited_at is None and now >= deadline:
                     _terminate(proc, created)
                     if on_exit:
                         on_exit(124)
                     yield b"[device timeout]\n"
                     return
                 try:
-                    chunk = chunks.get(timeout=max(0.01, deadline - time.monotonic()))
+                    wait_until = deadline if exited_at is None else exited_at + PIPE_DRAIN_GRACE
+                    chunk = chunks.get(timeout=min(0.1, max(0.01, wait_until - now)))
                 except queue.Empty:
-                    _terminate(proc, created)
-                    if on_exit:
-                        on_exit(124)
-                    yield b"[device timeout]\n"
-                    return
+                    continue
                 if chunk is None:
                     break
                 available = MAX_OUTPUT - total

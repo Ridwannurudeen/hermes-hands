@@ -1,10 +1,31 @@
-import time
+import os
+import shlex
 import threading
+import time
 
 import httpx
 
 from hermeshands_device import cli, loop, config
 from hermeshands_device.protocol import R2D, b64u, canonical_json, generate_keypair, sign_request
+
+
+def _core_wrapped(command):
+    try:
+        from tools.environments.base_session_env import _wrap_command_script
+    except ImportError:
+        escaped = command.replace("'", "'\\''")
+        escaped += '\n\n__hermes_rc=$? __hermes_ps=("${PIPESTATUS[@]}"); (exit $__hermes_rc) && :'
+        return f"eval '{escaped}'"
+    return _wrap_command_script(
+        command,
+        quoted_cwd="/tmp",
+        quoted_snap="/tmp/snapshot",
+        snap_tmp_template="/tmp/snapshot.tmp.XXXXXXXXXX",
+        passthrough_names=(),
+        snapshot_ready=False,
+        cwd_marker="__CWD__",
+        pipe_marker="__PIPE__",
+    )
 
 
 def _signed_poll(monkeypatch, *, body=None, signature_body=None, response_ts=None, response_nonce=None, signing_key=None):
@@ -174,6 +195,66 @@ def test_loop_posts_seq_ordered_chunks(monkeypatch):
     agent._run_job({"job_id": "job", "type": "exec", "script": "echo hi"})
     assert [seq for seq, _ in posted] == [0, 1, 2]
     assert posted[-1][1]["done"] is True
+
+
+def test_loop_allows_core_background_pid_liveness_probe(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.running = {}
+    command = 'kill -0 "$(cat /tmp/hermes_bg_proc-1.pid 2>/dev/null)" 2>/dev/null; echo $?'
+    script = _core_wrapped(command)
+    assert "eval 'kill -0" in script
+    assert loop.policy.refusal(command)
+    posted = []
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter((b"0\n",)))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    agent._run_job({"job_id": "probe", "type": "exec", "script": script})
+    assert posted == [{"chunk": "0\n"}, {"done": True, "returncode": 0}]
+
+
+def test_loop_refuses_denied_commands_even_when_preceded_by_background_probe(monkeypatch):
+    probe = 'kill -0 "$(cat /tmp/hermes_bg_proc-1.pid 2>/dev/null)" 2>/dev/null; echo $?'
+    commands = (
+        probe + "; kill -9 $PPID",
+        probe + f"; taskkill /PID {os.getpid()} /F",
+        f'echo "{probe}"; hermes-hands unpair',
+        'kill -0 "$(cat ~/.hermes-hands/agent.pid 2>/dev/null)" 2>/dev/null; echo $?; kill -9 $PPID',
+        probe + "; shutdown now",
+    )
+    for command in commands:
+        script = _core_wrapped(command)
+        agent = object.__new__(loop.DeviceLoop)
+        agent.processes = {}
+        agent.running = {}
+        posted = []
+        monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+        monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter(()))
+        agent._run_job({"job_id": "denied", "type": "exec", "script": script})
+        assert posted == [{"chunk": f"Policy refused command matching: {loop.policy.refusal(script)}\n", "done": True, "returncode": 126}]
+
+
+def test_probe_wrapper_matches_core_output_when_core_is_importable():
+    try:
+        from tools.environments.base_session_env import _wrap_command_script
+    except ImportError:
+        return
+    pid_path = shlex.quote("/tmp/a'b folder/hermes_bg_proc-1.pid")
+    command = f'kill -0 "$(cat {pid_path} 2>/dev/null)" 2>/dev/null; echo $?'
+    expected = _wrap_command_script(
+        command,
+        quoted_cwd="/tmp",
+        quoted_snap="/tmp/snapshot",
+        snap_tmp_template="/tmp/snapshot.tmp.XXXXXXXXXX",
+        passthrough_names=(),
+        snapshot_ready=False,
+        cwd_marker="__CWD__",
+        pipe_marker="__PIPE__",
+    )
+    assert _core_wrapped(command) == expected
+    probe_line = next(line for line in expected.splitlines() if line.startswith("eval '"))
+    assert loop._BACKGROUND_PID_PROBE.sub("", probe_line) == ""
 
 
 def test_loop_retries_result_after_network_error(monkeypatch):

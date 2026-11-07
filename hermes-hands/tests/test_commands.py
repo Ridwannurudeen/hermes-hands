@@ -97,6 +97,15 @@ def test_use_refuses_unknown_device(monkeypatch):
     assert "No paired device" in ctx.handler("use missing", session_key="s", platform="telegram", source=Source())
 
 
+def test_status_appends_device_policy_alerts(monkeypatch):
+    ctx = setup(monkeypatch)
+    monkeypatch.setattr(commands.store, "list_devices", lambda: [{"name": "laptop", "online": True, "policy_ok": False}])
+    monkeypatch.setattr(commands.store, "relay_alive", lambda: True)
+    monkeypatch.setattr(commands.messages, "alerts", lambda devices: ["Policy alert: laptop"])
+    result = ctx.handler("status")
+    assert result == "Hands: relay up; target server; 1 device(s).\nPolicy alert: laptop"
+
+
 def test_revoke_requires_exact_yes(monkeypatch):
     ctx = setup(monkeypatch, ["telegram:42"])
     calls = []

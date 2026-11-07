@@ -1,7 +1,6 @@
 import os
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -15,7 +14,9 @@ def test_windowsapps_which_candidate_rejected(monkeypatch, tmp_path):
     monkeypatch.setattr(executor.os, "name", "nt")
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "none"))
     monkeypatch.delenv("HERMES_HANDS_BASH", raising=False)
-    monkeypatch.setattr(shutil, "which", lambda name: r"C:\Users\x\AppData\Local\Microsoft\WindowsApps\bash.exe")
+    monkeypatch.setattr(
+        shutil, "which", lambda name: r"C:\Users\x\AppData\Local\Microsoft\WindowsApps\bash.exe"
+    )
     monkeypatch.setattr(os.path, "isfile", lambda path: True)
     assert executor.resolve_bash() is None
 
@@ -28,6 +29,39 @@ def test_real_bash_execution(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     chunks = b"".join(executor.run("echo hi", timeout=5))
     assert chunks.strip() == b"hi"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows background-job pipe inheritance regression")
+def test_background_process_survives_shell_exit(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("Git Bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    pid_file = tmp_path / "background.pid"
+    script_file = tmp_path / "background.py"
+    script_file.write_text(
+        f"import os, time\nopen({str(pid_file)!r}, 'w').write(str(os.getpid()))\ntime.sleep(30)\n",
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    output = b"".join(
+        executor.run(
+            f'nohup python "{script_file.as_posix()}" >/dev/null 2>&1 & echo $!', timeout=5
+        )
+    )
+    elapsed = time.monotonic() - started
+    assert output.splitlines()[0].isdigit()
+    deadline = time.monotonic() + 1
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    child_pid = int(pid_file.read_text(encoding="utf-8-sig"))
+    try:
+        assert elapsed < 1.0
+        assert psutil.pid_exists(child_pid)
+    finally:
+        if psutil.pid_exists(child_pid):
+            psutil.Process(child_pid).kill()
 
 
 def test_large_script_runs_from_temp_file_and_is_removed(monkeypatch, tmp_path):
@@ -67,11 +101,20 @@ def test_grandchild_killed_on_windows(monkeypatch, tmp_path):
         pytest.skip("Git Bash is unavailable")
     monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    bash_python = subprocess.run([bash, "-c", "command -v python"], capture_output=True, text=True, encoding="utf-8", timeout=5)
+    bash_python = subprocess.run(
+        [bash, "-c", "command -v python"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=5,
+    )
     if bash_python.returncode:
         pytest.skip("Python is unavailable inside Git Bash")
     script_file = tmp_path / "spawn-grandchild.py"
-    script_file.write_text("import subprocess, sys, time\nchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\nprint(child.pid, flush=True)\ntime.sleep(30)\n", encoding="utf-8")
+    script_file.write_text(
+        "import subprocess, sys, time\nchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\nprint(child.pid, flush=True)\ntime.sleep(30)\n",
+        encoding="utf-8",
+    )
     chunks = b"".join(executor.run(f'python "{script_file.as_posix()}"', timeout=2))
     child_pid = int(chunks.splitlines()[0])
     deadline = time.monotonic() + 2
