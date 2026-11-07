@@ -20,12 +20,10 @@ def _ids(value: object) -> set[str]:
 
 
 def _is_owner(ctx, platform: str, source) -> bool:
-    from gateway.session import Platform
-
     if source is None and platform in {"cli", "tui", "desktop"}:
         return True
     source_platform = getattr(source, "platform", None)
-    if source_platform == Platform.LOCAL:
+    if str(getattr(source_platform, "value", source_platform)) == "local":
         return True
     user_id = getattr(source, "user_id", None)
     if not user_id:
@@ -36,8 +34,10 @@ def _is_owner(ctx, platform: str, source) -> bool:
         from gateway.config import load_gateway_config
 
         config = load_gateway_config()
-        platform_key = Platform(platform)
-        platform_config = config.platforms.get(platform_key)
+        platform_config = next(
+            (value for key, value in config.platforms.items() if str(getattr(key, "value", key)) == platform),
+            None,
+        )
         extra = getattr(platform_config, "extra", {}) if platform_config else {}
         is_group = str(getattr(source, "chat_type", "dm") or "dm").strip().lower() not in {
             "", "dm", "direct", "private"

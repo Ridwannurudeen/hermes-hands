@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import secrets
+from urllib.parse import urlsplit
+
+import httpx
 
 from . import store
 
@@ -50,46 +53,25 @@ def register_cli(ctx) -> None:
                 print(f"Owner saved: telegram:{owner_id}")
             else:
                 print("Owner id was not saved.")
-            from tools.bot_desktop import placement
-
-            result = placement.resolve()
-            if result.where == placement.REFUSED:
-                print(result.reason)
-                print("hermes config set bot_desktop.placement gateway")
+            print("Set desktop placement with: hermes config set bot_desktop.placement gateway")
             return
         if action == "doctor":
             from hermes_cli.config import load_config_readonly
-            from hermes_cli.dashboard_auth.registry import list_interactive_providers
-            from hermes_cli.dashboard_procs import _scan_dashboard_processes
-            from hermes_cli.main_dashboard import _dashboard_listening, _parse_dashboard_runtime
+            from hermes_cli.dashboard_auth import list_interactive_providers
 
             cfg = load_config_readonly() or {}
             dashboard = cfg.get("dashboard") or {}
             public_url = str(dashboard.get("public_url") or "").strip()
-            runtime = next(
-                (
-                    parsed
-                    for _pid, command in _scan_dashboard_processes()
-                    if (parsed := _parse_dashboard_runtime(command)) is not None
-                    and parsed[0] == "dashboard"
-                ),
-                None,
-            )
-            bind_ok = bool(
-                runtime
-                and runtime[1] in {"127.0.0.1", "localhost", "::1"}
-                and _dashboard_listening(runtime[1], runtime[2])
-            )
-            _check("Dashboard loopback bind", bind_ok, "Bind the dashboard to 127.0.0.1.")
+            dashboard_url = str(ctx.get_config("dashboard_url", default="http://127.0.0.1:9119")).strip()
+            parsed_url = urlsplit(dashboard_url)
+            loopback = parsed_url.hostname in {"127.0.0.1", "localhost", "::1"}
+            try:
+                reachable = loopback and httpx.get(dashboard_url, timeout=3).is_success
+            except httpx.HTTPError:
+                reachable = False
+            _check("Dashboard loopback HTTP", bool(reachable), "Set dashboard_url to a reachable loopback dashboard URL.")
             _check("dashboard.public_url", bool(public_url), "Set dashboard.public_url to the public HTTPS URL.")
             _check("Interactive dashboard auth", bool(list_interactive_providers()), "Configure dashboard.basic_auth or another interactive auth provider.")
-            try:
-                from . import client
-
-                reachable = bool(client.state().get("relay"))
-            except Exception:
-                reachable = False
-            _check("Relay reachable", reachable, "Start the Hermes dashboard hosting the Hands relay.")
             _check("Shared plugin_data_dir", store.relay_alive(), "Run the gateway and dashboard with the same HERMES_HOME.")
 
     def _check(label: str, passed: bool, fix: str) -> None:
