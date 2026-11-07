@@ -1,0 +1,179 @@
+import os
+import threading
+import time
+
+import pytest
+
+from hands import handle as handle_module
+from hands.handle import DEVICE_TIMEOUT_GRACE, RemoteProcessHandle
+
+client = handle_module.client
+
+
+class FakeRelay:
+    """Stands in for the loopback client; ``outputs`` are dicts or exceptions, served in order."""
+
+    def __init__(self, outputs, *, start_error=None):
+        self.outputs = list(outputs)
+        self.start_error = start_error
+        self.started = []
+        self.cancelled = []
+        self.release = threading.Event()
+        self.release.set()
+
+    def start_job(self, device, *, script, login, timeout):
+        self.started.append((device, script, login, timeout))
+        if self.start_error is not None:
+            raise self.start_error
+        return "job1"
+
+    def job_output(self, job_id, after):
+        assert job_id == "job1"
+        self.release.wait(5)
+        item = self.outputs.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return {"returncode": None, "error": None, "png_b64": None, **item}
+
+    def cancel_job(self, job_id):
+        self.cancelled.append(job_id)
+
+
+@pytest.fixture
+def fake(monkeypatch):
+    def install(outputs, **kwargs):
+        relay = FakeRelay(outputs, **kwargs)
+        for name in ("start_job", "job_output", "cancel_job"):
+            monkeypatch.setattr(client, name, getattr(relay, name))
+        return relay
+
+    return install
+
+
+def read_to_eof(proc, timeout=2.0) -> bytes:
+    """Read stdout's descriptor to EOF on a thread; fails if EOF does not arrive in ``timeout``."""
+    data, finished = [], threading.Event()
+
+    def reader():
+        fd = proc.stdout.fileno()
+        while chunk := os.read(fd, 4096):
+            data.append(chunk)
+        finished.set()
+
+    threading.Thread(target=reader, daemon=True).start()
+    assert finished.wait(timeout), "stdout did not reach EOF"
+    return b"".join(data)
+
+
+def wait_exit(proc, timeout=5.0) -> int:
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None:
+        assert time.monotonic() < deadline, "handle never exited"
+        time.sleep(0.005)
+    return proc.returncode
+
+
+def test_write_end_closes_before_exit_is_visible(fake):
+    relay = fake(
+        [
+            {"chunks": ["hello ", "wörld"], "next": 2, "done": False},
+            {"chunks": ["\n"], "next": 3, "done": True, "returncode": 3},
+        ]
+    )
+    relay.release.clear()
+    proc = RemoteProcessHandle("laptop", "echo hi", login=True, timeout=30)
+    assert proc.poll() is None and proc.returncode is None and proc.wait(timeout=0.05) is None
+    assert not hasattr(proc, "pid")
+    relay.release.set()
+    assert wait_exit(proc) == 3
+    # poll() is non-None only after the write end closed: the drain reads everything, then EOF.
+    assert read_to_eof(proc, timeout=1.0).decode("utf-8") == "hello wörld\n"
+    assert relay.started == [("laptop", "echo hi", True, 30 + DEVICE_TIMEOUT_GRACE)]
+    assert proc.wait() == 3
+
+
+def test_exit_is_published_only_after_the_write_end_closed(fake, monkeypatch):
+    relay = fake([{"chunks": ["x"], "next": 1, "done": True, "returncode": 0}])
+    relay.release.clear()
+    seen_at_close = []
+
+    class OsSpy:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def close(self, fd):
+            seen_at_close.append(procs[0].poll())
+            os.close(fd)
+
+    procs = []
+    monkeypatch.setattr(handle_module, "os", OsSpy())
+    procs.append(RemoteProcessHandle("laptop", "true", login=False, timeout=5))
+    relay.release.set()
+    assert wait_exit(procs[0]) == 0
+    assert seen_at_close == [None]
+
+
+def test_refused_start_says_why_and_returns_255(fake):
+    fake([], start_error=client.HandsError("hands: laptop is offline, so nothing ran."))
+    proc = RemoteProcessHandle("laptop", "true", login=False, timeout=5)
+    assert wait_exit(proc) == 255
+    assert read_to_eof(proc) == b"hands: laptop is offline, so nothing ran."
+
+
+def test_relay_lost_mid_command_keeps_partial_output(fake):
+    fake(
+        [{"chunks": ["partial"], "next": 1, "done": False}, client.HandsError("hands: relay down")]
+    )
+    proc = RemoteProcessHandle("laptop", "make", login=False, timeout=5)
+    assert wait_exit(proc) == 255
+    assert read_to_eof(proc) == b"partial\nhands: relay down"
+
+
+def test_relay_failure_without_returncode_is_255_with_reason(fake):
+    fake([{"chunks": ["a"], "next": 1, "done": True, "error": "hands: laptop went offline"}])
+    proc = RemoteProcessHandle("laptop", "make", login=False, timeout=5)
+    assert wait_exit(proc) == 255
+    assert read_to_eof(proc) == b"a\nhands: laptop went offline"
+
+
+def test_kill_cancels_at_the_relay_and_drops_later_output(fake):
+    relay = fake([{"chunks": ["too late"], "next": 1, "done": True, "returncode": 137}])
+    relay.release.clear()
+    proc = RemoteProcessHandle("laptop", "sleep 99", login=False, timeout=5)
+    deadline = time.monotonic() + 5
+    while proc._job_id is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+    proc.kill()
+    proc.kill()
+    assert relay.cancelled == ["job1"]
+    relay.release.set()
+    assert wait_exit(proc) == 137
+    assert read_to_eof(proc) == b""
+
+
+def test_kill_before_the_job_exists_cancels_it_once_queued(fake, monkeypatch):
+    queued = threading.Event()
+    relay = fake([{"chunks": [], "next": 0, "done": True, "returncode": 137}])
+    original = relay.start_job
+
+    def slow_start(device, **kwargs):
+        queued.wait(5)
+        return original(device, **kwargs)
+
+    monkeypatch.setattr(client, "start_job", slow_start)
+    proc = RemoteProcessHandle("laptop", "sleep 99", login=False, timeout=5)
+    proc.kill()
+    assert relay.cancelled == []
+    queued.set()
+    wait_exit(proc)
+    assert relay.cancelled == ["job1"]
+
+
+def test_closed_reader_does_not_break_the_worker(fake):
+    relay = fake([{"chunks": ["x" * 200_000], "next": 1, "done": True, "returncode": 0}])
+    relay.release.clear()
+    proc = RemoteProcessHandle("laptop", "yes", login=False, timeout=5)
+    proc.stdout.close()
+    relay.release.set()
+    assert wait_exit(proc) == 0
