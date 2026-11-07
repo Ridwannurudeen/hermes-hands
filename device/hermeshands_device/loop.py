@@ -27,6 +27,7 @@ class DeviceLoop:
         self.processes: dict[str, tuple[object, float]] = {}
         self.stop_event = threading.Event()
         self.fatal: list[Exception] = []
+        self.policy_change_logged = False
         self.client = httpx.Client(transport=transport, timeout=35)
 
     def _post(self, endpoint: str, body_obj: dict) -> httpx.Response:
@@ -52,8 +53,10 @@ class DeviceLoop:
             return {}
         if response.status_code == 409:
             if response.json().get("error") == "policy_changed":
-                self._cancel_all()
-                logger.warning("Relay policy changed; cancelling running jobs and backing off")
+                self._cancel_running_jobs()
+                if not self.policy_change_logged:
+                    logger.warning("Relay policy changed; cancelling running jobs and backing off")
+                    self.policy_change_logged = True
                 raise PermissionError("policy_changed")
             raise ValueError(f"unexpected relay status {response.status_code}")
         if response.status_code != 200:
@@ -77,6 +80,9 @@ class DeviceLoop:
 
     def _cancel_all(self) -> None:
         self.stop_event.set()
+        self._cancel_running_jobs()
+
+    def _cancel_running_jobs(self) -> None:
         for job_id in list(self.processes):
             proc, started = self.processes[job_id]
             if proc.poll() is None:
@@ -101,7 +107,7 @@ class DeviceLoop:
                 return
             except httpx.HTTPError:
                 self.stop_event.wait(2)
-        raise PermissionError("device stopped before result delivery")
+        logger.debug("Dropping result for %s because the device is stopping", job_id)
 
     def _run_job(self, job: dict) -> None:
         job_id, seq = job["job_id"], 0
@@ -127,14 +133,26 @@ class DeviceLoop:
                     _terminate(target[0], target[1])
                 self._result(job_id, seq, done=True, returncode=0)
         except PermissionError as exc:
+            if self.stop_event.is_set():
+                logger.debug("Dropping result for %s because the device is stopping", job_id)
+                return
             if str(exc) == "unknown_device":
                 return
             if str(exc) == "policy_changed":
                 self.stop_event.wait(30)
                 return
-            self._result(job_id, seq, done=True, returncode=1, error=str(exc))
+            try:
+                self._result(job_id, seq, done=True, returncode=1, error=str(exc))
+            except Exception:
+                logger.debug("Could not deliver job failure for %s", job_id, exc_info=True)
         except Exception as exc:
-            self._result(job_id, seq, done=True, returncode=1, error=str(exc))
+            if self.stop_event.is_set():
+                logger.debug("Dropping result for %s because the device is stopping", job_id)
+                return
+            try:
+                self._result(job_id, seq, done=True, returncode=1, error=str(exc))
+            except Exception:
+                logger.debug("Could not deliver job failure for %s", job_id, exc_info=True)
         finally:
             self.processes.pop(job_id, None)
             self.running.pop(job_id, None)
@@ -149,6 +167,9 @@ class DeviceLoop:
                 if str(exc) == "unknown_device":
                     self.stop_event.set()
                     return
+                if str(exc) == "policy_changed":
+                    self.stop_event.wait(30)
+                    continue
                 self.stop_event.wait(2)
             except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError):
                 self.stop_event.wait(2)
@@ -171,6 +192,9 @@ class DeviceLoop:
             except PermissionError as exc:
                 if str(exc) == "unknown_device":
                     raise
+                if str(exc) == "policy_changed":
+                    self.stop_event.wait(30)
+                    continue
                 time.sleep(random.uniform(1, 3))
             except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError):
                 logger.warning("Device poll failed; retrying")

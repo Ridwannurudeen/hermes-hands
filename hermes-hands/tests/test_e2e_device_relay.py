@@ -286,11 +286,6 @@ def test_forged_relay_replies_are_dropped(rig, caplog):
     assert not (rig.home / "pwned.txt").exists()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="device bug: loop.py _verify_response's 409 branch calls _cancel_all(), which sets "
-    "stop_event, so the agent stops serving and /hands accept-policy cannot bring it back",
-)
 def test_policy_change_is_refused_until_accepted(rig):
     env = rig.environment()
     assert env.execute("echo before")["returncode"] == 0

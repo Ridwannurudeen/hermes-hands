@@ -193,3 +193,57 @@ def test_loop_retries_result_after_network_error(monkeypatch):
     monkeypatch.setattr(agent.stop_event, "wait", lambda delay: False)
     agent._result("job", 0, done=True)
     assert len(attempts) == 2
+
+
+def test_policy_change_cancels_jobs_without_stopping_agent(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.policy_change_logged = False
+    response = httpx.Response(409, json={"error": "policy_changed"})
+
+    try:
+        agent._verify_response(response, "/device/poll")
+    except PermissionError as exc:
+        assert str(exc) == "policy_changed"
+    else:
+        raise AssertionError("policy change response was accepted")
+
+    assert not agent.stop_event.is_set()
+    posted = []
+    agent.running = {}
+    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.executor, "run", lambda *a, **kw: iter(()))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    agent._run_job({"job_id": "later", "type": "exec", "script": "echo hi"})
+    assert posted == [{"done": True, "returncode": 0}]
+
+
+def test_stopping_during_result_delivery_does_not_escape_job_thread(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.running = {}
+    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+
+    def post(*args, **kwargs):
+        agent.stop_event.set()
+        raise httpx.ConnectError("device stopped")
+
+    monkeypatch.setattr(agent, "_post", post)
+    monkeypatch.setattr(loop.executor, "run", lambda *a, **kw: iter((b"output",)))
+    errors = []
+
+    def run():
+        try:
+            agent._run_job({"job_id": "job", "type": "exec", "script": "echo hi"})
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert errors == []
