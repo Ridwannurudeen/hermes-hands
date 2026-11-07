@@ -99,9 +99,11 @@ def main(argv: list[str] | None = None) -> int:
         return _pair(args.gateway_url, args.name, args.code)
     if args.command == "serve":
         from .loop import DeviceLoop
+        from .janitor import start as start_janitor
 
         if not config.device_id() or not config.gateway_url():
             parser.error("pair this device first")
+        start_janitor()
         DeviceLoop(allow_screen=args.allow_screen).run_forever()
         return 0
     if args.command == "status":
