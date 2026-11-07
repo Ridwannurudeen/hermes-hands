@@ -188,6 +188,7 @@ def test_loop_posts_seq_ordered_chunks(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.processes = {}
     agent.running = {}
+    agent.stop_event = threading.Event()
     monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
     monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
     monkeypatch.setattr(loop.executor, "run", lambda *a, **kw: iter((b"one", b"two")))
@@ -222,6 +223,33 @@ def test_loop_sends_output_read_after_exit_with_done(monkeypatch):
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((seq, kwargs)))
     agent._run_job({"job_id": "job", "type": "exec", "script": "echo hi"})
     assert posted == [(0, {"chunk": "running "}), (1, {"chunk": "after exit", "done": True, "returncode": 3})]
+
+
+def test_loop_flushes_held_output_before_executor_error(monkeypatch):
+    posted = []
+    agent = object.__new__(loop.DeviceLoop)
+    agent.processes = {}
+    agent.running = {}
+    agent.stop_event = threading.Event()
+
+    class Process:
+        def poll(self):
+            return 3
+
+    def run(*args, on_start, on_exit, **kwargs):
+        on_start(Process(), 0.0)
+        yield b"held output"
+        raise RuntimeError("executor failed")
+
+    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.executor, "run", run)
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((seq, kwargs)))
+    agent._run_job({"job_id": "job", "type": "exec", "script": "echo hi"})
+    assert posted == [
+        (0, {"chunk": "held output"}),
+        (1, {"done": True, "returncode": 1, "error": "executor failed"}),
+    ]
 
 
 def test_loop_allows_core_background_pid_liveness_probe(monkeypatch):

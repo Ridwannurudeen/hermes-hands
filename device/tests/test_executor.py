@@ -24,7 +24,7 @@ def test_windowsapps_which_candidate_rejected(monkeypatch, tmp_path):
 def test_resolve_bash_probes_each_candidate_once(monkeypatch, tmp_path):
     bash = tmp_path / "bash.exe"
     bash.write_bytes(b"")
-    monkeypatch.setattr(executor, "_PROBED", set())
+    monkeypatch.setattr(executor, "_PROBED", {})
     monkeypatch.setattr(executor.os, "name", "nt")
     monkeypatch.setenv("HERMES_HANDS_BASH", str(bash))
     monkeypatch.setenv("ProgramFiles", str(tmp_path / "none"))
@@ -39,6 +39,54 @@ def test_resolve_bash_probes_each_candidate_once(monkeypatch, tmp_path):
     assert probes == [[str(bash), "-c", "exit 0"]]
     bash.unlink()
     assert executor.resolve_bash() is None  # a bash that went away is still noticed
+
+
+def test_cached_bash_is_reprobed_when_file_changes(monkeypatch, tmp_path):
+    bash = tmp_path / "bash.exe"
+    bash.write_bytes(b"old")
+    monkeypatch.setattr(executor, "_PROBED", {})
+    monkeypatch.setattr(executor.os, "name", "nt")
+    monkeypatch.setenv("HERMES_HANDS_BASH", str(bash))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "none"))
+    monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    probes = []
+
+    def probe(args, **kwargs):
+        probes.append(args)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(executor.subprocess, "run", probe)
+    assert executor.resolve_bash() == str(bash)
+    bash.write_bytes(b"replacement with a different size")
+    assert executor.resolve_bash() == str(bash)
+    assert probes == [[str(bash), "-c", "exit 0"]] * 2
+
+
+def test_failed_cached_bash_reprobe_uses_next_candidate(monkeypatch, tmp_path):
+    preferred = tmp_path / "preferred.exe"
+    fallback = tmp_path / "fallback.exe"
+    preferred.write_bytes(b"old")
+    fallback.write_bytes(b"bash")
+    monkeypatch.setattr(executor, "_PROBED", {})
+    monkeypatch.setattr(executor.os, "name", "nt")
+    monkeypatch.setenv("HERMES_HANDS_BASH", str(preferred))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "none"))
+    monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+    monkeypatch.delenv("LOCALAPPDATA", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: str(fallback))
+    probes = []
+
+    def probe(args, **kwargs):
+        probes.append(args[0])
+        return subprocess.CompletedProcess(args, int(args[0] == str(preferred) and probes.count(str(preferred)) > 1))
+
+    monkeypatch.setattr(executor.subprocess, "run", probe)
+    assert executor.resolve_bash() == str(preferred)
+    preferred.write_bytes(b"replacement with a different size")
+    assert executor.resolve_bash() == str(fallback)
+    assert probes == [str(preferred), str(preferred), str(fallback)]
 
 
 def test_real_bash_execution(monkeypatch, tmp_path):

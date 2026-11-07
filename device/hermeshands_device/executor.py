@@ -17,7 +17,7 @@ import psutil
 MAX_OUTPUT = 64 * 1024 * 1024
 CHUNK_SIZE = 16 * 1024
 PIPE_DRAIN_GRACE = 0.2
-_PROBED: set[str] = set()  # candidates whose probe passed: a probe costs a bash start, every job
+_PROBED: dict[str, tuple[int, int, int]] = {}  # file identity for candidates whose probe passed
 
 
 def _is_stub(path: str) -> bool:
@@ -45,15 +45,20 @@ def resolve_bash() -> str | None:
     for candidate in dict.fromkeys(candidates):
         if os.name == "nt" and _is_stub(candidate):
             continue
-        if not os.path.isfile(candidate):
+        try:
+            stat = os.stat(candidate)
+        except OSError:
             continue
+        identity = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
         if candidate in _PROBED:
-            return candidate
+            if _PROBED[candidate] == identity:
+                return candidate
+            del _PROBED[candidate]
         try:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             probe = subprocess.run([candidate, "-c", "exit 0"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, creationflags=flags, check=False)
             if probe.returncode == 0:
-                _PROBED.add(candidate)
+                _PROBED[candidate] = identity
                 return candidate
         except (OSError, subprocess.TimeoutExpired):
             continue

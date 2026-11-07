@@ -119,6 +119,7 @@ class DeviceLoop:
 
     def _run_job(self, job: dict) -> None:
         job_id, seq = job["job_id"], 0
+        tail = b""
         try:
             if job["type"] == "exec":
                 script = job["script"]
@@ -127,7 +128,7 @@ class DeviceLoop:
                 if refused:
                     self._result(job_id, seq, chunk=f"Policy refused command matching: {refused}\n", done=True, returncode=126)
                     return
-                exit_code, tail = [0], b""
+                exit_code = [0]
                 for chunk in executor.run(job["script"], login=job.get("login", False), timeout=job.get("timeout", 120), job_id=job_id, on_start=lambda proc, started: self.processes.__setitem__(job_id, (proc, started)), on_exit=lambda code: exit_code.__setitem__(0, code)):
                     process = self.processes.get(job_id)
                     if process is not None and process[0].poll() is not None:
@@ -158,6 +159,9 @@ class DeviceLoop:
                 self.stop_event.wait(30)
                 return
             try:
+                if tail:
+                    self._result(job_id, seq, chunk=tail.decode("utf-8", errors="replace"))
+                    seq += 1
                 self._result(job_id, seq, done=True, returncode=1, error=str(exc))
             except Exception:
                 logger.debug("Could not deliver job failure for %s", job_id, exc_info=True)
@@ -166,6 +170,9 @@ class DeviceLoop:
                 logger.debug("Dropping result for %s because the device is stopping", job_id)
                 return
             try:
+                if tail:
+                    self._result(job_id, seq, chunk=tail.decode("utf-8", errors="replace"))
+                    seq += 1
                 self._result(job_id, seq, done=True, returncode=1, error=str(exc))
             except Exception:
                 logger.debug("Could not deliver job failure for %s", job_id, exc_info=True)
