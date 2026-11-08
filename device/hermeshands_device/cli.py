@@ -78,14 +78,18 @@ def _doctor() -> int:
     if bash:
         python_found = False
         for command in ("python3", "python"):
-            probe = subprocess.run([bash, "-c", f'command -v {command}'], capture_output=True, text=True, encoding="utf-8", timeout=5)
+            try:
+                probe = subprocess.run([bash, "-c", f'command -v {command}'], capture_output=True, text=True, encoding="utf-8", timeout=5)
+            except subprocess.TimeoutExpired:
+                print(f"python in bash: command -v {command} timed out")
+                continue
             executable = probe.stdout.strip()
             if not executable:
                 continue
             try:
                 version = subprocess.run([bash, "-c", f'{command} -c "import sys; print(sys.version)"'], capture_output=True, text=True, encoding="utf-8", timeout=20)
             except subprocess.TimeoutExpired:
-                print(f"python in bash: {command} timed out while starting")
+                print(f"python in bash: {command} version probe timed out while starting")
                 continue
             if version.returncode == 0 and version.stdout.strip():
                 print(f"python in bash: {executable} ({version.stdout.strip().splitlines()[0]})")

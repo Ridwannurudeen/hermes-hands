@@ -33,7 +33,7 @@ def get_or_create() -> tuple[bytes, bytes]:
     if keyring:
         try:
             value = keyring.get_password(SERVICE, "device-private")
-        except keyring.errors.KeyringError:
+        except Exception:
             logger.warning("Keyring unavailable; using protected device key file")
             keyring = None
             value = None
@@ -48,7 +48,7 @@ def get_or_create() -> tuple[bytes, bytes]:
     if keyring:
         try:
             keyring.set_password(SERVICE, "device-private", b64u(private))
-        except keyring.errors.KeyringError:
+        except Exception:
             logger.warning("Keyring unavailable; using protected device key file")
             keyring = None
     if not keyring:

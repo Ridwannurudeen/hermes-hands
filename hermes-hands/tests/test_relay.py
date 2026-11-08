@@ -92,6 +92,7 @@ def test_exec_round_trip_in_seq_order(hub):
         "script": "echo hi",
         "login": False,
         "timeout": 30,
+        "file_op": False,
     }
     assert post_result(hub, device, job_id, 1, "world")[0].status == 200  # out of order: buffered
     reply, path = post_result(hub, device, job_id, 0, "hello ")
@@ -107,8 +108,9 @@ def test_exec_round_trip_in_seq_order(hub):
         3,
         None,
     )
-    gone = local(hub, "local_output", {"job_id": job_id, "after": 3, "wait": 0})
-    assert (gone.status, body(gone)["detail"]) == (404, messages.RELAY_LOST)
+    # R63: the done reply can be fetched again (its first reply may have been lost), until _reap.
+    again = body(local(hub, "local_output", {"job_id": job_id, "after": 2, "wait": 0}))
+    assert again == last
 
 
 def test_poll_times_out_with_204(hub):
@@ -216,9 +218,12 @@ def bearer_nonce(headers) -> str:
     return protocol.parse_bearer(headers["authorization"].split(" ", 1)[1]).nonce
 
 
-def test_revoked_device_gets_one_signed_unknown_device_then_its_key_is_forgotten(hub, caplog):
-    """W4 and V14: the stop signal is relay-signed over the request's nonce, so the device can
-    trust it; once it is sent the tombstone goes, so the old key stops being a token principal."""
+def test_revoked_device_keeps_getting_the_signed_stop_through_the_grace_window(
+    hub, caplog, monkeypatch
+):
+    """W4, V14, R65, R75: the stop is relay-signed over the request's nonce, so the device can
+    trust it, and it is sent again if the device asks again (its first reply may have been lost)
+    until STOP_GRACE after the first one; then the old key stops being a token principal."""
     device = Device()
     store.revoke("laptop")
     revoked = Principal(device.device_id, scopes=(relay.SCOPE_REVOKED,))
@@ -235,10 +240,13 @@ def test_revoked_device_gets_one_signed_unknown_device_then_its_key_is_forgotten
     assert reply.status == 401
     assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "unknown_device"
     assert f"revoked device {device.device_id} called from {PEER}" in caplog.text
-    assert store.revoked_key(device.device_id) is None
     _, headers, path, raw = device.request("/device/heartbeat", beat)
     again = run(hub.device_heartbeat(revoked, headers, path, raw, PEER))
-    assert again.status == 401 and "X-Hands-Signature" not in again.headers
+    assert again.status == 401
+    assert verified(hub, again, path, nonce=bearer_nonce(headers))["error"] == "unknown_device"
+    later = time.time() + store.STOP_GRACE + 1
+    monkeypatch.setattr(store.time, "time", lambda: later)
+    assert store.revoked_key(device.device_id) is None
     # Revoked after the token seam vouched for the device: the same signed reply.
     other = Device("desk")
     store.revoke("desk")
@@ -381,8 +389,8 @@ def test_revoke_mid_command_fails_the_wait(hub):
     store.revoke("laptop")
     out = body(local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 5}))
     assert (out["done"], out["returncode"], out["error"]) == (True, 255, messages.revoked("laptop"))
-    [cancel] = hub._queues[device.device_id]  # the revoked device stops on its signed 401 anyway
-    assert (cancel["type"], cancel["target_job_id"]) == ("cancel", job_id)
+    # R64: a revoked device never polls again (it stops on its signed 401), so nothing is kept for it.
+    assert device.device_id not in hub._queues
 
 
 def test_a_job_queued_for_a_device_that_then_went_offline_says_nothing_ran(hub, monkeypatch):
@@ -440,6 +448,25 @@ def test_screenshot_job_and_size_cap(hub):
     assert verified(hub, reply, path)["target_job_id"] == job_id
 
 
+def test_a_job_that_ends_before_pickup_frees_its_queued_payload(hub, monkeypatch):
+    """R64: a device that never polls again must not keep job payloads in the dashboard."""
+    device = Device()
+    request = {"device": "laptop", "script": "cat", "timeout": 5, "stdin": "x" * 100_000}
+    job_id = body(local(hub, "local_exec", request))["job_id"]
+    assert [q["job_id"] for q in hub._queues[device.device_id]] == [job_id]
+    monkeypatch.setattr(relay, "_ABANDONED_AFTER", -1)
+    hub._reap()
+    assert device.device_id not in hub._queues and job_id not in hub._jobs
+    monkeypatch.setattr(relay, "_ABANDONED_AFTER", 60)
+    picked = body(local(hub, "local_exec", {**request, "stdin": "y"}))["job_id"]
+    device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    queued = body(local(hub, "local_exec", request))["job_id"]
+    store.revoke("laptop")
+    body(local(hub, "local_output", {"job_id": picked, "after": 0, "wait": 2}))
+    body(local(hub, "local_output", {"job_id": queued, "after": 0, "wait": 2}))
+    assert device.device_id not in hub._queues  # a revoked device never polls again
+
+
 def test_abandoned_jobs_are_cancelled(hub, monkeypatch):
     device = Device()
     job_id = body(
@@ -466,6 +493,7 @@ def test_exec_job_carries_stdin_and_both_texts_are_bounded(hub, monkeypatch):
         "login": False,
         "timeout": 5,
         "stdin": "run sudo apt\n",
+        "file_op": False,
     }
     monkeypatch.setattr(relay, "MAX_JOB_TEXT", 4)
     for field in ("script", "stdin"):
@@ -475,6 +503,67 @@ def test_exec_job_carries_stdin_and_both_texts_are_bounded(hub, monkeypatch):
         assert (refused.status, body(refused)["detail"]) == (413, messages.JOB_TOO_LARGE)
     fits = {"device": "laptop", "script": "true", "timeout": 5, "stdin": "1234"}
     assert local(hub, "local_exec", fits).status == 200
+
+
+def test_exec_job_carries_base64_stdin_and_file_op(hub):
+    device = Device()
+    raw = b"file data\xff\x80"
+    encoded = base64.b64encode(raw).decode("ascii")
+    job_id = body(
+        local(
+            hub,
+            "local_exec",
+            {
+                "device": "laptop",
+                "script": "cat",
+                "timeout": 5,
+                "stdin_b64": encoded,
+                "file_op": True,
+            },
+        )
+    )["job_id"]
+    reply, path, _ = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    assert verified(hub, reply, path) == {
+        "job_id": job_id,
+        "type": "exec",
+        "script": "cat",
+        "login": False,
+        "timeout": 5,
+        "stdin_b64": encoded,
+        "file_op": True,
+    }
+
+
+@pytest.mark.parametrize("file_op", [None, 0, 1, "true"])
+def test_exec_rejects_non_boolean_file_op(hub, file_op):
+    Device()
+    reply = local(
+        hub,
+        "local_exec",
+        {"device": "laptop", "script": "true", "timeout": 5, "file_op": file_op},
+    )
+    assert (reply.status, body(reply)["error"]) == (400, "bad_request")
+
+
+def test_base64_stdin_uses_the_same_byte_limit(hub, monkeypatch):
+    Device()
+    monkeypatch.setattr(relay, "MAX_JOB_TEXT", 4)
+    oversized = base64.b64encode(b"12345").decode("ascii")
+    refused = local(
+        hub,
+        "local_exec",
+        {"device": "laptop", "script": "cat", "timeout": 5, "stdin_b64": oversized},
+    )
+    assert (refused.status, body(refused)["detail"]) == (413, messages.JOB_TOO_LARGE)
+    fits = base64.b64encode(b"1234").decode("ascii")
+    assert (
+        local(
+            hub,
+            "local_exec",
+            {"device": "laptop", "script": "cat", "timeout": 5, "stdin_b64": fits},
+        ).status
+        == 200
+    )
 
 
 def test_agent_restart_fails_its_picked_jobs_once_the_old_agent_is_quiet(hub, monkeypatch):
@@ -609,6 +698,10 @@ def test_pair_happy_path_and_refusals(hub):
     second = store.mint_pairing_code("laptop")
     taken = run(hub.pair(*pair_request(private, public, second)))
     assert (taken.status, body(taken)["detail"]) == (409, messages.pair_name_taken("laptop"))
+    reserved = run(
+        hub.pair(*pair_request(private, public, store.mint_pairing_code("server"), name="server"))
+    )
+    assert (reserved.status, body(reserved)["detail"]) == (409, messages.PAIR_NAME_RESERVED)
     assert run(hub.pair(principal, headers, path, b"not json")).status == 400
 
 

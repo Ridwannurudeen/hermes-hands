@@ -10,6 +10,7 @@ Needs FastAPI and Hermes core importable (``hermes_cli``, ``tools``), and bash f
 (Git Bash on Windows); skipped otherwise.
 """
 
+import base64
 import functools
 import json
 import sys
@@ -347,6 +348,20 @@ def test_file_contents_never_meet_the_device_deny_list(rig):
     written = files.write_file(f"{rig.device_home}/notes.md", content)
     assert written.error is None and written.verified is True, written.to_dict()
     assert (rig.home / "notes.md").read_bytes() == content.encode("utf-8")
+    job = next(job for job in rig.delivered if job.get("stdin") == content)
+    assert job["file_op"] is True and "stdin_b64" not in job
+
+
+def test_file_tool_preserves_invalid_utf8_stdin_end_to_end(rig):
+    raw = b"file data\xff\x80\n"
+    content = raw.decode("utf-8", errors="surrogateescape")
+    files = ShellFileOperations(rig.environment())
+    written = files.write_file(f"{rig.device_home}/binary.txt", content)
+    assert written.error is None and written.verified is True, written.to_dict()
+    assert (rig.home / "binary.txt").read_bytes() == raw
+    encoded = base64.b64encode(raw).decode("ascii")
+    job = next(job for job in rig.delivered if job.get("stdin_b64") == encoded)
+    assert job["file_op"] is True and "stdin" not in job
 
 
 def lose_an_output_fetch(rig, monkeypatch, *, restart: bool) -> dict:

@@ -16,7 +16,7 @@ DEFAULTS = [
     r"\bsudo\b",
     r"(?:rm\s+-rf\s+(?:/(?:\s|$)|['\"]?(?:~/?|\$HOME/?)['\"]?(?:\s|$))|\bRemove-Item\b.*(?:[A-Za-z]:\\|[/\\])(?:\s|$).*?-Recurse)",
     r"\bmkfs(?:\.[\w-]+)?\b|\bdd\b.*\bof=/dev/",
-    r"\bdiskpart\b|\bformat\b.*(?:[A-Za-z]:|/FS:)",
+    r"\bdiskpart\b|(?:^|[\r\n;&|()])\s*(?:cmd(?:\.exe)?\s+/c\s+)?(?:[A-Za-z]:\\(?:[^\\\s;&|()]+\\)*)?format(?:\.com)?\s+[A-Za-z]:",
     r"\b(?:shutdown|reboot|Stop-Computer)\b",
     r"(?:curl|wget|Invoke-WebRequest).*\|\s*(?:sh|bash|pwsh|powershell)",
     r"(?:taskkill\s+/PID\s+<agent-pid>\b|Stop-Process\b.*-Id\s+<agent-pid>\b|\bkill\s+-?9?\s+<agent-pid>\b)",

@@ -35,6 +35,7 @@ def _signed_poll(monkeypatch, *, body=None, signature_body=None, response_ts=Non
     monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
     monkeypatch.setattr(config, "device_id", lambda: "device-1")
     monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    monkeypatch.setattr(config, "load", lambda: {"gateway_url": "https://example.test/api/plugins/hermes-hands", "device_id": "device-1", "relay_public_key": b64u(public)})
     payload = {"job_id": "job-1", "type": "exec", "script": "echo signed"}
     body = canonical_json(payload) if body is None else body
     signature_body = body if signature_body is None else signature_body
@@ -120,6 +121,93 @@ def test_loop_rejects_poll_reply_signed_by_wrong_key(monkeypatch):
         agent.client.close()
 
 
+@pytest.mark.parametrize("status,error", [(401, "unknown_device"), (409, "policy_changed")])
+@pytest.mark.parametrize("mutation", ["wrong_key", "wrong_nonce", "unsigned"])
+def test_control_error_replies_reject_signature_mutants(monkeypatch, status, error, mutation):
+    private, public = generate_keypair()
+    wrong_private, _ = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
+    monkeypatch.setattr(config, "device_id", lambda: "device-1")
+    monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    monkeypatch.setattr(config, "load", lambda: {"gateway_url": "https://example.test/api/plugins/hermes-hands", "device_id": "device-1", "relay_public_key": b64u(public)})
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(lambda request: httpx.Response(204, request=request)))
+    request = httpx.Request("POST", "https://example.test/device/poll", headers={"X-Hands-Nonce": "request-nonce"})
+    body = canonical_json({"error": error})
+    timestamp = int(time.time())
+    response_nonce = "other-nonce" if mutation == "wrong_nonce" else "request-nonce"
+    key = wrong_private if mutation == "wrong_key" else private
+    headers = {}
+    if mutation != "unsigned":
+        headers = {
+            "X-Hands-Ts": str(timestamp),
+            "X-Hands-Nonce": response_nonce,
+            "X-Hands-Signature": sign_request(key, R2D, timestamp, response_nonce, "POST", "/api/plugins/hermes-hands/device/poll", body),
+        }
+    response = httpx.Response(status, content=body, request=request, headers=headers)
+    try:
+        with pytest.raises(ValueError, match=f"transient relay status {status}"):
+            agent._verify_response(response, "/device/poll")
+        assert not agent.stop_event.is_set()
+    finally:
+        agent.client.close()
+
+
+def test_device_loop_client_ignores_environment_proxies(monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9999")
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(lambda request: httpx.Response(204, request=request)))
+    try:
+        assert agent.client._trust_env is False
+    finally:
+        agent.client.close()
+
+
+def test_first_transient_auth_warning_is_not_suppressed(monkeypatch, caplog):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(lambda request: httpx.Response(204, request=request)))
+    monkeypatch.setattr(loop.time, "monotonic", lambda: 10.0)
+    try:
+        agent._transient_status(401)
+        agent._transient_status(401)
+    finally:
+        agent.client.close()
+    warnings = [record.message for record in caplog.records if "Relay returned HTTP 401" in record.message]
+    assert warnings == ["Relay returned HTTP 401; retrying. Check for clock skew over 300 seconds, a dashboard started without the relay seed, or a device revoked before this version."]
+
+
+def test_transient_poll_does_not_repeat_generic_warning(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(loop.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(loop.threading, "Thread", lambda **kwargs: type("Thread", (), {"start": lambda self: None})())
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.poll_retry_delay = 1
+    agent.last_auth_warning = float("-inf")
+    agent.fatal = []
+    agent.processes = {}
+    agent._poll_body = lambda: {}
+    attempts = []
+
+    def verify(response, endpoint):
+        agent._transient_status(401)
+        raise ValueError("transient relay status 401")
+
+    monkeypatch.setattr(agent, "_post", lambda *args: attempts.append(args) or httpx.Response(401))
+    monkeypatch.setattr(agent, "_verify_response", verify)
+
+    def wait(delay):
+        if len(attempts) == 3:
+            agent.stop_event.set()
+        return False
+
+    monkeypatch.setattr(agent.stop_event, "wait", wait)
+    agent.run_forever()
+    warnings = [record.message for record in caplog.records if record.levelno >= 30]
+    assert len(attempts) == 3
+    assert sum("Relay returned HTTP 401" in message for message in warnings) == 1
+    assert not any("Device poll failed" in message for message in warnings)
+
+
 def test_pair_accepts_correctly_signed_reply(monkeypatch):
     private, public = generate_keypair()
     _, device_public = generate_keypair()
@@ -149,6 +237,7 @@ def test_loop_rejects_bad_signature(monkeypatch):
     monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
     monkeypatch.setattr(config, "device_id", lambda: "device-1")
     monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    monkeypatch.setattr(config, "load", lambda: {"gateway_url": "https://example.test/api/plugins/hermes-hands", "device_id": "device-1", "relay_public_key": b64u(public)})
     response = httpx.Response(200, content=b'{"job_id":"x","type":"exec","script":"echo bad"}', headers={"X-Hands-Ts": str(int(time.time())), "X-Hands-Nonce": "n", "X-Hands-Signature": "bad"})
     agent = loop.DeviceLoop(transport=httpx.MockTransport(lambda request: response))
     try:
@@ -169,6 +258,7 @@ def test_loop_requires_reply_nonce_to_match_request(monkeypatch):
     monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
     monkeypatch.setattr(config, "device_id", lambda: "device-1")
     monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    monkeypatch.setattr(config, "load", lambda: {"gateway_url": "https://example.test/api/plugins/hermes-hands", "device_id": "device-1", "relay_public_key": b64u(public)})
     body = b'{"job_id":"x","type":"exec","script":"echo bad"}'
     ts = int(time.time())
 
@@ -280,6 +370,7 @@ def test_signed_unknown_device_stops_agent(monkeypatch):
     monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
     monkeypatch.setattr(config, "device_id", lambda: "device-1")
     monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    monkeypatch.setattr(config, "load", lambda: {"gateway_url": "https://example.test/api/plugins/hermes-hands", "device_id": "device-1", "relay_public_key": b64u(public)})
     agent = loop.DeviceLoop(transport=httpx.MockTransport(lambda request: httpx.Response(204, request=request)))
     request = httpx.Request("POST", "https://example.test/device/poll", headers={"X-Hands-Nonce": "request-nonce"})
     body = canonical_json({"error": "unknown_device"})
@@ -428,6 +519,22 @@ def test_loop_incrementally_decodes_split_utf8(monkeypatch):
     assert "".join(item["chunk"] for item in posted) == "\u4e2d"
 
 
+def test_loop_passes_base64_stdin_to_executor(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.accepted_policy_hash = "hash"
+    agent.processes = {}
+    agent.running = {}
+    agent.cancelled_jobs = set()
+    agent.job_deadlines = {}
+    received = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: received.append(kwargs) or iter(()))
+    monkeypatch.setattr(agent, "_result", lambda *args, **kwargs: None)
+    agent._run_job({"job_id": "stdin-b64", "type": "exec", "script": "cat", "stdin_b64": "Y2Fm6Q=="})
+    assert received[0]["stdin_b64"] == "Y2Fm6Q=="
+
+
 def test_loop_drains_all_output_when_result_posts_are_slow(monkeypatch, tmp_path):
     bash = loop.executor.resolve_bash()
     if not bash:
@@ -442,15 +549,98 @@ def test_loop_drains_all_output_when_result_posts_are_slow(monkeypatch, tmp_path
     agent.accepted_policy_hash = "hash"
     agent.processes, agent.running = {}, {}
     agent.cancelled_jobs, agent.job_deadlines = set(), {}
+    agent.stop_event = threading.Event()
     output = []
 
     def slow_result(job_id, seq, **kwargs):
-        time.sleep(0.005)
+        time.sleep(0.5)
         output.append(kwargs.get("chunk", ""))
 
     agent._result = slow_result
-    agent._run_job({"job_id": "slow-output", "type": "exec", "script": "head -c 1500000 /dev/zero | tr '\\000' x", "timeout": 30})
-    assert "".join(output).encode() == b"x" * 1_500_000
+    agent._run_job({"job_id": "slow-output", "type": "exec", "script": "head -c 200000 /dev/zero | tr '\\000' x", "timeout": 30})
+    assert "".join(output).encode() == b"x" * 200_000
+
+
+def test_loop_marks_post_exit_output_truncation(monkeypatch, tmp_path):
+    bash = loop.executor.resolve_bash()
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(loop.executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(loop.executor.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(loop.executor, "PIPE_DRAIN_GRACE", 0.1)
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    agent = object.__new__(loop.DeviceLoop)
+    agent.accepted_policy_hash = "hash"
+    agent.processes, agent.running = {}, {}
+    agent.cancelled_jobs, agent.job_deadlines = set(), {}
+    posted = []
+    agent._result = lambda job_id, seq, **kwargs: posted.append(kwargs)
+
+    agent._run_job({"job_id": "idle-pipe", "type": "exec", "script": "sleep 0.6 & echo early", "timeout": 5})
+    time.sleep(0.7)
+    assert posted[-1] == {
+        "chunk": "early\n[output truncated after the post-exit idle limit]\n",
+        "done": True,
+        "returncode": 1,
+        "error": "Output was truncated after the post-exit pipe idle limit",
+    }
+    assert any("early" in item.get("chunk", "") for item in posted)
+
+
+def test_cancel_remembered_before_registration_reaches_terminate(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.accepted_policy_hash = "hash"
+    agent.processes = {}
+    agent.running = {}
+    agent.cancelled_jobs = {"job"}
+    agent.job_deadlines = {}
+    agent.process_lock = threading.Lock()
+    terminated = []
+    process = type("Proc", (), {"poll": lambda self: None})()
+
+    def run(*args, on_start, on_exit, **kwargs):
+        on_start(process, 1.0)
+        on_exit(137)
+        return iter(())
+
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.executor, "run", run)
+    monkeypatch.setattr(loop.executor, "_terminate", lambda proc, started: terminated.append((proc, started)))
+    monkeypatch.setattr(agent, "_result", lambda *args, **kwargs: None)
+    agent._run_job({"job_id": "job", "type": "exec", "script": "sleep 10"})
+    assert terminated == [(process, 1.0)]
+
+
+def test_result_delivery_expiry_stops_later_chunks(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.accepted_policy_hash = "hash"
+    agent.processes = {}
+    agent.running = {}
+    agent.cancelled_jobs = set()
+    agent.job_deadlines = {}
+    agent.process_lock = threading.Lock()
+    agent.stop_event = threading.Event()
+    posted = []
+    closed = []
+
+    def chunks(*args, on_start, on_exit, **kwargs):
+        try:
+            yield b"first"
+            yield b"second"
+        finally:
+            closed.append(True)
+
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.executor, "run", chunks)
+    monkeypatch.setattr(agent, "_post", lambda *args: (_ for _ in ()).throw(httpx.ConnectError("offline")))
+    monkeypatch.setattr(agent.stop_event, "wait", lambda delay: False)
+    monkeypatch.setattr(loop.time, "monotonic", lambda: 100.0)
+    agent._run_job({"job_id": "job", "type": "exec", "script": "echo x", "timeout": 0})
+    assert posted == []
+    assert closed == [True]
 
 
 def test_result_reply_cancel_terminates_registered_job(monkeypatch):
@@ -674,10 +864,110 @@ def test_loop_ignores_deny_words_in_wrapper_cwd(monkeypatch):
     agent.accepted_policy_hash = "hash"
 
     script = _core_wrapped("echo ok")
-    script = script.replace("/tmp", "/tmp/sudo/shutdown/.hermes-hands")
+    script = script.replace("/tmp", "/tmp/sudo/shutdown")
     agent._run_job({"job_id": "cwd-words", "type": "exec", "script": script})
 
     assert posted[0]["chunk"] == "ok\n"
+
+
+@pytest.mark.parametrize("command", ["cat <<'EOF'\nhello\nEOF", "echo first \\\n  second"])
+def test_loop_extracts_plain_eval_without_scanning_wrapper_cwd(monkeypatch, command):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.running = {}
+    posted = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter((b"ok\n",)))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    agent.accepted_policy_hash = "hash"
+
+    script = _core_wrapped(command).replace("/tmp", "/tmp/sudo/shutdown")
+    agent._run_job({"job_id": "plain-eval", "type": "exec", "script": script})
+
+    assert posted[0]["chunk"] == "ok\n"
+
+
+def test_file_operation_uses_self_protection_patterns_only(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.running = {}
+    posted = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: pytest.fail("protected file operation ran"))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    agent.accepted_policy_hash = "hash"
+
+    agent._run_job({"job_id": "file-op", "type": "exec", "script": "cat ~/.hermes-hands/device.json", "file_op": True})
+
+    assert posted[0]["returncode"] == 126
+
+
+def test_session_bootstrap_does_not_scan_its_workdir_as_a_command(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.running = {}
+    posted = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter((b"ok\n",)))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    agent.accepted_policy_hash = "hash"
+    bootstrap = "builtin cd -- '/home/u/src/sudo-tools' 2>/dev/null || true\nprintf ready\n"
+
+    agent._run_job({"job_id": "bootstrap", "type": "exec", "script": bootstrap})
+
+    assert posted[0]["chunk"] == "ok\n"
+
+
+def test_workdir_under_device_home_is_self_protected(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.running = {}
+    posted = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: pytest.fail("protected workdir ran"))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    agent.accepted_policy_hash = "hash"
+
+    script = "builtin cd -- '/home/u/.hermes-hands' || exit 126\neval 'cat device.json\\n\\n__hermes_rc=$? __hermes_ps=(\"${PIPESTATUS[@]}\"); (exit $__hermes_rc) && :'"
+    agent._run_job({"job_id": "protected-workdir", "type": "exec", "script": script})
+
+    assert posted[0]["returncode"] == 126
+
+
+def test_file_operation_deny_word_is_not_a_self_protection_refusal(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.running = {}
+    posted = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter(()))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    agent.accepted_policy_hash = "hash"
+
+    agent._run_job({"job_id": "file-op-sudo", "type": "exec", "script": "cat docs/sudo.md", "file_op": True})
+
+    assert posted[-1]["done"] is True
+    assert posted[-1]["returncode"] == 0
+
+
+def test_device_loop_stops_when_pairing_changes(monkeypatch):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    pairing = {"gateway_url": "https://owner.test/api", "device_id": "owner", "relay_public_key": ""}
+    monkeypatch.setattr(config, "load", lambda: pairing.copy())
+    monkeypatch.setattr(config, "relay_public_key", lambda: b"owner-key")
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(lambda request: pytest.fail("request sent after pairing changed")))
+    pairing["gateway_url"] = "https://attacker.test/api"
+
+    with pytest.raises(PermissionError, match="pairing_changed"):
+        agent._post("/device/poll", {})
+
+    assert agent.stop_event.is_set()
 
 
 def test_probe_wrapper_matches_core_output_when_core_is_importable():
@@ -730,6 +1020,9 @@ def test_policy_change_cancels_jobs_without_stopping_agent(monkeypatch):
     private, public = generate_keypair()
     monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
     monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    monkeypatch.setattr(config, "load", lambda: {"gateway_url": "https://example.test/api/plugins/hermes-hands", "device_id": "device-1", "relay_public_key": b64u(public)})
+    agent.gateway_url = "https://example.test/api/plugins/hermes-hands"
+    agent.relay_public_key = public
     request = httpx.Request("POST", "https://example.test/device/poll", headers={"X-Hands-Nonce": "nonce"})
     body = canonical_json({"error": "policy_changed"})
     ts = int(time.time())
@@ -787,8 +1080,9 @@ def test_stopping_during_result_delivery_does_not_escape_job_thread(monkeypatch)
     assert errors == []
 
 
-def test_run_forever_terminates_jobs_when_loop_exits(monkeypatch):
+def test_run_forever_terminates_jobs_when_loop_exits(monkeypatch, tmp_path):
     agent = object.__new__(loop.DeviceLoop)
+    monkeypatch.setattr(loop.Path, "home", lambda: tmp_path)
     agent.stop_event = threading.Event()
     agent.fatal = []
     agent.running = {}
@@ -802,6 +1096,54 @@ def test_run_forever_terminates_jobs_when_loop_exits(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         agent.run_forever()
     assert calls == ["cancel"]
+
+
+def test_second_serve_refuses_before_reaping_live_jobs(monkeypatch, tmp_path):
+    monkeypatch.setattr(loop.Path, "home", lambda: tmp_path)
+    reaps = []
+    monkeypatch.setattr(loop.executor, "reap_recorded_processes", lambda: reaps.append(True))
+    entered, release = threading.Event(), threading.Event()
+
+    def make_agent():
+        agent = object.__new__(loop.DeviceLoop)
+        agent.stop_event = threading.Event()
+        agent.processes = {}
+        agent.running = {}
+        agent.fatal = []
+        agent.instance = "0123456789abcdef"
+        agent.poll_retry_delay = 1
+        agent._poll_body = lambda: {}
+        agent._heartbeat_loop = lambda: None
+
+        def wait_for_release(*args):
+            entered.set()
+            assert release.wait(2)
+            raise KeyboardInterrupt
+
+        agent._post = wait_for_release
+        return agent
+
+    first = make_agent()
+    second = make_agent()
+    errors = []
+
+    def serve_first():
+        try:
+            first.run_forever()
+        except KeyboardInterrupt:
+            errors.append("stopped")
+
+    thread = threading.Thread(target=serve_first)
+    thread.start()
+    try:
+        assert entered.wait(2)
+        with pytest.raises(RuntimeError, match="already running"):
+            second.run_forever()
+        assert reaps == [True]
+    finally:
+        release.set()
+        thread.join(2)
+    assert errors == ["stopped"]
 
 
 

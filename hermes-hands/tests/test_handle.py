@@ -23,9 +23,10 @@ class FakeRelay:
         self.release = threading.Event()
         self.release.set()
 
-    def start_job(self, device, *, script, login, timeout, stdin=None):
+    def start_job(self, device, *, script, login, timeout, stdin=None, file_op=False):
         self.started.append((device, script, login, timeout))
         self.stdin = stdin
+        self.file_op = file_op
         if self.start_error is not None:
             raise self.start_error
         return "job1"
@@ -130,6 +131,14 @@ def test_stdin_goes_to_the_relay_beside_the_script(fake):
     assert wait_exit(proc) == 0
     assert relay.started == [("laptop", "cat > f", False, 5 + DEVICE_TIMEOUT_GRACE)]
     assert relay.stdin == "sudo text\n"
+    assert relay.file_op is False
+
+
+def test_file_op_marker_goes_to_the_relay(fake):
+    relay = fake([{"chunks": [], "next": 0, "done": True, "returncode": 0}])
+    proc = RemoteProcessHandle("laptop", "cat > f", login=False, timeout=5, file_op=True)
+    assert wait_exit(proc) == 0
+    assert relay.file_op is True
 
 
 def test_relay_lost_mid_command_keeps_partial_output_and_never_says_nothing_ran(fake):

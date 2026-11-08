@@ -1,6 +1,8 @@
 import json
 import types
 
+import pytest
+
 from hermeshands_device import cli, config
 from hermeshands_device.protocol import b64u
 
@@ -127,3 +129,26 @@ def test_doctor_reports_python_probe_timeout(monkeypatch, capsys):
     monkeypatch.setattr(cli.subprocess, "run", run)
     assert cli._doctor() == 1
     assert "timed out while starting" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("timed_out_command", ("python3", "python"))
+def test_doctor_reports_command_probe_timeout_and_continues(monkeypatch, capsys, timed_out_command):
+    monkeypatch.setattr(cli.executor, "resolve_bash", lambda: "bash.exe")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "git.exe")
+    monkeypatch.setattr(cli.config, "gateway_url", lambda: "")
+    calls = []
+
+    def run(args, **kwargs):
+        command = args[-1]
+        calls.append(command)
+        if command == f"command -v {timed_out_command}":
+            raise cli.subprocess.TimeoutExpired(args, kwargs["timeout"])
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli._doctor() == 1
+    output = capsys.readouterr().out
+    assert f"python in bash: command -v {timed_out_command} timed out" in output
+    assert f"command -v {('python' if timed_out_command == 'python3' else 'python3')}" in calls
+    assert "git: git.exe" in output
+    assert "gateway: not paired" in output

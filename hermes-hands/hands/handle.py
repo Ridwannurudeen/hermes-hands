@@ -42,6 +42,7 @@ class RemoteProcessHandle:
         timeout: int,
         inline_limit: int | None = None,
         stdin: str | None = None,
+        file_op: bool = False,
     ):
         read_fd, write_fd = os.pipe()
         self._stdout = os.fdopen(read_fd, "r", encoding="utf-8-sig", errors="replace")
@@ -62,7 +63,7 @@ class RemoteProcessHandle:
         worker = contextvars.copy_context()
         threading.Thread(
             target=worker.run,
-            args=(self._run, device, script, login, timeout, stdin),
+            args=(self._run, device, script, login, timeout, stdin, file_op),
             name=f"hermes-hands-{device}",
             daemon=True,
         ).start()
@@ -141,7 +142,7 @@ class RemoteProcessHandle:
             self._write(f"\n{messages.output_omitted(self._omitted, job_id)}\n")
         self._write_bytes(bytes(self._tail))
 
-    def _run(self, device: str, script: str, login: bool, timeout: int, stdin: str | None) -> None:
+    def _run(self, device: str, script: str, login: bool, timeout: int, stdin: str | None, file_op: bool) -> None:
         returncode, job_id, notice = UNREACHABLE, None, None
         try:
             job_id = client.start_job(
@@ -150,6 +151,7 @@ class RemoteProcessHandle:
                 login=login,
                 timeout=timeout + DEVICE_TIMEOUT_GRACE,
                 stdin=stdin,
+                file_op=file_op,
             )
             with self._lock:
                 self._job_id = job_id

@@ -81,7 +81,9 @@ def test_screenshot_returns_media_line(monkeypatch, tmp_path):
         symlink.symlink_to(old_png)
     except OSError:
         symlink = None
-    monkeypatch.setattr("hands.targets.store.get_session_target", lambda key: "laptop")
+    monkeypatch.setattr(
+        "hands.targets.store.get_session_target", lambda key: ("laptop", "session:session")
+    )
     monkeypatch.setattr(store, "get_device", lambda name: {"name": name})
     ctx = load_tools(monkeypatch, session_key="session")
     result = json.loads(ctx.handlers["hands_screenshot"]({}))
@@ -129,7 +131,7 @@ def test_screenshot_errors_are_json(monkeypatch):
     constants = types.ModuleType("hermes_constants")
     constants.get_hermes_home = lambda: __import__("pathlib").Path(".")
     monkeypatch.setitem(sys.modules, "hermes_constants", constants)
-    monkeypatch.setattr(store, "get_session_target", lambda key: "laptop")
+    monkeypatch.setattr(store, "get_session_target", lambda key: ("laptop", "session:session"))
     monkeypatch.setattr(store, "get_device", lambda name: {"name": name})
     ctx = load_tools(monkeypatch, screenshot=lambda device: (_ for _ in ()).throw(RuntimeError("offline")), session_key="session")
     assert json.loads(ctx.handlers["hands_screenshot"]({})) == {"error": "offline"}

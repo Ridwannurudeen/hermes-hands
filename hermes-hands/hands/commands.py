@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shlex
 
-from . import client, messages, store
+from . import client, messages, store, targets
 
 
 def _ids(value: object) -> set[str]:
@@ -20,9 +20,24 @@ def _ids(value: object) -> set[str]:
     return {str(item).strip() for item in items if str(item).strip()}
 
 
+def _platform(platform: str, source) -> str:
+    value = getattr(source, "platform", None) or platform
+    return str(getattr(value, "value", value) or "").lower()
+
+
 def _in_shared_chat(source) -> bool:
-    """A group, channel or thread: core gives its participants one session (session.py:690-725)."""
-    return str(getattr(source, "chat_type", "dm") or "dm").strip().lower() not in {"", "dm", "direct", "private"}
+    """A group, channel or thread: core gives its participants one session (session.py:690-725).
+    Slack reports a group DM (MPIM) as chat_type dm too (slack/adapter.py:4597, 4698); only a 1:1
+    IM has a channel id that starts with D (slack/adapter.py:5463)."""
+    chat_type = str(getattr(source, "chat_type", "dm") or "dm").strip().lower()
+    if chat_type not in {"", "dm", "direct", "private"}:
+        return True
+    return _platform("", source) == "slack" and not str(getattr(source, "chat_id", "") or "").startswith("D")
+
+
+def _caller(platform: str, source) -> str:
+    """This command's sender, named as ``targets.current_caller`` names the sender of a tool call."""
+    return targets.caller_id(_platform(platform, source), str(getattr(source, "user_id", "") or ""))
 
 
 def terminal_backend() -> str:
@@ -80,8 +95,12 @@ def register_commands(ctx, *, has_seed: bool) -> None:
                 else:
                     if not store.relay_alive():  # the relay started, so it wrote its heartbeat
                         relay, cause = "down", [messages.STORE_SPLIT]
-            target = store.get_session_target(session_key) if session_key else None
-            status = f"Hands: relay {relay}; target {target or ctx.get_config('default_target', default='server')}; {len(devices)} device(s)."
+            target = targets.target_for(
+                session_key=session_key,
+                caller=_caller(platform, source),
+                default_target=str(ctx.get_config("default_target", default=targets.SERVER)),
+            )
+            status = f"Hands: relay {relay}; target {target}; {len(devices)} device(s)."
             alerts = messages.alerts(devices)
             return "\n".join([status, *cause, *alerts])
         if action == "devices" and len(args) == 1:
@@ -108,6 +127,8 @@ def register_commands(ctx, *, has_seed: bool) -> None:
         if action == "pair":
             if _in_shared_chat(source):
                 return messages.PAIR_DIRECT_ONLY
+            if name == store.RESERVED_NAME:
+                return messages.PAIR_NAME_RESERVED
             if not has_seed:
                 return messages.NOT_SET_UP
             code = store.mint_pairing_code(name)
@@ -115,8 +136,7 @@ def register_commands(ctx, *, has_seed: bool) -> None:
 
             dashboard = (load_config_readonly() or {}).get("dashboard") or {}
             gateway_url = (
-                ctx.get_config("public_url", default="")
-                or dashboard.get("public_url")
+                dashboard.get("public_url")
                 or ctx.get_config("dashboard_url", default="http://127.0.0.1:9119")
             )
             command = f"hermes-hands pair {gateway_url} --name {shlex.quote(name)} --code={shlex.quote(code)}"
@@ -136,7 +156,8 @@ def register_commands(ctx, *, has_seed: bool) -> None:
                 return f"No paired device named {name}."
             if not session_key:
                 return "Hands: no session key is available."
-            store.set_session_target(session_key, name)
+            store.set_session_target(session_key, name, owner=_caller(platform, source))
+            targets.notify_target_changed(session_key)
             return f"Target set to {name}; it applies from the next command."
         if action == "revoke":
             answer = ctx.ask_choice(f"Revoke {name}?", [{"value": "yes", "label": "Yes"}, {"value": "no", "label": "No"}])

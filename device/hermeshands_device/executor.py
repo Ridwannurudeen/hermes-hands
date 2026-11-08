@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import queue
 import re
 import shutil
@@ -19,8 +20,11 @@ import psutil
 MAX_OUTPUT = 64 * 1024 * 1024
 CHUNK_SIZE = 16 * 1024
 PIPE_DRAIN_GRACE = 0.2
+POST_EXIT_DRAIN_LIMIT = 2
 OUTPUT_QUEUE_SIZE = 8
+TASKKILL_TIMEOUT = 10
 _PROBED: dict[str, tuple[int, int, int]] = {}  # file identity for candidates whose probe passed
+_WINDOWS_JOBS: dict[int, int] = {}
 
 
 def _is_stub(path: str) -> bool:
@@ -70,25 +74,133 @@ def resolve_bash() -> str | None:
 
 def _terminate(proc: subprocess.Popen, start_time: float) -> None:
     if os.name == "nt":
+        job = _WINDOWS_JOBS.get(proc.pid)
+        opened_job = job is None
+        if job is None:
+            job = _open_windows_job(proc.pid, start_time)
+        if job is not None:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            terminated = bool(kernel32.TerminateJobObject(wintypes.HANDLE(job), 1))
+            if opened_job:
+                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+                kernel32.CloseHandle(wintypes.HANDLE(job))
+            if terminated:
+                return
         try:
-            current = psutil.Process(proc.pid).create_time()
+            process = psutil.Process(proc.pid)
+            current = process.create_time()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return
         if abs(current - start_time) > 0.01:
             return
+        try:
+            descendants = [(child.pid, child.create_time()) for child in process.children(recursive=True)]
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            descendants = []
         taskkill = shutil.which("taskkill")
         if taskkill:
-            subprocess.run([taskkill, "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
-        else:
-            proc.kill()
+            try:
+                subprocess.run([taskkill, "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=TASKKILL_TIMEOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
+            except (OSError, subprocess.SubprocessError) as exc:
+                logging.getLogger(__name__).warning("taskkill failed for job %s: %s", proc.pid, exc)
+        for child_pid, child_start in descendants:
+            try:
+                child = psutil.Process(child_pid)
+                if abs(child.create_time() - child_start) <= 0.01:
+                    child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+                logging.getLogger(__name__).warning("Could not kill job child %s: %s", child_pid, exc)
     else:
         try:
             os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok -- POSIX-only branch
         except ProcessLookupError:
-            pass
+            return
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Could not kill process group %s: %s", proc.pid, exc)
+            return
+        return
+    try:
+        proc.kill()
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Could not kill job process %s: %s", proc.pid, exc)
+
+
+def _windows_job_name(pid: int, start_time: float) -> str:
+    return f"Local\\hermes-hands-{pid}-{int(start_time * 1000)}"
+
+
+def _open_windows_job(pid: int, start_time: float) -> int | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+    kernel32.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    job = kernel32.OpenJobObjectW(0x0001, False, _windows_job_name(pid, start_time))
+    return int(job if isinstance(job, int) else job.value) if job else None
+
+
+def _create_windows_job(proc: subprocess.Popen, start_time: float) -> int | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    job = kernel32.CreateJobObjectW(None, _windows_job_name(proc.pid, start_time))
+    if not job:
+        logging.getLogger(__name__).warning("Could not create Windows job object: %s", ctypes.get_last_error())
+        return None
+
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    process_handle = wintypes.HANDLE(int(proc._handle))
+    if not kernel32.AssignProcessToJobObject(job, process_handle):
+        logging.getLogger(__name__).warning("Could not assign job process to Windows job object: %s", ctypes.get_last_error())
+        kernel32.CloseHandle(job)
+        return None
+    job_value = int(job if isinstance(job, int) else job.value)
+    ctypes.windll.kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _WINDOWS_JOBS[proc.pid] = job_value
+    return job_value
+
+
+def _close_windows_job(proc: subprocess.Popen, job: int | None) -> None:
+    if job is not None:
+        import ctypes
+        from ctypes import wintypes
+
+        _WINDOWS_JOBS.pop(proc.pid, None)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle(wintypes.HANDLE(job))
 
 
 def terminate_recorded(pid: int, start_time: float) -> None:
+    if os.name == "nt":
+        job = _WINDOWS_JOBS.get(pid) or _open_windows_job(pid, start_time)
+        if job is not None:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            terminated = bool(kernel32.TerminateJobObject(wintypes.HANDLE(job), 1))
+            if pid not in _WINDOWS_JOBS:
+                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+                kernel32.CloseHandle(wintypes.HANDLE(job))
+            if terminated:
+                return
     try:
         process = psutil.Process(pid)
         current = process.create_time()
@@ -97,14 +209,31 @@ def terminate_recorded(pid: int, start_time: float) -> None:
     if abs(current - start_time) > 0.01:
         return
     if os.name == "nt":
+        try:
+            descendants = [(child.pid, child.create_time()) for child in process.children(recursive=True)]
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            descendants = []
         taskkill = shutil.which("taskkill")
         if taskkill:
-            subprocess.run([taskkill, "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
-        else:
-            process.kill()
+            try:
+                subprocess.run([taskkill, "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=TASKKILL_TIMEOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
+            except (OSError, subprocess.SubprocessError) as exc:
+                logging.getLogger(__name__).warning("taskkill failed for recorded job %s: %s", pid, exc)
+        for child_pid, child_start in descendants:
+            try:
+                child = psutil.Process(child_pid)
+                if abs(child.create_time() - child_start) <= 0.01:
+                    child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+                logging.getLogger(__name__).warning("Could not reap job child %s: %s", child_pid, exc)
+        try:
+            if abs(process.create_time() - start_time) <= 0.01:
+                process.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+            logging.getLogger(__name__).warning("Could not reap process %s: %s", pid, exc)
     else:
         try:
-            process.kill()
+            os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
 
@@ -152,9 +281,11 @@ def reap_recorded_processes() -> None:
         path.unlink(missing_ok=True)
 
 
-def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "job", stdin: str | None = None, on_start=None, on_exit=None, on_capped=None) -> Iterator[bytes]:
+def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "job", stdin: str | None = None, stdin_b64: str | None = None, on_start=None, on_exit=None, on_capped=None, on_truncated=None) -> Iterator[bytes]:
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job_id):
         raise ValueError("invalid job id")
+    if stdin is not None and stdin_b64 is not None:
+        raise ValueError("stdin and stdin_b64 cannot both be provided")
     bash = resolve_bash()
     if not bash:
         raise RuntimeError("Git Bash was not found or failed its probe")
@@ -164,12 +295,24 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
     stdin_path = None
     stdin_handle = subprocess.DEVNULL
     proc = None
+    windows_job = None
     record_written = False
     try:
-        if stdin is not None:
+        if stdin_b64 is not None:
+            import base64
+
+            try:
+                stdin_bytes = base64.b64decode(stdin_b64, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("stdin_b64 must be valid base64") from exc
+        elif stdin is not None:
+            stdin_bytes = stdin.encode("utf-8", errors="surrogateescape")
+        else:
+            stdin_bytes = None
+        if stdin_bytes is not None:
             with tempfile.NamedTemporaryFile("wb", prefix=f"{job_id}.", suffix=".stdin", dir=script_dir, delete=False) as stdin_file:
-                stdin_file.write(stdin.encode("utf-8", errors="surrogateescape"))
                 stdin_path = Path(stdin_file.name)
+                stdin_file.write(stdin_bytes)
             stdin_handle = stdin_path.open("rb")
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", suffix=".sh", dir=script_dir, delete=False) as script_file:
             script_file.write(script)
@@ -182,15 +325,16 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
             env.setdefault("PYTHONUTF8", "1")
             env.setdefault("PYTHONIOENCODING", "utf-8")
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=stdin_handle, env=env, **kwargs)
-        if stdin is not None:
+        if stdin_bytes is not None:
             stdin_handle.close()
         created = psutil.Process(proc.pid).create_time()
+        windows_job = _create_windows_job(proc, created)
         if on_start:
             record_process(job_id, proc.pid, created)
             record_written = True
             on_start(proc, created)
     except BaseException:
-        if stdin is not None:
+        if stdin_handle != subprocess.DEVNULL:
             stdin_handle.close()
         if proc is not None and proc.poll() is None:
             _terminate(proc, psutil.Process(proc.pid).create_time())
@@ -199,8 +343,11 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
             script_path.unlink(missing_ok=True)
         if stdin_path is not None:
             stdin_path.unlink(missing_ok=True)
+        _close_windows_job(proc, windows_job)
         if record_written:
             record_path(job_id).unlink(missing_ok=True)
+        if proc is not None:
+            _close_windows_job(proc, windows_job)
         raise
     chunks: queue.Queue[bytes | None] = queue.Queue(maxsize=OUTPUT_QUEUE_SIZE)
     deadline = time.monotonic() + timeout
@@ -208,18 +355,19 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
     capped = threading.Event()
     exited = threading.Event()
     timed_out = threading.Event()
-    drain_deadline = [None]
+    reader_stop = threading.Event()
     termination_started = threading.Event()
+    truncated = threading.Event()
 
     def terminate_once() -> None:
         if not termination_started.is_set():
-            termination_started.set()
             _terminate(proc, created)
+            termination_started.set()
 
     def kill_at_deadline() -> None:
         timed_out.set()
-        drain_deadline[0] = time.monotonic() + 2
-        terminate_once()
+        if proc.poll() is None or proc.pid in _WINDOWS_JOBS:
+            terminate_once()
 
     timer = threading.Timer(max(0, deadline - time.monotonic()), kill_at_deadline)
     timer.daemon = True
@@ -227,10 +375,37 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
 
     def read_output() -> None:
         nonlocal total
+        idle_deadline = None
+        post_exit_started = None
+        backpressure = 0.0
+
+        def post_exit_limit_reached() -> bool:
+            nonlocal post_exit_started
+            if proc.poll() is None:
+                return False
+            if post_exit_started is None:
+                post_exit_started = time.monotonic()
+            return time.monotonic() - post_exit_started - backpressure >= POST_EXIT_DRAIN_LIMIT
+
+        def truncate_post_exit() -> None:
+            truncated.set()
+            if on_truncated:
+                on_truncated()
+            send_end()
+
+        def send_end() -> None:
+            while not reader_stop.is_set():
+                try:
+                    chunks.put(None, timeout=0.05)
+                    return
+                except queue.Full:
+                    if exited.is_set():
+                        return
+
         while True:
-            if timed_out.is_set():
+            if reader_stop.is_set():
                 return
-            if drain_deadline[0] is not None and time.monotonic() >= drain_deadline[0]:
+            if timed_out.is_set():
                 return
             if os.name == "nt":
                 import ctypes
@@ -243,6 +418,15 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                 if not ready:
                     chunk = os.read(proc.stdout.fileno(), CHUNK_SIZE)
                 elif available_bytes.value == 0:
+                    if proc.poll() is not None:
+                        if post_exit_limit_reached():
+                            truncate_post_exit()
+                            return
+                        if idle_deadline is None:
+                            idle_deadline = time.monotonic() + PIPE_DRAIN_GRACE
+                        elif time.monotonic() >= idle_deadline:
+                            truncate_post_exit()
+                            return
                     time.sleep(0.05)
                     continue
                 else:
@@ -251,31 +435,44 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                 ready, _, _ = select.select([proc.stdout], [], [], 0.05)
                 chunk = os.read(proc.stdout.fileno(), CHUNK_SIZE) if ready else None
                 if chunk is None:
+                    if proc.poll() is not None:
+                        if post_exit_limit_reached():
+                            truncate_post_exit()
+                            return
+                        if idle_deadline is None:
+                            idle_deadline = time.monotonic() + PIPE_DRAIN_GRACE
+                        elif time.monotonic() >= idle_deadline:
+                            truncate_post_exit()
+                            return
                     continue
             if not chunk:
-                while True:
-                    try:
-                        chunks.put(None, timeout=0.05)
-                        return
-                    except queue.Full:
-                        if exited.is_set():
-                            return
+                send_end()
+                return
+            idle_deadline = None
             available = MAX_OUTPUT - total
             if len(chunk) > available:
                 chunk = chunk[:available]
                 capped.set()
             total += len(chunk)
+            blocked_at = time.monotonic()
             while True:
-                if drain_deadline[0] is not None and time.monotonic() >= drain_deadline[0]:
+                if reader_stop.is_set():
                     return
                 try:
                     chunks.put(chunk, timeout=0.05)
+                    backpressure += time.monotonic() - blocked_at
+                    if idle_deadline is not None:
+                        idle_deadline += time.monotonic() - blocked_at
                     break
                 except queue.Full:
                     if exited.is_set():
                         return
             if capped.is_set():
-                _terminate(proc, created)
+                terminate_once()
+                send_end()
+                return
+            if post_exit_limit_reached():
+                truncate_post_exit()
                 return
 
     reader = threading.Thread(target=read_output, daemon=True)
@@ -286,18 +483,14 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
         with output_path.open("wb") as log:
             while True:
                 now = time.monotonic()
-                if timed_out.is_set() or now >= deadline:
+                if timed_out.is_set() or (proc.poll() is None and now >= deadline):
                     terminate_once()
                     if on_exit:
                         on_exit(124)
                     yield b"[device timeout]\n"
                     return
-                if proc.poll() is not None and drain_deadline[0] is None:
-                    drain_deadline[0] = min(deadline, now + 2)
-                if drain_deadline[0] is not None and now >= drain_deadline[0]:
-                    break
                 try:
-                    chunk = chunks.get(timeout=min(PIPE_DRAIN_GRACE if proc.poll() is not None else 0.1, max(0.01, (drain_deadline[0] - now) if drain_deadline[0] else 0.1)))
+                    chunk = chunks.get(timeout=0.1)
                 except queue.Empty:
                     continue
                 if chunk is None:
@@ -313,8 +506,13 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                 if on_capped:
                     on_capped()
                 if on_exit:
-                    on_exit(proc.returncode)
+                    on_exit(1)
                 yield b"[output truncated at 64 MiB]\n"
+                return
+            if truncated.is_set():
+                if on_exit:
+                    on_exit(1)
+                yield b"[output truncated after the post-exit idle limit]\n"
                 return
         proc.wait(timeout=max(0.1, deadline - time.monotonic()))
         if timed_out.is_set():
@@ -325,7 +523,9 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
             on_exit(proc.returncode)
     finally:
         exited.set()
+        reader_stop.set()
         timer.cancel()
+        timer.join(timeout=TASKKILL_TIMEOUT + 1)
         if proc.poll() is None:
             terminate_once()
             try:
@@ -334,8 +534,12 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                 proc.kill()
                 proc.wait()
         reader.join(timeout=0.2)
+        if proc.stdout is not None:
+            proc.stdout.close()
         if script_path is not None:
             script_path.unlink(missing_ok=True)
         if stdin_path is not None:
             stdin_path.unlink(missing_ok=True)
         record_path(job_id).unlink(missing_ok=True)
+        if proc is not None:
+            _close_windows_job(proc, windows_job)

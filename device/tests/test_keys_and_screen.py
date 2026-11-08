@@ -43,6 +43,27 @@ def test_keyring_backend_error_falls_back_to_file(monkeypatch, tmp_path, caplog)
     assert "using protected device key file" in caplog.text
 
 
+def test_non_keyring_error_while_loading_key_falls_back_to_file(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "KEY_PATH", tmp_path / "device.json")
+
+    class KeyringError(Exception):
+        pass
+
+    class BrokenKeyring:
+        errors = types.SimpleNamespace(KeyringError=KeyringError)
+
+        @staticmethod
+        def get_password(service, username):
+            raise RuntimeError("keyring backend failed unexpectedly")
+
+    monkeypatch.setattr(keys, "_keyring", lambda: BrokenKeyring)
+    pair = keys.get_or_create()
+    assert keys.get_or_create() == pair
+    assert config.KEY_PATH.exists()
+    assert "using protected device key file" in caplog.text
+
+
 def test_existing_file_key_is_authoritative_when_keyring_appears(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ROOT", tmp_path)
     monkeypatch.setattr(config, "KEY_PATH", tmp_path / "device.json")
@@ -105,6 +126,31 @@ def test_keyring_set_error_falls_back_to_file(monkeypatch, tmp_path):
     pair = keys.get_or_create()
     assert config.KEY_PATH.exists()
     assert keys.get_or_create() == pair
+
+
+def test_non_keyring_error_while_saving_key_falls_back_to_file(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "KEY_PATH", tmp_path / "device.json")
+
+    class KeyringError(Exception):
+        pass
+
+    class BrokenKeyring:
+        errors = types.SimpleNamespace(KeyringError=KeyringError)
+
+        @staticmethod
+        def get_password(service, username):
+            return None
+
+        @staticmethod
+        def set_password(service, username, password):
+            raise RuntimeError("keyring backend failed unexpectedly")
+
+    monkeypatch.setattr(keys, "_keyring", lambda: BrokenKeyring)
+    pair = keys.get_or_create()
+    assert config.KEY_PATH.exists()
+    assert keys.get_or_create() == pair
+    assert "using protected device key file" in caplog.text
 
 
 def test_screen_requires_explicit_flag():

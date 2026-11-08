@@ -30,7 +30,16 @@ class HandsError(Exception):
 
 class RelayUnavailable(HandsError):
     """No usable answer from the relay (a transport error, a body that is not JSON, a 5xx), so an
-    idempotent call may be tried again."""
+    idempotent call may be tried again. ``may_have_acted`` is True when the request was sent but no
+    answer came back, so the relay may have done what it asked."""
+
+    def __init__(self, message: str, *, may_have_acted: bool = False):
+        super().__init__(message)
+        self.may_have_acted = may_have_acted
+
+
+# Only a connection failure proves that no request bytes left this process.
+_NOT_SENT = (httpx.ConnectError,)
 
 
 def configure(dashboard_url: str, local_bearer: str | None) -> None:
@@ -54,31 +63,70 @@ def _post(route: str, body: dict, *, timeout: float | None = None) -> dict:
     try:
         response = _http.post(route, json=body, **({"timeout": timeout} if timeout else {}))
     except httpx.HTTPError as exc:
-        raise RelayUnavailable(messages.RELAY_DOWN) from exc
+        raise RelayUnavailable(
+            messages.RELAY_DOWN, may_have_acted=not isinstance(exc, _NOT_SENT)
+        ) from exc
     try:
         data = response.json()
     except ValueError as exc:
-        raise RelayUnavailable(messages.relay_refused(response.status_code)) from exc
+        raise RelayUnavailable(
+            messages.relay_refused(response.status_code), may_have_acted=True
+        ) from exc
     if response.status_code != 200:
         # The relay's own refusals carry a hands: detail; anything else (the token seam's bare 401,
         # a 404 for routes that are not mounted) means the dashboard is not the relay we expect.
-        detail = str(data.get("detail") or "")
-        error = RelayUnavailable if response.status_code >= 500 else HandsError
-        raise error(
+        detail = str(data.get("detail") or "") if isinstance(data, dict) else ""
+        message = (
             detail if detail.startswith("hands:") else messages.relay_refused(response.status_code)
         )
+        if response.status_code >= 500:
+            raise RelayUnavailable(message, may_have_acted=True)
+        raise HandsError(message)
+    if not isinstance(data, dict):
+        raise RelayUnavailable(messages.relay_refused(response.status_code), may_have_acted=True)
     return data
 
 
+def _stdin_fields(stdin: str | None) -> dict:
+    """Text stdin stays a string; surrogateescaped bytes go as stdin_b64. Never both."""
+    if stdin is None:
+        return {}
+    try:
+        stdin.encode("utf-8")
+    except UnicodeEncodeError:
+        raw = stdin.encode("utf-8", errors="surrogateescape")
+        return {"stdin_b64": base64.b64encode(raw).decode("ascii")}
+    return {"stdin": stdin}
+
+
 def start_job(
-    device: str, *, script: str, login: bool, timeout: int, stdin: str | None = None
+    device: str,
+    *,
+    script: str,
+    login: bool,
+    timeout: int,
+    stdin: str | None = None,
+    file_op: bool = False,
 ) -> str:
-    """Queue ``script`` for ``device``, with ``stdin`` as its standard input when given; returns the
-    job id. Refused at once when the device is offline. Never retried: a lost reply may have queued it."""
-    body = {"device": device, "type": "exec", "script": script, "login": login, "timeout": timeout}
-    if stdin is not None:
-        body["stdin"] = stdin
-    return str(_post("/local/exec", body)["job_id"])
+    """Queue a script with optional stdin and the file-tool policy marker."""
+    body = {
+        "device": device,
+        "type": "exec",
+        "script": script,
+        "login": login,
+        "timeout": timeout,
+        **_stdin_fields(stdin),
+        "file_op": file_op,
+    }
+    try:
+        job_id = _post("/local/exec", body).get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            raise RelayUnavailable(messages.relay_refused(200), may_have_acted=True)
+        return job_id
+    except RelayUnavailable as exc:
+        if exc.may_have_acted:
+            raise HandsError(messages.queue_unknown(device)) from exc
+        raise
 
 
 def job_output(job_id: str, after: int) -> dict:

@@ -85,6 +85,14 @@ def run_terminal(env, command, *, workdir=None):
     return result
 
 
+@pytest.fixture(autouse=True)
+def fresh_session_cwds():
+    """Each test is its own process as far as the per-container cwd memory goes."""
+    environment._SESSION_CWDS.clear()
+    yield
+    environment._SESSION_CWDS.clear()
+
+
 @pytest.fixture
 def laptop(wired, tmp_path, monkeypatch):
     """A paired 'laptop' whose home is a temp dir, chosen by session s1; yields ``(hub, device, home)``."""
@@ -123,8 +131,10 @@ class FakeHandle:
 
     jobs: list[dict] = []
 
-    def __init__(self, device, script, *, login, timeout, inline_limit=None, stdin=None):
-        FakeHandle.jobs.append({"script": script, "stdin": stdin, "login": login})
+    def __init__(self, device, script, *, login, timeout, inline_limit=None, stdin=None, file_op=False):
+        FakeHandle.jobs.append(
+            {"script": script, "stdin": stdin, "file_op": file_op, "login": login}
+        )
         read_fd, write_fd = os.pipe()
         os.close(write_fd)
         self.stdout = os.fdopen(read_fd, "r", encoding="utf-8-sig")
@@ -319,7 +329,8 @@ def test_a_file_tool_after_a_switch_keeps_the_servers_cwd_off_the_device(laptop)
         terminal_tool.record_session_cwd("s1", "/opt/srvapp")  # where the server session cd'd
         store.set_session_target("s1", "laptop")  # /hands use laptop
         env.execute("cat notes.txt 2>/dev/null; true", cwd=env.cwd)  # read_file runs first
-        assert store.get_last_run("s1") == "server"
+        # It saw the switch and moved core's record to the laptop (terminal_tool.py:266-276).
+        assert store.get_last_run("s1") == "laptop"
         first = run_terminal(env, "pwd")
         assert first["returncode"] == 0 and first["cwd"] == device_path(str(home)), first
         assert store.get_last_run("s1") == "laptop"
@@ -354,7 +365,7 @@ def test_a_device_starts_in_its_home_whatever_the_gateway_cwd(laptop, tmp_path, 
         env.cwd = str(tmp_path)  # a Desktop or ACP workspace override (terminal_tool.py:358-362)
         assert env.cwd == device_path(str(home))
         store.set_session_target("s1", "server")
-        assert Path(env.cwd) == configured
+        assert Path(env.cwd) == tmp_path  # the workspace is where the server starts now
         env.cwd = str(tmp_path)
         assert env._subs["server"].cwd == str(tmp_path)
 
@@ -683,6 +694,8 @@ def test_a_windows_path_core_joined_onto_the_base_becomes_the_drive_path(wired):
         assert device_env("/c/Users/dev")._file_path(joined) == joined  # only Windows devices
     assert windows._file_path("/c/Users/dev/a:b.txt") == "/c/Users/dev/a:b.txt"
     assert windows._file_path("file:///C:/Users") == "file:///C:/Users"  # not joined onto a base
+    # joined onto a gateway terminal.cwd (file_tools_paths.py:106-112, 144)
+    assert windows._file_path("/srv/gw proj/C:\\Users\\me\\n.txt") == "/c/Users/me/n.txt"
 
 
 def test_search_patterns_reach_the_device_as_given(wired, monkeypatch):
@@ -854,8 +867,10 @@ def test_file_tools_absolute_and_relative_paths_land_on_the_device(file_tools_on
 
 
 def test_file_tool_caches_follow_the_target(file_tools_on_laptop, monkeypatch):
-    """Core resolves rg once per ShellFileOperations (file_operations_search.py:523-551); a search
-    on the device must not run the path the server resolved."""
+    """Core resolves rg once per ShellFileOperations (file_operations_search.py:523-551); after a
+    switch core's public clear_file_ops_cache drops that object (file_tools.py:377-399), so the next
+    file tool on the device never runs the path the server resolved. The call that sees the switch
+    still holds the old object: environment.target_changed, from /hands use, runs before it."""
     from tools import file_operations_search
 
     file_tools, home = file_tools_on_laptop
@@ -865,15 +880,18 @@ def test_file_tool_caches_follow_the_target(file_tools_on_laptop, monkeypatch):
     ops.search(pattern="anything", path=".", target="content")
     assert ops._rg_resolution_cache.get("rg") == "/opt/hermes/pm/ripgrep/rg"
     store.set_session_target("s1", "laptop")
+    ops.search(pattern="anything", path=".", target="content")  # sees the switch, drops the object
+    fresh = file_tools._get_file_ops("t1")
+    assert fresh is not ops and not fresh._rg_resolution_cache
     seen = []
-    real = ops.env.execute
+    real = fresh.env.execute
 
     def spy(command, cwd="", **kwargs):
         seen.append(command)
         return real(command, cwd, **kwargs)
 
-    monkeypatch.setattr(ops.env, "execute", spy)
-    ops.search(pattern="anything", path=".", target="content")
+    monkeypatch.setattr(fresh.env, "execute", spy)
+    fresh.search(pattern="anything", path=".", target="content")
     assert seen and not any("/opt/hermes/pm/ripgrep/rg" in command for command in seen), seen
 
 
@@ -1094,3 +1112,164 @@ def test_a_device_that_cannot_answer_keeps_its_job_tracked_and_unkilled(laptop):
         assert gone.exited and gone.completion_reason == "lost"
     finally:
         end_jobs(sessions, device)
+
+
+def test_a_workdir_equal_to_another_targets_cwd_is_honoured(laptop, tmp_path):
+    """Core passes explicit workdir= as given (terminal_tool.py:1039-1040), even after a switch."""
+    from tools import terminal_tool
+
+    hub, device, home = laptop
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (home / "proj").mkdir()
+    with Agent(hub, device, bash_job):
+        store.set_session_target("s1", "server")
+        env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        terminal_tool._active_environments["s1"] = env
+        try:
+            server_cwd = run_terminal(
+                env, f"cd {shlex.quote(device_path(str(shared)))}"
+            )["cwd"]
+            store.set_session_target("s1", "laptop")
+            environment.target_changed("s1")
+            ran = run_terminal(env, "pwd", workdir=server_cwd)
+            assert ran["cwd"].endswith("/shared"), ran
+            assert run_terminal(env, "pwd")["cwd"] == device_path(str(home))
+        finally:
+            terminal_tool._active_environments.pop("s1", None)
+
+
+def test_the_server_starts_in_terminal_cwd_even_when_core_drops_it(laptop, tmp_path, monkeypatch):
+    """Core replaces a terminal.cwd under /home, /Users or a drive with "~" for a container backend
+    (terminal_tool.py:805-809); the server is this host, as on the local backend."""
+    configured = tmp_path / "configured proj"
+    configured.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(configured))
+    store.set_session_target("s1", "server")
+    env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+    assert Path(run_terminal(env, "pwd")["cwd"]) == configured
+
+
+@pytest.mark.parametrize("target", ["server", "laptop"])
+def test_a_first_workdir_without_a_session_key_never_moves_the_start(laptop, monkeypatch, target):
+    hub, device, home = laptop
+    ctx = Ctx()
+    ctx.config["default_target"] = target
+    monkeypatch.delenv("HERMES_SESSION_KEY")
+    start = Path(os.environ["MESSAGING_CWD"]) if target == "server" else home
+    (start / "other").mkdir()
+    with Agent(hub, device, bash_job):
+        env = HandsEnvironment(ctx, cwd="~", timeout=30)
+        env.execute("pwd", cwd=str(start / "other"), bounded_capture=True)  # workdir= first
+        after = env.execute("pwd", cwd="~", bounded_capture=True)
+    assert not last_line(after).rstrip("/").endswith("other"), after
+
+
+def test_a_server_workspace_override_owns_the_record_for_a_later_object(laptop):
+    """The cwd setter, which core's register_task_env_overrides calls (terminal_tool.py:350-362),
+    stores that the record is now the server's, so an object made after an idle reap knows it."""
+    from tools import terminal_tool
+
+    hub, device, home = laptop
+    workspace = Path(os.environ["MESSAGING_CWD"])
+    with Agent(hub, device, bash_job):
+        env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        run_terminal(env, "true")
+        assert store.get_last_run("s1") == "laptop"
+        store.set_session_target("s1", "server")
+        terminal_tool._active_environments["s1"] = env
+        try:
+            terminal_tool.register_task_env_overrides("s1", {"cwd": str(workspace)})
+        finally:
+            terminal_tool._active_environments.pop("s1", None)
+            terminal_tool.clear_task_env_overrides("s1")
+        assert store.get_last_run("s1") == "server"
+        run_terminal(env, "true")
+        terminal_tool.record_session_cwd("s1", "/opt/srvapp")  # a Linux gateway's server record
+        env.cleanup()
+        store.set_session_target("s1", "laptop")
+        fresh = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        first = run_terminal(fresh, "pwd")
+        assert first["returncode"] == 0 and first["cwd"] == device_path(str(home)), first
+
+
+def test_a_quoted_rg_path_with_a_space_still_marks_a_search(wired, monkeypatch):
+    """Core quotes an rg it found under a home with a space (file_operations_search.py:695-702)."""
+    monkeypatch.setattr(environment, "_gateway_home", lambda: "/home/gw")
+    command = (
+        "set -o pipefail; '/c/Users/r b/scoop/shims/rg' --line-number --no-heading "
+        "--with-filename '/home/gw/.cache' '/c/Users/r b' 2>/dev/null | head -n 50"
+    )
+    assert device_env("/c/Users/r b", windows=True)._file_command(command) == command
+
+
+def test_a_lost_jobs_pid_stops_counting(laptop):
+    from tools.process_registry import process_registry
+
+    env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+    device = FakeSub([4242])
+    env._subs = {"laptop": device}
+    sessions = []
+    try:
+        sessions.append(process_registry.spawn_via_env(env, "sleep 30", task_id="gone"))
+        device.answer = {"output": messages.unknown_device("laptop"), "returncode": 255}
+        sessions[0]._reader_thread.join(10)
+        assert process_registry.get(sessions[0].id).completion_reason == "lost"
+        assert env._background_pids == {}
+    finally:
+        end_jobs(sessions, device)
+
+
+def test_a_workdir_equal_to_terminal_cwd_is_honoured_on_a_device(laptop, tmp_path, monkeypatch):
+    """Core passes terminal.cwd only when the session has no record (terminal_tool.py:1041-1061)."""
+    hub, device, home = laptop
+    shared = tmp_path / "shared app"
+    shared.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(shared))
+    with Agent(hub, device, bash_job):
+        env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        run_terminal(env, "mkdir -p sub && cd sub")
+        ran = run_terminal(env, "pwd", workdir=str(shared))
+    assert ran["cwd"].endswith("/shared app"), ran
+
+
+def test_relative_paths_after_an_idle_reap_still_follow_the_terminal(file_tools_on_laptop):
+    """Core's idle reaper drops the object (terminal_tool_lifecycle.py:135-160); the terminal comes
+    back where core recorded it, and so must the anchor of relative file-tool paths."""
+    from tools.terminal_tool import terminal_tool
+    from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
+
+    file_tools, home = file_tools_on_laptop
+    base = device_path(str(home))
+    terminal_tool(f"mkdir -p '{base}/proj' && cd '{base}/proj'", task_id="t1")
+    _cleanup_inactive_envs(lifetime_seconds=-1)
+    written = json.loads(file_tools.write_file_tool("c.txt", "c\n", task_id="t1"))
+    assert (home / "proj" / "c.txt").exists(), written
+    assert "1|c" in json.loads(file_tools.read_file_tool("c.txt", task_id="t1"))["content"]
+
+
+def test_target_changed_drops_the_old_targets_not_found_answers(file_tools_on_laptop, monkeypatch):
+    """Core answers a read from its 60 s not-found cache before it asks the backend (file_tools.py:
+    663-666); /hands use calls target_changed so the new target is asked."""
+    file_tools, home = file_tools_on_laptop
+    monkeypatch.setenv("HERMES_SESSION_ID", "t1")
+    store.set_session_target("s1", "server")
+    path = f"{device_path(str(home))}/report.txt"
+    miss = json.loads(file_tools.read_file_tool(path, task_id="t1"))
+    assert "not found" in (miss.get("error") or "").lower(), miss
+    (home / "report.txt").write_text("laptop data\n", encoding="utf-8")
+    store.set_session_target("s1", "laptop")
+    environment.target_changed("s1")
+    hit = json.loads(file_tools.read_file_tool(path, task_id="t1"))
+    assert "laptop data" in hit.get("content", ""), hit
+
+
+def test_after_cd_to_the_root_relative_paths_anchor_on_the_devices_root(file_tools_on_laptop):
+    """Core refuses "/" as a sandbox home and would fall back to the gateway's own cwd
+    (terminal_tool_config.py:188-192, file_tools_paths.py:276-278)."""
+    from tools.file_tools_paths import _resolve_path_for_task
+    from tools.terminal_tool import terminal_tool
+
+    file_tools, home = file_tools_on_laptop
+    assert json.loads(terminal_tool("cd /", task_id="t1"))["exit_code"] == 0
+    assert str(_resolve_path_for_task("notes.txt", "t1")) == "/notes.txt"

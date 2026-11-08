@@ -12,6 +12,7 @@ from hands import commands
 class Platform(str, Enum):
     LOCAL = "local"
     TELEGRAM = "telegram"
+    SLACK = "slack"
 
 
 class Source:
@@ -145,7 +146,7 @@ def test_use_refuses_a_device_unless_the_backend_is_hands(monkeypatch):
     monkeypatch.setattr(commands, "terminal_backend", lambda: "local")
     monkeypatch.setattr(commands.store, "get_device", lambda name: {"name": name})
     targets = []
-    monkeypatch.setattr(commands.store, "set_session_target", lambda key, name: targets.append(name))
+    monkeypatch.setattr(commands.store, "set_session_target", lambda key, name, owner: targets.append(name))
     refused = ctx.handler("use laptop", session_key="s", platform="telegram", source=Source())
     assert "terminal.backend is local" in refused
     assert "hermes config set terminal.backend hands" in refused
@@ -204,7 +205,7 @@ def test_use_sets_a_device_only_in_a_direct_chat(monkeypatch):
     monkeypatch.setattr(commands, "terminal_backend", lambda: "hands")
     monkeypatch.setattr(commands.store, "get_device", lambda name: {"name": name})
     targets = []
-    monkeypatch.setattr(commands.store, "set_session_target", lambda key, name: targets.append(name))
+    monkeypatch.setattr(commands.store, "set_session_target", lambda key, name, owner: targets.append(name))
     for chat_type in ("group", "channel", "thread"):
         source = Source(chat_type=chat_type)
         reply = ctx.handler("use laptop", session_key="g", platform="telegram", source=source)
@@ -242,6 +243,55 @@ def test_the_backend_is_read_the_way_hermes_resolves_it(monkeypatch, tmp_path):
     (tmp_path / "config.yaml").write_text("terminal:\n  backend: local\n", encoding="utf-8")
     monkeypatch.setenv("TERMINAL_ENV", "hands")
     assert commands.terminal_backend() == "local"
+
+
+def test_use_binds_the_target_to_the_person_who_sent_it(monkeypatch):
+    """R13, R14: the target only ever applies to its sender (targets.target_for)."""
+    ctx = setup(monkeypatch, ["telegram:42"])
+    monkeypatch.setattr(commands, "terminal_backend", lambda: "hands")
+    monkeypatch.setattr(commands.store, "get_device", lambda name: {"name": name})
+    bound = []
+    monkeypatch.setattr(
+        commands.store, "set_session_target", lambda key, name, owner: bound.append((key, name, owner))
+    )
+    ctx.handler("use laptop", session_key="d", platform="telegram", source=Source())
+    ctx.handler("use laptop", session_key="k", platform="desktop", source=None)
+    assert bound == [("d", "laptop", "telegram:42"), ("k", "laptop", "local")]
+
+
+def test_a_slack_group_dm_is_a_shared_chat(monkeypatch):
+    """R14: Slack reports a group DM as chat_type dm; only a 1:1 IM's channel id starts with D."""
+    ctx = setup(monkeypatch, ["slack:U1"])
+    monkeypatch.setattr(commands, "terminal_backend", lambda: "hands")
+    monkeypatch.setattr(commands.store, "get_device", lambda name: {"name": name})
+    minted = []
+    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name: minted.append(name) or "c")
+    group_dm, im = Source("U1", Platform.SLACK), Source("U1", Platform.SLACK)
+    group_dm.chat_id, im.chat_id = "G0MPIM", "D0IM"
+    reply = ctx.handler("use laptop", session_key="g", platform="slack", source=group_dm)
+    assert reply == commands.messages.USE_DIRECT_ONLY
+    reply = ctx.handler("pair desk", session_key="g", platform="slack", source=group_dm)
+    assert reply == commands.messages.PAIR_DIRECT_ONLY and minted == []
+    assert commands._in_shared_chat(im) is False and commands._in_shared_chat(Source()) is False
+
+
+def test_no_device_can_be_named_server(monkeypatch):
+    """Critic: a device called server could never be targeted; /hands use server means the host."""
+    ctx = setup(monkeypatch, ["telegram:42"])
+    minted = []
+    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name: minted.append(name) or "c")
+    reply = ctx.handler("pair server", session_key="d", platform="telegram", source=Source())
+    assert reply == commands.messages.PAIR_NAME_RESERVED and minted == []
+
+
+def test_status_shows_the_target_that_applies_to_the_sender(monkeypatch):
+    ctx = setup(monkeypatch, ["telegram:42"])
+    monkeypatch.setattr(commands.store, "list_devices", lambda: [])
+    monkeypatch.setattr(commands.store, "relay_alive", lambda: True)
+    monkeypatch.setattr(commands.store, "get_session_target", lambda key: ("laptop", "telegram:42"))
+    owner = ctx.handler("status", session_key="g", platform="telegram", source=Source())
+    guest = ctx.handler("status", session_key="g", platform="telegram", source=Source(user_id="7"))
+    assert "target laptop;" in owner and "target server;" in guest
 
 
 def test_revoke_requires_exact_yes(monkeypatch):

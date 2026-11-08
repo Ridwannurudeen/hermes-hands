@@ -82,17 +82,25 @@ def test_device_listing_and_revoke_frees_the_name(hands_db):
     assert store.revoked_key(device_id) == b"k" * 32  # the tombstone keeps the key
     again = _pair("laptop")
     assert [d["device_id"] for d in store.list_devices()] == [again]
-    # V14: pairing the name again ends the old key's tombstone.
-    assert store.revoked_key(again) is None and store.revoked_key(device_id) is None
+    # R75: pairing the name again keeps the old key's tombstone, so the old laptop, offline when it
+    # was revoked, still gets its signed stop when it wakes; the new device has its own id.
+    assert store.revoked_key(again) is None and store.revoked_key(device_id) == b"k" * 32
 
 
-def test_tombstones_end_once_told_or_after_their_ttl(hands_db, monkeypatch):
+def test_tombstones_last_a_grace_window_after_the_first_stop_or_their_ttl(hands_db, monkeypatch):
+    """R65, R75: a device whose signed stop reply was lost asks again and is told again, until
+    STOP_GRACE after the first stop; an untold tombstone lasts TOMBSTONE_TTL."""
     first, second = _pair("laptop"), _pair("desk")
     store.revoke("laptop")
     store.revoke("desk")
-    store.forget_revoked(first)
+    now = time.time()
+    store.mark_told(first)
+    monkeypatch.setattr(time, "time", lambda: now + store.STOP_GRACE - 5)
+    store.mark_told(first)  # a repeat stop does not move the window
+    assert store.revoked_key(first) == b"k" * 32
+    monkeypatch.setattr(time, "time", lambda: now + store.STOP_GRACE + 1)
     assert store.revoked_key(first) is None and store.revoked_key(second) == b"k" * 32
-    later = time.time() + store.TOMBSTONE_TTL + 1
+    later = now + store.TOMBSTONE_TTL + 1
     monkeypatch.setattr(time, "time", lambda: later)
     assert store.revoked_key(second) is None
     _pair("other")
@@ -124,23 +132,37 @@ def test_revoke_keeps_a_tombstone_in_a_hands_db_from_before_tombstones(hands_db)
     assert store.revoked_key("d1") == b"k" * 32 and store.get_device("laptop") is None
 
 
-def test_a_round_two_tombstone_table_gains_its_name_column_in_place(hands_db):
+def test_earlier_tombstone_and_target_tables_gain_their_columns_in_place(hands_db):
     conn = sqlite3.connect(hands_db / "hands.db")
     conn.execute(
         "CREATE TABLE revoked_devices (device_id TEXT PRIMARY KEY, public_key TEXT NOT NULL,"
-        " revoked_at INTEGER NOT NULL)"
+        " revoked_at INTEGER NOT NULL, name TEXT NOT NULL DEFAULT '')"
     )
     conn.execute(
-        "INSERT INTO revoked_devices VALUES ('old', ?, ?)",
+        "INSERT INTO revoked_devices VALUES ('old', ?, ?, 'laptop')",
         (protocol.b64u(b"k" * 32), int(time.time())),
     )
+    conn.execute(
+        "CREATE TABLE session_targets (session_key TEXT PRIMARY KEY, target TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO session_targets VALUES ('s1', 'laptop')")
     conn.commit()
     conn.close()
     assert store.revoked_key("old") == b"k" * 32
-    _pair("laptop")
-    assert store.revoke("laptop") is True
-    _pair("laptop")  # clears only the laptop's own tombstone
+    store.mark_told("old")
     assert store.revoked_key("old") == b"k" * 32
+    assert store.get_session_target("s1") == ("laptop", "")  # bound to nobody: resolves to server
+    store.set_session_target("s1", "laptop", owner="telegram:42")
+    assert store.get_session_target("s1") == ("laptop", "telegram:42")
+
+
+def test_no_device_can_be_paired_as_server(hands_db):
+    code = store.mint_pairing_code(store.RESERVED_NAME)
+    with pytest.raises(store.PairingError) as reserved:
+        store.complete_pairing(
+            code, name="server", public_key="AA", os="Linux", home="/", policy_hash="p0"
+        )
+    assert (reserved.value.status, reserved.value.error) == (409, "name_reserved")
 
 
 def test_offline_after_last_seen(hands_db, monkeypatch):
@@ -165,10 +187,11 @@ def test_policy_change_refuses_until_accepted(hands_db):
 
 def test_session_targets(hands_db):
     assert store.get_session_target("s1") is None
-    store.set_session_target("s1", "laptop")
-    store.set_session_target("s1", "server")
+    store.set_session_target("s1", "laptop", owner="telegram:42")
+    store.set_session_target("s1", "server", owner="telegram:7")
     store.set_session_target("s2", "laptop")
-    assert (store.get_session_target("s1"), store.get_session_target("s2")) == ("server", "laptop")
+    assert store.get_session_target("s1") == ("server", "telegram:7")
+    assert store.get_session_target("s2") == ("laptop", "local")
 
 
 def test_session_last_run(hands_db):

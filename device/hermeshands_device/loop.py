@@ -4,6 +4,7 @@ import base64
 import codecs
 import json
 import logging
+import os
 import platform
 import re
 import secrets
@@ -29,12 +30,18 @@ _BACKGROUND_PID_PROBE = re.compile(
 _CORE_EVAL_COMMAND = re.compile(
     r"(?ms)^eval '((?:[^']|'\\'')*)\n\n__hermes_rc=\$\? __hermes_ps=\(\"\$\{PIPESTATUS\[@\]\}\"\); \(exit \$__hermes_rc\) && :'$"
 )
+_CORE_PLAIN_EVAL_COMMAND = re.compile(r"(?m)^eval '((?:[^']|'\\'')*)'$", re.DOTALL)
+_CORE_CWD = re.compile(r"(?m)^builtin cd -- (.+?)(?: 2>/dev/null \|\| true| \|\| exit 126)$")
 
 
 class DeviceLoop:
     def __init__(self, *, allow_screen: bool = False, transport=None):
         self.allow_screen = allow_screen
         self.private, self.public = get_or_create()
+        pairing = config.load()
+        self.gateway_url = pairing.get("gateway_url", "").rstrip("/")
+        self.device_id = pairing.get("device_id", "")
+        self.relay_public_key = config.relay_public_key()
         self.running: dict[str, threading.Thread] = {}
         self.processes: dict[str, tuple[object, float]] = {}
         self.cancelled_jobs: set[str] = set()
@@ -46,21 +53,25 @@ class DeviceLoop:
         self.instance = secrets.token_hex(8)
         self.poll_retry_delay = 1
         self.heartbeat_retry_delay = 1
-        self.last_auth_warning = 0.0
+        self.last_auth_warning = float("-inf")
         self.accepted_policy_hash = None
-        self.client = httpx.Client(transport=transport, timeout=35)
+        self.client = httpx.Client(transport=transport, timeout=35, trust_env=False)
 
     def _post(self, endpoint: str, body_obj: dict) -> httpx.Response:
+        pairing = config.load()
+        if (pairing.get("gateway_url", "").rstrip("/"), pairing.get("device_id", ""), config.relay_public_key()) != (self.gateway_url, self.device_id, self.relay_public_key):
+            self.stop_event.set()
+            raise PermissionError("pairing_changed")
         body = canonical_json(body_obj)
-        path = urlparse(config.gateway_url()).path.rstrip("/") + endpoint
+        path = urlparse(self.gateway_url).path.rstrip("/") + endpoint
         ts, nonce = int(time.time()), new_nonce()
         headers = {
             "Content-Type": "application/json",
-            "Authorization": "Bearer " + make_bearer(config.device_id(), self.private, ts=ts, nonce=nonce),
+            "Authorization": "Bearer " + make_bearer(self.device_id, self.private, ts=ts, nonce=nonce),
             "X-Hands-Ts": str(ts), "X-Hands-Nonce": nonce,
             "X-Hands-Signature": sign_request(self.private, D2R, ts, nonce, "POST", path, body),
         }
-        return self.client.post(config.gateway_url() + endpoint, content=body, headers=headers)
+        return self.client.post(self.gateway_url + endpoint, content=body, headers=headers)
 
     def _verify_response(self, response: httpx.Response, endpoint: str) -> dict:
         if response.status_code in (401, 409):
@@ -103,9 +114,9 @@ class DeviceLoop:
             nonce = response.headers["X-Hands-Nonce"]
             request_nonce = response.request.headers["X-Hands-Nonce"]
             signature = response.headers["X-Hands-Signature"]
-            path = urlparse(config.gateway_url()).path.rstrip("/") + endpoint
+            path = urlparse(self.gateway_url).path.rstrip("/") + endpoint
             return nonce == request_nonce and fresh(ts, int(time.time())) and verify_request(
-                config.relay_public_key(), signature, R2D, ts, nonce, "POST", path, response.content
+                self.relay_public_key, signature, R2D, ts, nonce, "POST", path, response.content
             )
         except (KeyError, ValueError, httpx.RequestNotRead):
             return False
@@ -117,7 +128,7 @@ class DeviceLoop:
         now = time.monotonic()
         if now - self.last_auth_warning >= 60:
             logger.warning(
-                "Relay returned HTTP %s; retrying. Confirm this device is still paired and that the dashboard is using the same relay data directory.",
+                "Relay returned HTTP %s; retrying. Check for clock skew over 300 seconds, a dashboard started without the relay seed, or a device revoked before this version.",
                 status,
             )
             self.last_auth_warning = now
@@ -180,10 +191,11 @@ class DeviceLoop:
             except (httpx.HTTPError, ValueError):
                 deadline = getattr(self, "job_deadlines", {}).get(job_id)
                 if deadline is not None and time.monotonic() >= deadline:
-                    logger.warning("Stopping result retries for %s after its job deadline", job_id)
-                    return
+                    logger.warning("Stopping job %s after result delivery expired at sequence %s", job_id, seq)
+                    raise InterruptedError("result delivery expired")
                 self.stop_event.wait(1)
-        logger.debug("Dropping result for %s because the device is stopping", job_id)
+        logger.debug("Stopping result delivery for %s because the device is stopping", job_id)
+        raise InterruptedError("device is stopping")
 
     def _run_job(self, job: dict) -> None:
         job_id, seq = job["job_id"], 0
@@ -212,14 +224,24 @@ class DeviceLoop:
                 script = job["script"]
                 policy_script = _BACKGROUND_PID_PROBE.sub("", script)
                 wrapped_command = _CORE_EVAL_COMMAND.search(policy_script)
+                if not wrapped_command:
+                    wrapped_command = _CORE_PLAIN_EVAL_COMMAND.search(policy_script)
                 if wrapped_command:
                     policy_script = wrapped_command.group(1).replace("'\\''", "'")
-                refused = policy.refusal(policy_script, policy_patterns)
+                cwd = _CORE_CWD.search(script)
+                policy_script = _CORE_CWD.sub("", policy_script)
+                if cwd and policy.refusal(cwd.group(1), policy_patterns[:4]):
+                    refused = policy.refusal(cwd.group(1), policy_patterns[:4])
+                elif job.get("file_op"):
+                    refused = policy.refusal(policy_script, policy_patterns[:4])
+                else:
+                    refused = policy.refusal(policy_script, policy_patterns)
                 if refused:
                     self._result(job_id, seq, chunk=f"Policy refused command matching: {refused}\n", done=True, returncode=126)
                     return
                 exit_code = [0]
                 capped = threading.Event()
+                truncated = threading.Event()
                 timeout = job.get("timeout", 120)
                 self.job_deadlines[job_id] = time.monotonic() + timeout
                 decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -230,7 +252,7 @@ class DeviceLoop:
                         self.cancelled_jobs.discard(job_id)
                     if cancelled:
                         executor._terminate(proc, started)
-                for chunk in executor.run(job["script"], login=job.get("login", False), timeout=timeout, job_id=job_id, stdin=job.get("stdin"), on_start=on_start, on_exit=lambda code: exit_code.__setitem__(0, code), on_capped=capped.set):
+                for chunk in executor.run(job["script"], login=job.get("login", False), timeout=timeout, job_id=job_id, stdin=job.get("stdin"), stdin_b64=job.get("stdin_b64"), on_start=on_start, on_exit=lambda code: exit_code.__setitem__(0, code), on_capped=capped.set, on_truncated=truncated.set):
                     with self.process_lock:
                         process = self.processes.get(job_id)
                     if process is not None and process[0].poll() is not None:
@@ -243,6 +265,8 @@ class DeviceLoop:
                 final = decoder.decode(tail, final=True)
                 if capped.is_set():
                     self._result(job_id, seq, chunk=final, done=True, returncode=1, error="Output exceeded the 64 MiB device limit")
+                elif truncated.is_set():
+                    self._result(job_id, seq, chunk=final, done=True, returncode=1, error="Output was truncated after the post-exit pipe idle limit")
                 else:
                     self._result(job_id, seq, chunk=final, done=True, returncode=exit_code[0])
             elif job["type"] == "screenshot":
@@ -261,6 +285,8 @@ class DeviceLoop:
         except InterruptedError:
             return
         except PermissionError as exc:
+            if str(exc) == "pairing_changed":
+                return
             if self.stop_event.is_set():
                 logger.debug("Dropping result for %s because the device is stopping", job_id)
                 return
@@ -304,6 +330,8 @@ class DeviceLoop:
                 self.heartbeat_retry_delay = 1
                 self.stop_event.wait(5)
             except PermissionError as exc:
+                if str(exc) == "pairing_changed":
+                    return
                 if str(exc) == "unknown_device":
                     self.stop_event.set()
                     return
@@ -317,10 +345,30 @@ class DeviceLoop:
     def run_forever(self) -> None:
         if not hasattr(self, "poll_retry_delay"):
             self.poll_retry_delay = 1
-        executor.reap_recorded_processes()
-        heartbeat = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        heartbeat.start()
+        lock_path = Path.home() / ".hermes-hands" / "serve.lock"
+        lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_file = lock_path.open("a+b")
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
         try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            lock_file.close()
+            raise RuntimeError("Another hermes-hands serve process is already running for this device home") from exc
+        try:
+            executor.reap_recorded_processes()
+            heartbeat = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            heartbeat.start()
             while not self.stop_event.is_set():
                 try:
                     response = self._post("/device/poll", self._poll_body())
@@ -335,17 +383,30 @@ class DeviceLoop:
                     if self.fatal:
                         raise self.fatal[0]
                 except PermissionError as exc:
+                    if str(exc) == "pairing_changed":
+                        raise RuntimeError("Device pairing changed while serve was running") from exc
                     if str(exc) == "unknown_device":
                         raise
                     if str(exc) == "policy_changed":
                         self._retry("poll_retry_delay", cap=5)
                         continue
                     self._retry("poll_retry_delay")
-                except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError):
-                    logger.warning("Device poll failed; retrying")
+                except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError) as exc:
+                    if not (isinstance(exc, ValueError) and str(exc).startswith("transient relay status ")):
+                        logger.warning("Device poll failed; retrying")
                     self._retry("poll_retry_delay")
         finally:
             self.stop_event.set()
             self._cancel_running_jobs()
+            if os.name == "nt":
+                import msvcrt
+
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
 
 

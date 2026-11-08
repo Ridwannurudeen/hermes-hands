@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import os
 import subprocess
 import sys
@@ -44,7 +43,10 @@ def task_xml(*, executable: str, username: str, allow_screen: bool = False) -> b
     execute.text = executable
     ElementTree.SubElement(exec_action, "WorkingDirectory").text = str(Path.home())
     arguments = ElementTree.SubElement(exec_action, "Arguments")
-    arguments.text = "serve --allow-screen" if allow_screen else "serve"
+    if allow_screen:
+        arguments.text = "-m hermeshands_device.cli serve --allow-screen"
+    else:
+        arguments.text = "-m hermeshands_device.cli serve"
     declaration = '<?xml version="1.0" encoding="UTF-16"?>\n'
     return (declaration + ElementTree.tostring(task, encoding="unicode")).encode("utf-16")
 
@@ -56,10 +58,15 @@ def install(*, dry_run: bool = False, remove: bool = False, allow_screen: bool =
     if remove:
         args = command(remove=True)
     else:
-        executable = shutil.which("hermes-hands")
-        if not executable:
-            print("hermes-hands executable was not found on PATH", file=sys.stderr)
+        python = Path(sys.executable)
+        if not python.is_absolute():
+            print("Python executable path is not absolute; cannot install service", file=sys.stderr)
             return 1
+        pythonw = python.with_name("pythonw.exe")
+        if not pythonw.is_file():
+            print("pythonw.exe was not found next to the active Python interpreter", file=sys.stderr)
+            return 1
+        executable = str(pythonw)
         username = f"{os.environ['USERDOMAIN']}\\{os.environ['USERNAME']}"
         with tempfile.TemporaryDirectory(prefix="hermes-hands-") as temp_dir:
             xml_path = Path(temp_dir) / "task.xml"

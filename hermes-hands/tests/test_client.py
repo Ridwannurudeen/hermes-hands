@@ -161,6 +161,47 @@ def test_starting_is_never_retried(wired, monkeypatch):
     assert str(down.value) == messages.RELAY_DOWN
 
 
+@pytest.mark.parametrize(
+    "error", [httpx.ReadError("reset"), httpx.ReadTimeout("slow"), httpx.RemoteProtocolError("cut")]
+)
+def test_a_start_whose_reply_was_lost_may_have_been_queued(wired, monkeypatch, error):
+    """R56: only a request that never reached the relay (no connection) is "nothing ran"."""
+    Device()
+    failing_once(monkeypatch, "/local/exec", error)
+    with pytest.raises(client.HandsError) as unknown:
+        client.start_job("laptop", script="true", login=False, timeout=5)
+    assert str(unknown.value) == messages.queue_unknown("laptop")
+    assert "nothing ran" not in str(unknown.value)
+
+
+@pytest.mark.parametrize("error", [httpx.ConnectTimeout("slow"), httpx.PoolTimeout("busy")])
+def test_a_start_timeout_does_not_prove_the_request_was_unsent(wired, monkeypatch, error):
+    Device()
+    failing_once(monkeypatch, "/local/exec", error)
+    with pytest.raises(client.HandsError) as unknown:
+        client.start_job("laptop", script="true", login=False, timeout=5)
+    assert str(unknown.value) == messages.queue_unknown("laptop")
+
+
+@pytest.mark.parametrize("failure", [502, 200])
+def test_a_start_without_a_usable_http_reply_may_have_been_queued(wired, monkeypatch, failure):
+    Device()
+    if failure == 200:
+        real = client._http.post
+
+        def post(path, **kwargs):
+            if path == "/local/exec":
+                return httpx.Response(200, json={"not": "a job id"})
+            return real(path, **kwargs)
+
+        monkeypatch.setattr(client._http, "post", post)
+    else:
+        failing_once(monkeypatch, "/local/exec", failure)
+    with pytest.raises(client.HandsError) as unknown:
+        client.start_job("laptop", script="true", login=False, timeout=5)
+    assert str(unknown.value) == messages.queue_unknown("laptop")
+
+
 def test_relay_gone_after_the_start_says_the_command_may_still_run(wired, monkeypatch):
     hub, _ = wired
     Device()

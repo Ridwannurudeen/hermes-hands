@@ -17,8 +17,10 @@ import os
 import posixpath
 import re
 import shlex
+import sys
 import sqlite3
 import threading
+import weakref
 
 from gateway.session_context import get_session_env
 from tools.environments.base import BaseEnvironment
@@ -44,8 +46,10 @@ _WORD = re.compile(r"'((?:[^']|'\"'\"')*)'|(?<![^\s<>|;&(])([\w@%+=:,./-]+)(?=[\
 # The start of core's atomic write (file_operations.py:586-606): its parent and target.
 _ATOMIC_WRITE = re.compile(rf"set -e; d=({_SHELL_WORD}); t=({_SHELL_WORD}); ")
 # A search_files command (file_operations_search.py:688-693, 1221, 1328): rg, grep or find first.
+# The executable is bare, or single-quoted when its path has a space (file_operations_search.py:695-702).
 _SEARCH = re.compile(
-    r"(?:set -o pipefail; )?(?:cd \S.*? && )?'?(?:[^'\s]*/)?(?:rg|rg\.exe|grep|find)'? "
+    r"(?:set -o pipefail; )?(?:cd \S.*? && )?"
+    r"(?:'(?:[^']|'\"'\"')*/(?:rg|rg\.exe)'|(?:[^'\s]*/)?(?:rg|rg\.exe|grep|find)) "
 )
 # A Windows path core joined onto the base, which it does to anything not POSIX-absolute for a
 # container backend (file_tools_paths.py:157-163): ``<home>/C:\Users\x`` or ``<home>/C:/Users/x``.
@@ -57,9 +61,20 @@ _PYTHON_SNIPPET = re.compile(
 _SNIPPET_PATH = re.compile(r"^p = (?:pathlib\.Path\()?(\"(?:[^\"\\]|\\.)*\")", re.M)
 # Set by DeviceEnvironment.execute for one call and read in _run_bash, which core runs on its wait
 # worker in a copy of the caller's context (agent/deadline.py:340-361).
+# Core's container key -> target -> where the target's last terminal command that core records
+# ended. Kept per process, not per object: core's own cwd record outlives an idle-reaped
+# environment (terminal_tool.py:255-283), and this has to as well.
+_SESSION_CWDS: dict[str, dict[str, str]] = {}
+# The live environments, for target_changed.
+_LIVE: weakref.WeakSet[HandsEnvironment] = weakref.WeakSet()
 _INLINE_LIMIT: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     "hermes_hands_inline_limit", default=None
 )
+
+_FILE_OP: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "hermes_hands_file_op", default=False
+)
+
 
 
 def device_path(path: str) -> str:
@@ -88,6 +103,15 @@ def _hands_failure(result: dict) -> bool:
         line.startswith("hands:") for line in output.splitlines()
     )
 
+
+def _from_file_tools() -> bool:
+    """File tools do not name the call (file_operations.py:229-239). A terminal command and execute_code keep the full deny-list."""
+    frame = sys._getframe()
+    while frame is not None:
+        if str(frame.f_globals.get("__name__", "")).startswith("tools.file_operations"):
+            return True
+        frame = frame.f_back
+    return False
 
 class DeviceEnvironment(BaseEnvironment):
     """A paired device: core's spawn-per-call flow, with every bash run sent to the device as a job."""
@@ -129,8 +153,9 @@ class DeviceEnvironment(BaseEnvironment):
             path = self.home + path[len(gateway) :]
         if self.windows:
             drive = _JOINED_DRIVE.search(path)
-            # only onto a base core joins on: the device home or its cwd (file_tools_paths.py:276-278)
-            if drive is not None and path[: drive.start()] in (self.home, self.cwd):
+            # Only onto an absolute base, which every base core joins on is: the session's record,
+            # a workspace, terminal.cwd or the sandbox home (file_tools_paths.py:131-144, 276-278).
+            if drive is not None and path[: drive.start()].startswith("/"):
                 path = device_path(drive.group(1))
         return path
 
@@ -210,6 +235,7 @@ class DeviceEnvironment(BaseEnvironment):
             timeout=timeout,
             inline_limit=_INLINE_LIMIT.get(),
             stdin=stdin_data,
+            file_op=_FILE_OP.get(),
         )
 
     def execute(self, command: str, cwd: str = "", **kwargs) -> dict:
@@ -225,11 +251,14 @@ class DeviceEnvironment(BaseEnvironment):
         terminal = kwargs.get("bounded_capture")
         if not terminal and _BACKGROUND_FILE.search(command) is None:
             command = self._file_command(command)
+        file_op = (not terminal) and _from_file_tools()
         token = _INLINE_LIMIT.set(self.inline_limit if terminal else None)
+        file_token = _FILE_OP.set(file_op)
         try:
             return super().execute(command, cwd, **kwargs)
         finally:
             _INLINE_LIMIT.reset(token)
+            _FILE_OP.reset(file_token)
 
     @staticmethod
     def _quote_cwd_for_cd(cwd: str) -> str:
@@ -277,8 +306,10 @@ class HandsEnvironment(BaseEnvironment):
             self._store_failed()
             self._record_owner = None
         self._files_target: str | None = None
-        # target -> where its last terminal command that core records ended
-        self._session_cwd: dict[str, str] = {}
+        self._session_key = session_key
+        self._replaced: str | None = None
+        self._session_cwd = _SESSION_CWDS.setdefault(task_id, {})
+        _LIVE.add(self)
         # Create the first target now so ``cwd`` is already absolute when core stamps the sandbox
         # home right after create_environment (terminal_tool_backends.py:213-233, 256).
         self._current()
@@ -307,24 +338,39 @@ class HandsEnvironment(BaseEnvironment):
         )
         if target != self._files_target:
             if self._files_target is not None:
-                self._forget_file_ops()
+                self._switched(target, sub)
             self._files_target = target
         return target, sub
 
     def _forget_file_ops(self) -> None:
-        """Core keeps one ShellFileOperations per environment (file_tools.py:265-266, 312-375), and it
-        caches which executables exist and where rg is (file_operations.py:225-227,
-        file_operations_search.py:518-590) for whichever machine answered first. The target just
-        changed, so those answers are another machine's; a file tool reads an attribute of this object
-        before its first lookup (file_operations.py:238, file_operations_search.py:785-788)."""
+        """Core keeps one ShellFileOperations per environment, caching which executables exist and
+        where rg is for whichever machine answered first (file_operations.py:225-227,
+        file_operations_search.py:518-590), and a 60 s not-found cache per task (file_tools_read_
+        tracking.py:118-140). Both describe another machine once the target changes; core's public
+        calls drop them (file_tools.py:377-399, file_tools_read_tracking.py:192-206)."""
         from tools import file_tools
+        from tools.file_tools_read_tracking import notify_other_tool_call
 
-        with file_tools._file_ops_lock:
-            stale = [ops for ops in file_tools._file_ops_cache.values() if ops.env is self]
-        for ops in stale:
-            ops._command_cache.clear()
-            ops._rg_resolution_cache.clear()
-            ops._rg_modified_capability.clear()
+        file_tools.clear_file_ops_cache(self._task_id)
+        session_id = get_session_env("HERMES_SESSION_ID", "")
+        if session_id:
+            notify_other_tool_call(session_id)
+
+    def _switched(self, target: str, sub: BaseEnvironment) -> None:
+        """The conversation moved to ``target``. Core anchors relative file-tool paths on its cwd
+        record before anything this object reports (file_tools_paths.py:131-144), so the record is
+        set to where ``target`` was, through core's own call (terminal_tool.py:266-276)."""
+        from tools.approval import get_current_session_key
+        from tools.terminal_tool import get_session_cwd, record_session_cwd
+
+        self._forget_file_ops()
+        session_key = get_current_session_key(default=self._session_key)
+        cwd = self._session_cwd.get(target) or sub.cwd
+        if session_key and posixpath.isabs(device_path(cwd)):
+            # A terminal call that is resolving its cwd has already read the old record.
+            self._replaced = get_session_cwd(session_key)
+            record_session_cwd(session_key, cwd)
+            self._recorded_on(target)
 
     def _current(self) -> tuple[str, BaseEnvironment]:
         """``_resolve`` for core's attribute reads, which must never raise (file_operations.py:238-239,
@@ -337,8 +383,9 @@ class HandsEnvironment(BaseEnvironment):
             return self._sub(targets.SERVER)
 
     def _create(self, target: str) -> BaseEnvironment:
-        """``terminal.cwd`` (or a Desktop or ACP workspace) is a directory on the gateway host, so only
-        the server starts there; a device starts in the home it reported at pairing."""
+        """A target starts where its last recorded terminal command ended, which outlives an
+        idle-reaped object. Otherwise ``terminal.cwd`` (or a Desktop or ACP workspace) is a directory on
+        the gateway host, so only the server starts there; a device starts in its paired home."""
         if target == targets.SERVER:
             requested = None if self._requested_cwd == "~" else self._requested_cwd
             persistent = os.getenv("TERMINAL_LOCAL_PERSISTENT", "true").strip().lower() in {
@@ -346,7 +393,18 @@ class HandsEnvironment(BaseEnvironment):
                 "1",
                 "yes",
             }
-            cwd = requested or os.getenv("MESSAGING_CWD") or os.getcwd()
+            # Core drops a terminal.cwd under /home, /Users or a drive for a container backend
+            # (terminal_tool.py:805-809); for the server it is this host's, as on the local backend,
+            # and the file tools anchor on it (file_tools_paths.py:106-112, 144).
+            from tools.file_tools_paths import _configured_terminal_cwd
+
+            cwd = (
+                self._session_cwd.get(target)
+                or requested
+                or _configured_terminal_cwd()
+                or os.getenv("MESSAGING_CWD")
+                or os.getcwd()
+            )
             # The relay seed is blank in every command: core strips the provider's strip_env_keys
             # from background and helper processes (local.py:333-337) but not from the terminal's
             # own spawn env, which takes this env last (local.py:776-787, 1136).
@@ -360,7 +418,7 @@ class HandsEnvironment(BaseEnvironment):
         home = device_path(device["home"]) if device is not None else None
         return DeviceEnvironment(
             target,
-            cwd=home or "~",
+            cwd=self._session_cwd.get(target) or home or "~",
             timeout=self._timeout,
             home=home,
             windows=device is not None and device["os"].lower().startswith("windows"),
@@ -421,15 +479,16 @@ class HandsEnvironment(BaseEnvironment):
                 raise RuntimeError(lines[-1])
             self._job_ended(owner, int(kill.group(1)))
             return result
+        pid = None if job is None else self._background.get(job.group(1), (owner, None))[1]
         if not command.startswith("kill -0 "):
-            if command.startswith("cat ") and ".exit" in command and job is not None:
-                pid = self._background.get(job.group(1), (owner, None))[1]
-                if pid is not None:
-                    self._job_ended(owner, pid)
+            if command.startswith("cat ") and ".exit" in command and pid is not None:
+                self._job_ended(owner, pid)
             return result
         if result.get("returncode") == 0 and lines and lines[-1].strip().lstrip("-").isdigit():
             return result
         if any(text in output for text in self._gone(owner)):
+            if pid is not None:
+                self._job_ended(owner, pid)  # core records the job as lost
             raise RuntimeError(lines[-1])
         return {"output": "0", "returncode": 0}
 
@@ -450,16 +509,17 @@ class HandsEnvironment(BaseEnvironment):
         """Where a terminal command or a background launch runs ("" keeps the target's own cwd), and
         whether core records where it ends. Core passes ``workdir=``, which it never records, else the
         session's recorded cwd, else the configured default or workspace (terminal_tool.py:1014-1061,
-        terminal_tool_background.py:173-176, terminal_tool_result.py:222-225). Core's record key is
-        not always this object's (the raw task id, terminal_tool.py:1528-1530), so the cwd each
-        target's last recorded command ended in is kept here too."""
+        terminal_tool_background.py:173-176, terminal_tool_result.py:222-225), and tells the
+        environment nothing about which (:1373-1377). So a cwd is changed only when it is provably
+        not a workdir=: core's record of another target, or a gateway default on a device. Anything
+        else runs where it says. Without a session key core keys the record by a task id this object
+        never sees (:1528-1530); the cwd each target's last recorded command ended in stands in."""
         from tools.approval import get_current_session_key
         from tools.terminal_tool import _get_env_config, get_session_cwd, resolve_task_overrides
 
         session_key = get_current_session_key(default="")
         key = session_key or self._task_id
         recorded = get_session_cwd(key)
-        defaults = {_get_env_config().get("cwd"), resolve_task_overrides(key).get("cwd")}
         known = self._session_cwd.get(target)
         if cwd == "~":
             # Core drops a /home or /Users record outside the sandbox home (terminal_tool.py:
@@ -467,17 +527,22 @@ class HandsEnvironment(BaseEnvironment):
             if known is None and target == targets.SERVER and self._record_owner == targets.SERVER:
                 known = recorded if recorded and os.path.isdir(recorded) else None
             return known or "", True
-        if target != targets.SERVER and cwd in defaults and not self._in_home(sub, cwd):
-            return "", True  # a gateway directory: terminal.cwd or a Desktop, TUI or ACP workspace
         if cwd == known:
             return cwd, True
-        foreign = any(cwd == seen for other, seen in self._session_cwd.items() if other != target)
-        if foreign or (cwd == recorded and self._record_owner not in (None, target)):
-            return known or "", True  # another target's record
-        # Without a session key the record may sit under a task id this object never sees, so a
-        # first cwd is taken as the record; with one, an unrecorded cwd is a workdir=.
-        if cwd == recorded or cwd in defaults or (known is None and not session_key):
-            return cwd, True
+        replaced, self._replaced = self._replaced, None
+        if cwd == replaced:
+            return known or "", True  # the record core read before this call moved it to the target
+        owners = {other for other, seen in self._session_cwd.items() if seen == cwd}
+        is_record = cwd == recorded if session_key else bool(owners)
+        if is_record:
+            # The session's record: written after a command on its owner's target.
+            owner = next(iter(owners), self._record_owner)
+            return (cwd if owner in (None, target) else known or ""), True
+        defaults = {_get_env_config().get("cwd"), resolve_task_overrides(key).get("cwd")}
+        if recorded is None and cwd in defaults:
+            # Core's default with no record: terminal.cwd or a Desktop, TUI or ACP workspace,
+            # a gateway directory unless it is under a device's home.
+            return (cwd if target == targets.SERVER or self._in_home(sub, cwd) else ""), True
         return cwd, False  # workdir=
 
     @staticmethod
@@ -512,6 +577,8 @@ class HandsEnvironment(BaseEnvironment):
         if terminal or launch is not None:
             cwd, records = self._command_cwd(target, sub, cwd)
             records = records and terminal
+        else:
+            self._replaced = None  # core reads the record after this call, already moved
         if note is not None:
             self._noted = noted
         before = sub.cwd
@@ -565,10 +632,19 @@ class HandsEnvironment(BaseEnvironment):
     def cwd(self, value: str) -> None:
         """A workspace override (terminal_tool.py:350-362), which core also records as the session's
         cwd, names a gateway directory: devices keep theirs."""
+        from tools.approval import get_current_session_key
+        from tools.terminal_tool import record_session_cwd
+
         target, sub = self._current()
-        self._record_owner = targets.SERVER
+        self._session_cwd[targets.SERVER] = value  # where the server starts from now
         if target == targets.SERVER:
             sub.cwd = value
+            self._recorded_on(targets.SERVER)
+            return
+        session_key = get_current_session_key(default="")
+        cwd = self._session_cwd.get(target) or sub.cwd
+        if session_key and posixpath.isabs(device_path(cwd)):
+            record_session_cwd(session_key, cwd)  # core just recorded the workspace (:350-352)
 
     @property
     def env(self) -> dict:
@@ -599,8 +675,13 @@ class HandsEnvironment(BaseEnvironment):
         131-144, 276-301), and to keep recorded cwds (terminal_tool.py:1041-1047). Reads pass a
         relative path to the shell, which runs in this same cwd (file_tools.py:685), so writes,
         patches, reads and searches all land where the terminal is, as on the local backend."""
-        cwd = self._current()[1].cwd
-        return cwd if posixpath.isabs(device_path(cwd)) else None  # "~": a device never paired
+        target, sub = self._current()
+        cwd = self._session_cwd.get(target) or sub.cwd
+        if not posixpath.isabs(device_path(cwd)):
+            return None  # "~": a device never paired
+        # Core refuses "/" as a home and would anchor on the gateway's own cwd instead
+        # (terminal_tool_config.py:188-192, file_tools_paths.py:276-278); "/." names the same folder.
+        return "/." if cwd == "/" else cwd
 
     @_hermes_sandbox_home.setter
     def _hermes_sandbox_home(self, value: str) -> None:
@@ -626,3 +707,24 @@ class ProbeEnvironment(BaseEnvironment):
 
     def cleanup(self):
         """Nothing to release."""
+
+
+def target_changed(session_key: str) -> None:
+    """For ``/hands use``: move core's cwd record before its next tool call and clear old file caches."""
+    from tools.terminal_tool_lifecycle import get_active_env
+
+    active = get_active_env(session_key)
+    for env in list(_LIVE):
+        if env._session_key == session_key:
+            if env is not active:
+                env._forget_file_ops()
+                continue
+            try:
+                env._resolve()
+                # The target's cwd is now core's record. The next workdir= must pass through even if
+                # it equals the cwd that belonged to the old target.
+                env._replaced = None
+            except sqlite3.Error:
+                env._store_failed()
+                env._forget_file_ops()
+targets.bind_target_changed(target_changed)

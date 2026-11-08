@@ -1,12 +1,21 @@
+import shutil
 import subprocess
 from xml.etree import ElementTree
 
 from hermeshands_device import service
 
 
-def test_install_service_command_escapes_executable_with_spaces(monkeypatch):
+def _set_python_interpreter(monkeypatch, tmp_path):
+    interpreter = tmp_path / "A User" / "Scripts" / "python.exe"
+    interpreter.parent.mkdir(parents=True)
+    pythonw = interpreter.with_name("pythonw.exe")
+    pythonw.write_bytes(b"")
+    monkeypatch.setattr(service.sys, "executable", str(interpreter))
+    return pythonw
+
+
+def test_install_service_calls_schtasks_with_xml(monkeypatch):
     monkeypatch.setattr(service.sys, "platform", "win32")
-    monkeypatch.setattr(service.shutil, "which", lambda name: r"C:\Users\A User\pipx\bin\hermes-hands.exe")
     monkeypatch.setattr(service.os, "environ", {"USERDOMAIN": "LAPTOP", "USERNAME": "A User"})
     monkeypatch.setattr(service.Path, "home", lambda: service.Path(r"C:\Users\A User"))
     calls = []
@@ -18,9 +27,32 @@ def test_install_service_command_escapes_executable_with_spaces(monkeypatch):
     assert calls[0][1] is False
 
 
-def test_install_service_dry_run_prints_command_without_running(monkeypatch, capsys):
+def test_install_service_uses_absolute_pythonw_and_ignores_cwd_command(monkeypatch, tmp_path):
     monkeypatch.setattr(service.sys, "platform", "win32")
-    monkeypatch.setattr(service.shutil, "which", lambda name: r"C:\pipx\A User\hermes-hands.exe")
+    pythonw = _set_python_interpreter(monkeypatch, tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda name: "hermes-hands.exe")
+    monkeypatch.setattr(service.os, "environ", {"USERDOMAIN": "LAPTOP", "USERNAME": "A User"})
+    monkeypatch.setattr(service.Path, "home", lambda: service.Path(r"C:\Users\A User"))
+    calls = []
+
+    def run(args, check):
+        xml = ElementTree.fromstring(service.Path(args[3]).read_bytes())
+        calls.append((args, check, xml))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(service.subprocess, "run", run)
+    assert service.install() == 0
+    ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    command = calls[0][2].findtext("t:Actions/t:Exec/t:Command", namespaces=ns)
+    arguments = calls[0][2].findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns)
+    assert command == str(pythonw)
+    assert service.Path(command).is_absolute()
+    assert arguments == "-m hermeshands_device.cli serve"
+
+
+def test_install_service_dry_run_prints_command_without_running(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(service.sys, "platform", "win32")
+    pythonw = _set_python_interpreter(monkeypatch, tmp_path)
     monkeypatch.setattr(service.os, "environ", {"USERDOMAIN": "LAPTOP", "USERNAME": "A User"})
     monkeypatch.setattr(service.Path, "home", lambda: service.Path(r"C:\Users\A User"))
     monkeypatch.setattr(service.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not run")))
@@ -32,16 +64,37 @@ def test_install_service_dry_run_prints_command_without_running(monkeypatch, cap
     assert "ExecutionTimeLimit" in output and ">PT0S<" in output
     assert "RestartOnFailure" in output and "<Count>3</Count>" in output
     assert "LAPTOP\\A User" in output
-    assert "serve" in output
+    assert str(pythonw) in output
+    assert "-m hermeshands_device.cli serve" in output
 
 
-def test_install_service_passes_allow_screen_to_task(monkeypatch, capsys):
+def test_install_service_passes_allow_screen_to_task(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(service.sys, "platform", "win32")
-    monkeypatch.setattr(service.shutil, "which", lambda name: r"C:\pipx\hermes-hands.exe")
+    pythonw = _set_python_interpreter(monkeypatch, tmp_path)
     monkeypatch.setattr(service.os, "environ", {"USERDOMAIN": "LAPTOP", "USERNAME": "user"})
     monkeypatch.setattr(service.Path, "home", lambda: service.Path(r"C:\Users\user"))
     assert service.install(dry_run=True, allow_screen=True) == 0
-    assert "serve --allow-screen" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert str(pythonw) in output
+    assert "-m hermeshands_device.cli serve --allow-screen" in output
+
+
+def test_install_service_refuses_relative_python_executable(monkeypatch, capsys):
+    monkeypatch.setattr(service.sys, "platform", "win32")
+    monkeypatch.setattr(service.sys, "executable", "python.exe")
+    monkeypatch.setattr(service.os, "environ", {"USERDOMAIN": "LAPTOP", "USERNAME": "user"})
+    assert service.install(dry_run=True) == 1
+    assert "absolute" in capsys.readouterr().err.lower()
+
+
+def test_install_service_refuses_without_pythonw(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(service.sys, "platform", "win32")
+    interpreter = tmp_path / "Scripts" / "python.exe"
+    interpreter.parent.mkdir()
+    monkeypatch.setattr(service.sys, "executable", str(interpreter))
+    monkeypatch.setattr(service.os, "environ", {"USERDOMAIN": "LAPTOP", "USERNAME": "user"})
+    assert service.install(dry_run=True) == 1
+    assert "pythonw.exe" in capsys.readouterr().err
 
 
 def test_remove_service_command(monkeypatch):
@@ -53,7 +106,7 @@ def test_remove_service_command(monkeypatch):
 
 
 def test_task_xml_has_current_user_logon_and_unlimited_restartable_settings():
-    xml = service.task_xml(executable=r"C:\Program Files\hermes-hands.exe", username="LAPTOP\\A User")
+    xml = service.task_xml(executable=r"C:\Program Files\pythonw.exe", username="LAPTOP\\A User")
     root = ElementTree.fromstring(xml)
     ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
     assert root.findtext("t:Triggers/t:LogonTrigger/t:UserId", namespaces=ns) == "LAPTOP\\A User"
@@ -62,7 +115,8 @@ def test_task_xml_has_current_user_logon_and_unlimited_restartable_settings():
     assert root.findtext("t:Settings/t:StopIfGoingOnBatteries", namespaces=ns) == "false"
     assert root.findtext("t:Settings/t:ExecutionTimeLimit", namespaces=ns) == "PT0S"
     assert root.findtext("t:Settings/t:RestartOnFailure/t:Count", namespaces=ns) == "3"
-    assert root.findtext("t:Actions/t:Exec/t:Command", namespaces=ns) == r"C:\Program Files\hermes-hands.exe"
+    assert root.findtext("t:Actions/t:Exec/t:Command", namespaces=ns) == r"C:\Program Files\pythonw.exe"
+    assert root.findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns) == "-m hermeshands_device.cli serve"
     assert root.findtext("t:Actions/t:Exec/t:WorkingDirectory", namespaces=ns) == str(service.Path.home())
 
 

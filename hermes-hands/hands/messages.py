@@ -31,6 +31,10 @@ BAD_REQUEST = "hands: malformed request body."
 SCREENSHOT_TOO_LARGE = "hands: the screenshot is larger than 2 MiB; nothing was saved."
 SCREENSHOT_FAILED = "hands: the device did not send a screenshot."
 PAIR_BAD_CODE = "hands: this pairing code is unknown, expired or already used. Ask the owner for a new /hands pair code."
+PAIR_NAME_RESERVED = (
+    "hands: server is the name of the gateway host's own target, so no device can use it. "
+    "Pick another device name."
+)
 PAIR_BAD_SIGNATURE = "hands: the pairing request is not signed by the public key it carries."
 TARGET_NOTE_SERVER = "hands: now on server (the gateway host)"
 STORE_DOWN = (
@@ -115,6 +119,13 @@ def agent_restarted(name: str) -> str:
     return (
         f"hands: the device agent on {name} restarted while the command ran, so it may have partly "
         f"run there and any output above is partial. Check {name} before running it again."
+    )
+
+
+def queue_unknown(name: str) -> str:
+    return (
+        f"hands: the relay stopped answering after the command was sent to it, so it may have been "
+        f"queued and may run on {name}. Check {name} before running it again."
     )
 
 

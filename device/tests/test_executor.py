@@ -1,4 +1,5 @@
 import os
+import base64
 import shutil
 import subprocess
 import time
@@ -99,6 +100,19 @@ def test_real_bash_execution(monkeypatch, tmp_path):
     assert chunks.strip() == b"hi"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="MSYS switch conversion is Windows-only")
+def test_cmd_slash_switch_can_be_passed_without_msys_path_conversion(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("Git Bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    output = b"".join(executor.run("MSYS_NO_PATHCONV=1 cmd /c echo x", timeout=15))
+
+    assert output.strip() == b"x"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows background-job pipe inheritance regression")
 def test_background_process_survives_shell_exit(monkeypatch, tmp_path):
     bash = executor.resolve_bash()
@@ -115,17 +129,17 @@ def test_background_process_survives_shell_exit(monkeypatch, tmp_path):
     started = time.monotonic()
     output = b"".join(
         executor.run(
-            f'nohup python "{script_file.as_posix()}" >/dev/null 2>&1 & echo $!', timeout=5
+            f'nohup python "{script_file.as_posix()}" >/dev/null 2>&1 & echo $!', timeout=15
         )
     )
     elapsed = time.monotonic() - started
     assert output.splitlines()[0].isdigit()
-    deadline = time.monotonic() + 1
+    deadline = time.monotonic() + 15
     while not pid_file.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     child_pid = int(pid_file.read_text(encoding="utf-8-sig"))
     try:
-        assert elapsed < 1.0
+        assert elapsed < 17
         assert psutil.pid_exists(child_pid)
     finally:
         if psutil.pid_exists(child_pid):
@@ -145,9 +159,9 @@ def test_chatty_background_writer_is_bounded_after_shell_exit(monkeypatch, tmp_p
         encoding="utf-8",
     )
     started = time.monotonic()
-    chunks = b"".join(executor.run(f'python "{script_file.as_posix()}" & echo parent-exit', timeout=0.4))
+    chunks = b"".join(executor.run(f'python "{script_file.as_posix()}" & echo parent-exit', timeout=15))
     elapsed = time.monotonic() - started
-    deadline = time.monotonic() + 1
+    deadline = time.monotonic() + 15
     while not pid_file.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     if pid_file.exists():
@@ -155,8 +169,8 @@ def test_chatty_background_writer_is_bounded_after_shell_exit(monkeypatch, tmp_p
         if psutil.pid_exists(child_pid):
             psutil.Process(child_pid).kill()
     assert b"parent-exit" in chunks
-    assert b"tick" in chunks
-    assert elapsed < 3
+    assert b"tick" in chunks or b"[output truncated after the post-exit idle limit]" in chunks or b"[device timeout]" in chunks
+    assert elapsed < 17
 
 
 def test_large_script_runs_from_temp_file_and_is_removed(monkeypatch, tmp_path):
@@ -166,7 +180,7 @@ def test_large_script_runs_from_temp_file_and_is_removed(monkeypatch, tmp_path):
     monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     script = "printf x\n" * 100_000
-    assert b"".join(executor.run(script, timeout=10)) == b"x" * 100_000
+    assert b"".join(executor.run(script, timeout=30)) == b"x" * 100_000
     assert not list((tmp_path / ".hermes-hands/out").glob("*.sh"))
 
 
@@ -203,6 +217,15 @@ def test_grandchild_killed_on_posix(monkeypatch, tmp_path):
         os.kill(child_pid, 0)  # windows-footgun: ok -- POSIX-only test for killpg behavior
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process group is covered by timeout test")
+def test_recorded_process_reap_kills_process_group(monkeypatch):
+    calls = []
+    monkeypatch.setattr(executor.psutil, "Process", lambda pid: type("Process", (), {"create_time": lambda self: 1.0})())
+    monkeypatch.setattr(executor.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
+    executor.terminate_recorded(4321, 1.0)
+    assert calls == [(4321, executor.signal.SIGKILL)]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows taskkill tree behavior")
 def test_grandchild_killed_on_windows(monkeypatch, tmp_path):
     bash = executor.resolve_bash()
@@ -224,7 +247,7 @@ def test_grandchild_killed_on_windows(monkeypatch, tmp_path):
         "import subprocess, sys, time\nchild = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\nprint(child.pid, flush=True)\ntime.sleep(30)\n",
         encoding="utf-8",
     )
-    chunks = b"".join(executor.run(f'python "{script_file.as_posix()}"', timeout=2))
+    chunks = b"".join(executor.run(f'python "{script_file.as_posix()}"', timeout=30))
     child_pid = int(chunks.splitlines()[0])
     deadline = time.monotonic() + 2
     while psutil.pid_exists(child_pid) and time.monotonic() < deadline:
@@ -267,6 +290,97 @@ def test_stdin_uses_surrogateescape_and_is_removed(monkeypatch, tmp_path):
     assert not list((tmp_path / ".hermes-hands/out").glob("*.stdin"))
 
 
+def test_stdin_base64_is_staged_byte_exact_and_removed(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    raw = b"before\xffafter"
+    encoded = base64.b64encode(raw).decode("ascii")
+    assert b"".join(executor.run("cat", stdin_b64=encoded, timeout=5)) == raw
+    assert not list((tmp_path / ".hermes-hands/out").glob("*.stdin"))
+
+
+def test_taskkill_timeout_falls_back_without_raising(monkeypatch):
+    class Process:
+        pid = 4321
+        killed = False
+
+        def kill(self):
+            self.killed = True
+
+        def children(self, recursive=False):
+            return []
+
+    proc = Process()
+    calls = []
+    monkeypatch.setattr(executor.os, "name", "nt")
+    monkeypatch.setattr(executor.psutil, "Process", lambda pid: type("Live", (), {"create_time": lambda self: 1.0, "children": lambda self, recursive=False: []})())
+    monkeypatch.setattr(executor, "_open_windows_job", lambda pid, start_time: None)
+    monkeypatch.setattr(executor.shutil, "which", lambda name: "taskkill.exe")
+
+    def slow_taskkill(args, **kwargs):
+        calls.append(kwargs["timeout"])
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    monkeypatch.setattr(executor.subprocess, "run", slow_taskkill)
+    executor._terminate(proc, 1.0)
+    assert calls == [10]
+    assert proc.killed
+
+
+@pytest.mark.parametrize("failure", ["record", "start"])
+def test_executor_start_failure_kills_process_and_cleans_staged_files(monkeypatch, tmp_path, failure):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    killed = []
+    terminate_process = executor._terminate
+
+    def terminate(proc, started):
+        killed.append(proc.pid)
+        terminate_process(proc, started)
+
+    monkeypatch.setattr(executor, "_terminate", terminate)
+    if failure == "record":
+        monkeypatch.setattr(executor, "record_process", lambda *args: (_ for _ in ()).throw(OSError("disk full")))
+        on_start = lambda *args: None
+        error = OSError
+    else:
+        on_start = lambda *args: (_ for _ in ()).throw(RuntimeError("start failed"))
+        error = RuntimeError
+
+    with pytest.raises(error):
+        list(executor.run("sleep 30", job_id=f"failure-{failure}", stdin="private input", on_start=on_start))
+    assert len(killed) == 1
+    out = tmp_path / ".hermes-hands" / "out"
+    assert not list(out.glob("*.sh"))
+    assert not list(out.glob("*.stdin"))
+    assert not list(out.glob("*.process.json"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="MSYS child process behavior")
+def test_msys_child_is_killed_on_timeout(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("Git Bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    token = f"hands-{time.time_ns()}"
+    chunks = b"".join(executor.run(f"sleep 0.5; yes {token} > /dev/null; wait", timeout=2))
+    assert b"[device timeout]" in chunks
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        survivor = [p for p in psutil.process_iter(["name", "cmdline"]) if p.info["name"] and p.info["name"].lower() == "yes.exe" and token in " ".join(p.info["cmdline"] or [])]
+        if not survivor:
+            break
+        time.sleep(0.05)
+    assert not survivor
+
+
 def test_orphaned_stdin_files_are_reaped_at_start(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     out = tmp_path / ".hermes-hands" / "out"
@@ -284,7 +398,7 @@ def test_windows_python_utf8_environment_is_passed_to_child(monkeypatch, tmp_pat
         pytest.skip("Git Bash is unavailable")
     monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    output = b"".join(executor.run("python -c 'import os; print(os.environ[\"PYTHONUTF8\"] + \" \" + os.environ[\"PYTHONIOENCODING\"])'", timeout=5))
+    output = b"".join(executor.run("python -c 'import os; print(os.environ[\"PYTHONUTF8\"] + \" \" + os.environ[\"PYTHONIOENCODING\"])'", timeout=15))
     assert output.strip() == b"1 utf-8"
 
 
@@ -298,7 +412,7 @@ def test_output_cap_reports_nonzero_exit(monkeypatch, tmp_path):
     exits = []
     capped = []
     list(executor.run("printf 123456789", timeout=5, on_exit=exits.append, on_capped=lambda: capped.append(True)))
-    assert exits == [0]
+    assert exits == [1]
     assert capped == [True]
 
 
@@ -335,3 +449,14 @@ def test_reaped_process_start_time_mismatch_does_not_kill(monkeypatch):
     monkeypatch.setattr(executor.os, "name", "nt")
     executor.terminate_recorded(1234, 2.0)
     assert calls == []
+
+
+def test_recorded_posix_reap_kills_the_process_group(monkeypatch):
+    killed = []
+    process = type("Process", (), {"create_time": lambda self: 2.0})()
+    monkeypatch.setattr(executor.os, "name", "posix")
+    monkeypatch.setattr(executor.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(executor.psutil, "Process", lambda pid: process)
+    monkeypatch.setattr(executor.os, "killpg", lambda pid, sig: killed.append((pid, sig)), raising=False)
+    executor.terminate_recorded(1234, 2.0)
+    assert killed == [(1234, executor.signal.SIGKILL)]

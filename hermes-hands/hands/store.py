@@ -22,6 +22,8 @@ OFFLINE_AFTER = (
 )
 RELAY_STALE_AFTER = 15  # seconds; the relay writes its heartbeat row every 5
 TOMBSTONE_TTL = 7 * 24 * 3600  # seconds a revoked device's key can still be told to stop
+STOP_GRACE = 3600  # seconds the stop keeps being sent after the first one, in case it was lost
+RESERVED_NAME = "server"  # the gateway host's own target name; no device may take it
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -40,7 +42,7 @@ CREATE TABLE IF NOT EXISTS revoked_devices (
     device_id TEXT PRIMARY KEY,
     public_key TEXT NOT NULL,
     revoked_at INTEGER NOT NULL,
-    name TEXT NOT NULL DEFAULT ''
+    told_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS pairing_codes (
     code_hash TEXT PRIMARY KEY,
@@ -50,7 +52,8 @@ CREATE TABLE IF NOT EXISTS pairing_codes (
 );
 CREATE TABLE IF NOT EXISTS session_targets (
     session_key TEXT PRIMARY KEY,
-    target TEXT NOT NULL
+    target TEXT NOT NULL,
+    owner TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS session_marks (
     session_key TEXT PRIMARY KEY,
@@ -83,14 +86,18 @@ def _db() -> Iterator[sqlite3.Connection]:
     try:
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
-        if "name" not in {
-            row["name"] for row in conn.execute("PRAGMA table_info(revoked_devices)")
-        }:
-            conn.execute("ALTER TABLE revoked_devices ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+        # In place for a hands.db from an earlier version (CREATE TABLE IF NOT EXISTS keeps its tables).
+        _add_column(conn, "revoked_devices", "told_at", "INTEGER")
+        _add_column(conn, "session_targets", "owner", "TEXT NOT NULL DEFAULT ''")
         with conn:
             yield conn
     finally:
         conn.close()
+
+
+def _add_column(conn: sqlite3.Connection, table: str, column: str, kind: str) -> None:
+    if column not in {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
 
 def _code_hash(code: str) -> str:
@@ -153,6 +160,8 @@ def complete_pairing(
             raise PairingError(401, "bad_code")
         if row["name"] != name:
             raise PairingError(409, "name_mismatch", row["name"])
+        if name == RESERVED_NAME:
+            raise PairingError(409, "name_reserved", name)
         if conn.execute("SELECT 1 FROM devices WHERE name = ?", (name,)).fetchone() is not None:
             raise PairingError(409, "name_taken", name)
         device_id = secrets.token_hex(8)
@@ -162,7 +171,6 @@ def complete_pairing(
             " policy_ok, paired_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
             (device_id, name, public_key, os, home, policy_hash, policy_hash, now, now),
         )
-        conn.execute("DELETE FROM revoked_devices WHERE name = ?", (name,))
     return device_id
 
 
@@ -217,19 +225,26 @@ def record_seen(
 
 def revoked_key(device_id: str) -> bytes | None:
     """The public key a revoked device signs with (its tombstone), else None. A tombstone lasts
-    until the relay has told the device to stop, its name is paired again, or ``TOMBSTONE_TTL``."""
+    ``TOMBSTONE_TTL``, and ``STOP_GRACE`` after the first signed stop was sent: long enough for a
+    device whose stop reply was lost to ask again, short enough that the old key soon stops being a
+    token principal. Pairing the name again leaves it: the new device has a new device_id."""
+    now = int(time.time())
     with _db() as conn:
         row = conn.execute(
-            "SELECT public_key FROM revoked_devices WHERE device_id = ? AND revoked_at > ?",
-            (device_id, int(time.time()) - TOMBSTONE_TTL),
+            "SELECT public_key FROM revoked_devices WHERE device_id = ? AND revoked_at > ?"
+            " AND (told_at IS NULL OR told_at > ?)",
+            (device_id, now - TOMBSTONE_TTL, now - STOP_GRACE),
         ).fetchone()
     return None if row is None else protocol.unb64u(row["public_key"])
 
 
-def forget_revoked(device_id: str) -> None:
-    """Drop the tombstone once the device has been sent its signed ``unknown_device``."""
+def mark_told(device_id: str) -> None:
+    """Record when the device was first sent its signed ``unknown_device``."""
     with _db() as conn:
-        conn.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
+        conn.execute(
+            "UPDATE revoked_devices SET told_at = COALESCE(told_at, ?) WHERE device_id = ?",
+            (int(time.time()), device_id),
+        )
 
 
 def revoke(name: str) -> bool:
@@ -239,8 +254,8 @@ def revoke(name: str) -> bool:
     with _db() as conn:
         conn.execute("DELETE FROM revoked_devices WHERE revoked_at <= ?", (now - TOMBSTONE_TTL,))
         conn.execute(
-            "INSERT INTO revoked_devices (device_id, public_key, revoked_at, name)"
-            " SELECT device_id, public_key, ?, name FROM devices WHERE name = ?",
+            "INSERT INTO revoked_devices (device_id, public_key, revoked_at)"
+            " SELECT device_id, public_key, ? FROM devices WHERE name = ?",
             (now, name),
         )
         return conn.execute("DELETE FROM devices WHERE name = ?", (name,)).rowcount > 0
@@ -258,21 +273,23 @@ def accept_policy(name: str) -> bool:
         )
 
 
-def set_session_target(session_key: str, target: str) -> None:
+def set_session_target(session_key: str, target: str, owner: str = "local") -> None:
+    """Bind the session to ``target`` for ``owner`` (``targets.caller_id``), the person who chose it."""
     with _db() as conn:
         conn.execute(
-            "INSERT INTO session_targets (session_key, target) VALUES (?, ?)"
-            " ON CONFLICT(session_key) DO UPDATE SET target = excluded.target",
-            (session_key, target),
+            "INSERT INTO session_targets (session_key, target, owner) VALUES (?, ?, ?)"
+            " ON CONFLICT(session_key) DO UPDATE SET target = excluded.target, owner = excluded.owner",
+            (session_key, target, owner),
         )
 
 
-def get_session_target(session_key: str) -> str | None:
+def get_session_target(session_key: str) -> tuple[str, str] | None:
+    """``(target, owner)`` for the session; a row from before owners were recorded has owner ``""``."""
     with _db() as conn:
         row = conn.execute(
-            "SELECT target FROM session_targets WHERE session_key = ?", (session_key,)
+            "SELECT target, owner FROM session_targets WHERE session_key = ?", (session_key,)
         ).fetchone()
-    return None if row is None else row["target"]
+    return None if row is None else (row["target"], row["owner"])
 
 
 def get_last_run(session_key: str) -> str | None:

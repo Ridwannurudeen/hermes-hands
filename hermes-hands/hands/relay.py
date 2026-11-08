@@ -11,6 +11,7 @@ headers, path, body)``, device routes also the client address ``peer``, and retu
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import secrets
@@ -139,6 +140,8 @@ def _pairing_detail(exc: store.PairingError) -> str:
         return messages.pair_name_taken(exc.name)
     if exc.error == "name_mismatch":
         return messages.pair_name_mismatch(exc.name)
+    if exc.error == "name_reserved":
+        return messages.PAIR_NAME_RESERVED
     return messages.PAIR_BAD_CODE
 
 
@@ -202,13 +205,20 @@ class Relay:
 
     def _finish_locked(self, job: _Job, returncode: int, error: str) -> None:
         """End ``job`` for any reason but the device's own done; a job the device picked up is
-        also cancelled there, so abandoned work never keeps running on the device."""
+        also cancelled there, so abandoned work never keeps running on the device. A job it never
+        picked up leaves the queue now, so a device that never polls again holds no payload."""
         job.done, job.returncode, job.error = True, returncode, error
         self._wake_locked(job.job_id)
+        queue = self._queues.setdefault(job.device_id, deque())
         if job.picked:
             cancel = {"job_id": secrets.token_hex(8), "type": "cancel", "target_job_id": job.job_id}
-            self._queues.setdefault(job.device_id, deque()).append(cancel)
+            queue.append(cancel)
             self._wake_locked(job.device_id)
+        else:
+            for payload in [q for q in queue if q["job_id"] == job.job_id]:
+                queue.remove(payload)
+        if not queue:
+            del self._queues[job.device_id]
 
     def _cancel_locked(self, job: _Job) -> None:
         if not job.done:
@@ -273,10 +283,11 @@ class Relay:
                 pass  # that loop has closed, so nothing waits there any more
 
     def _take_locked(self, job: _Job, after: int) -> dict:
-        """Chunks from seq ``after`` on (older ones are freed); the job is dropped once done is handed out."""
+        """Chunks from seq ``after`` on (older ones are freed). A done job stays until ``_reap``, so a
+        fetch whose reply was lost gets the same final chunks and exit code again."""
         for seq in [s for s in job.chunks if s < after]:
             del job.chunks[seq]
-        out = {
+        return {
             "chunks": [job.chunks[s] for s in range(after, job.received)],
             "next": max(after, job.received),
             "done": job.done,
@@ -284,9 +295,6 @@ class Relay:
             "error": job.error if job.done else None,
             "png_b64": job.png_b64 if job.done else None,
         }
-        if job.done:
-            self._jobs.pop(job.job_id, None)
-        return out
 
     def _check_device(self, job: _Job) -> None:
         """Fail a job whose device was revoked, went offline or changed its deny-list, or whose agent
@@ -298,7 +306,10 @@ class Relay:
             name, picked = job.device_name, job.picked
             if device is None:
                 error = (messages.revoked if picked else messages.unknown_device)(name)
-            elif not device["policy_ok"]:
+                self._finish_locked(job, UNREACHABLE, error)
+                self._queues.pop(job.device_id, None)  # a revoked device never polls again
+                return
+            if not device["policy_ok"]:
                 error = (
                     messages.policy_changed_while_running if picked else messages.policy_changed
                 )(name)
@@ -362,7 +373,7 @@ class Relay:
         if not self._nonces.check_and_add(bearer.nonce, int(time.time())):
             return None, None, Reply.json(401, {"error": "replayed", "detail": messages.REPLAYED})
         if device is None:
-            store.forget_revoked(bearer.device_id)  # told once; after that core's seam refuses it
+            store.mark_told(bearer.device_id)  # it is told again until STOP_GRACE has passed
             return None, None, self._unknown(bearer.device_id, path, bearer.nonce, peer)
         return device, bearer.nonce, None
 
@@ -623,8 +634,30 @@ class Relay:
                     "login": bool(request.get("login", False)),
                     "timeout": int(request["timeout"]),
                 }
-                if request.get("stdin") is not None:
-                    extra["stdin"] = str(request["stdin"])
+                stdin_text = request.get("stdin", None)
+                stdin_b64 = request.get("stdin_b64", None)
+                if stdin_text is not None and stdin_b64 is not None:
+                    raise ValueError("stdin and stdin_b64")
+                file_op = request.get("file_op", False)
+                if not isinstance(file_op, bool):
+                    raise ValueError("file_op")
+                if stdin_b64 is not None:
+                    if not isinstance(stdin_b64, str):
+                        raise ValueError("stdin_b64")
+                    if len(stdin_b64) > 4 * -(-MAX_JOB_TEXT // 3):
+                        return Reply.json(
+                            413, {"error": "too_large", "detail": messages.JOB_TOO_LARGE}
+                        )
+                    if len(base64.b64decode(stdin_b64, validate=True)) > MAX_JOB_TEXT:
+                        return Reply.json(
+                            413, {"error": "too_large", "detail": messages.JOB_TOO_LARGE}
+                        )
+                    extra["stdin_b64"] = stdin_b64
+                elif stdin_text is not None:
+                    if not isinstance(stdin_text, str):
+                        raise ValueError("stdin")
+                    extra["stdin"] = stdin_text
+                extra["file_op"] = file_op
             elif kind == "screenshot":
                 extra = {}
             else:

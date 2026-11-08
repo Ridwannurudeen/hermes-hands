@@ -65,8 +65,19 @@ def test_policy_blocks_hermes_cli_commands_from_jobs():
         assert policy.refusal(script), script
 
 
-def test_policy_does_not_normalize_json_or_refuse_home_subpaths():
+def test_policy_does_not_normalize_json_or_refuse_home_subpaths(tmp_path, monkeypatch):
+    monkeypatch.setattr("hermeshands_device.config.POLICY_PATH", tmp_path / "policy.json")
     assert policy.refusal("curl https://localhost -d '{\"model\": \"llama3\", \"format\": \"json\", \"prompt\": \"hi\"}'") is None
+    assert policy.refusal("curl -d '{\"format\": \"json\"}' https://api.example.test/v1") is None
+    assert policy.refusal("git log --pretty=format:%h") is None
+    assert policy.refusal("ruff format src/") is None
+    assert policy.refusal("format C:")
+    assert policy.refusal("format.com C:")
+    assert policy.refusal("format X: /FS:NTFS")
+    assert policy.refusal("cmd /c format C:")
+    assert policy.refusal("cmd.exe /c format.com C:")
+    assert policy.refusal(r"C:\Windows\System32\format.com C:")
+    assert policy.refusal("format.exe C:") is None
     assert policy.refusal("python -c \"json.dumps({'format': 'x', 'b': 2})\"") is None
     assert policy.refusal("rm -rf ~/projects/app/node_modules") is None
     assert policy.refusal("rm -rf ~/.cache/pip") is None
