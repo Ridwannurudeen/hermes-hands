@@ -33,7 +33,7 @@ jobs:
           python -m pip install uv
           python -c 'import sys,tomllib; print("\n".join(tomllib.load(open(sys.argv[1], "rb")).get("tool", {}).get("uv", {}).get("override-dependencies", [])))' hermes-agent/pyproject.toml > "$RUNNER_TEMP/core-overrides.txt"
           python -m uv venv .venv
-          python -m uv pip install --python .venv --override "$RUNNER_TEMP/core-overrides.txt" -e ./hermes-agent -e ./hermes-hands/device pytest pytest-asyncio ruamel.yaml
+          python -m uv pip install --python .venv --override "$RUNNER_TEMP/core-overrides.txt" -e ./hermes-agent -e ./hermes-hands/device pytest pytest-asyncio pyyaml ruamel.yaml
           python -c 'import os,sys; p=".venv/Scripts" if os.name == "nt" else ".venv/bin"; open(os.environ["GITHUB_PATH"], "a", encoding="utf-8").write(os.path.abspath(p)+os.linesep)'
       - name: Validate plugin and doctor
         shell: bash
