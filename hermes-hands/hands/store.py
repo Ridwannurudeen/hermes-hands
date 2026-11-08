@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import secrets
 import sqlite3
 import time
@@ -36,7 +37,13 @@ CREATE TABLE IF NOT EXISTS devices (
     reported_policy_hash TEXT NOT NULL,
     policy_ok INTEGER NOT NULL DEFAULT 1,
     paired_at INTEGER NOT NULL,
-    last_seen INTEGER NOT NULL
+    last_seen INTEGER NOT NULL,
+    agent_version TEXT,
+    instance TEXT,
+    witness INTEGER NOT NULL DEFAULT 0,
+    session_state TEXT NOT NULL DEFAULT 'normal',
+    capabilities TEXT NOT NULL DEFAULT '[]',
+    session_ended_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS revoked_devices (
     device_id TEXT PRIMARY KEY,
@@ -89,6 +96,12 @@ def _db() -> Iterator[sqlite3.Connection]:
         # In place for a hands.db from an earlier version (CREATE TABLE IF NOT EXISTS keeps its tables).
         _add_column(conn, "revoked_devices", "told_at", "INTEGER")
         _add_column(conn, "session_targets", "owner", "TEXT NOT NULL DEFAULT ''")
+        _add_column(conn, "devices", "agent_version", "TEXT")
+        _add_column(conn, "devices", "instance", "TEXT")
+        _add_column(conn, "devices", "witness", "INTEGER NOT NULL DEFAULT 0")
+        _add_column(conn, "devices", "session_state", "TEXT NOT NULL DEFAULT 'normal'")
+        _add_column(conn, "devices", "capabilities", "TEXT NOT NULL DEFAULT '[]'")
+        _add_column(conn, "devices", "session_ended_at", "INTEGER")
         with conn:
             yield conn
     finally:
@@ -197,6 +210,12 @@ def device_by_id(device_id: str) -> dict | None:
         **_public(row, int(time.time())),
         "public_key": protocol.unb64u(row["public_key"]),
         "policy_hash": row["policy_hash"],
+        "agent_version": row["agent_version"],
+        "instance": row["instance"],
+        "witness": bool(row["witness"]),
+        "session_state": row["session_state"],
+        "capabilities": json.loads(row["capabilities"]),
+        "session_ended_at": row["session_ended_at"],
     }
 
 
@@ -206,16 +225,74 @@ def record_seen(
     policy_hash: str | None = None,
     os: str | None = None,
     home: str | None = None,
+    agent_version: str | None = None,
+    instance: str | None = None,
+    witness: bool | None = None,
+    session_state: str | None = None,
+    capabilities: list[str] | None = None,
 ) -> bool | None:
     """Mark the device seen now with what it reported; a policy hash different from the accepted one
-    turns ``policy_ok`` off until :func:`accept_policy`. Returns ``policy_ok``, or None if unknown."""
+    turns ``policy_ok`` off until :func:`accept_policy`. Witness state and capabilities are committed
+    with last-seen in the same transaction. Returns ``policy_ok``, or None if unknown."""
+    capabilities_json = (
+        None
+        if capabilities is None
+        else json.dumps(capabilities, ensure_ascii=False, separators=(",", ":"))
+    )
+    now = int(time.time())
     with _db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT instance, witness, session_state, capabilities, session_ended_at"
+            " FROM devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if current is None:
+            return None
+
+        next_witness = witness
+        next_session_state = session_state
+        next_capabilities = capabilities_json
+        session_ended_at = current["session_ended_at"]
+        new_instance = instance is not None and instance != current["instance"]
+        same_instance = instance is None or instance == current["instance"]
+        if session_state is not None:
+            if current["session_state"] in ("stopping", "stopped") and session_state in (
+                "normal",
+                "active",
+            ) and same_instance:
+                next_witness = bool(current["witness"])
+                next_session_state = current["session_state"]
+                next_capabilities = current["capabilities"]
+            else:
+                if session_state in ("stopping", "stopped"):
+                    next_witness = False
+                    session_ended_at = session_ended_at or now
+                elif session_state == "active" and new_instance:
+                    session_ended_at = None
+
         conn.execute(
             "UPDATE devices SET last_seen = ?, os = COALESCE(?, os), home = COALESCE(?, home),"
             " reported_policy_hash = COALESCE(?, reported_policy_hash),"
             " policy_ok = CASE WHEN ? IS NOT NULL AND ? != policy_hash THEN 0 ELSE policy_ok END"
-            " WHERE device_id = ?",
-            (int(time.time()), os, home, policy_hash, policy_hash, policy_hash, device_id),
+            ", agent_version = COALESCE(?, agent_version), instance = COALESCE(?, instance),"
+            " witness = COALESCE(?, witness), session_state = COALESCE(?, session_state),"
+            " capabilities = COALESCE(?, capabilities), session_ended_at = ? WHERE device_id = ?",
+            (
+                now,
+                os,
+                home,
+                policy_hash,
+                policy_hash,
+                policy_hash,
+                agent_version,
+                instance,
+                None if next_witness is None else int(next_witness),
+                next_session_state,
+                next_capabilities,
+                session_ended_at,
+                device_id,
+            ),
         )
         row = conn.execute(
             "SELECT policy_ok FROM devices WHERE device_id = ?", (device_id,)

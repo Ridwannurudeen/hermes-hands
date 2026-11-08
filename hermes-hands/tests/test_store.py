@@ -229,3 +229,66 @@ def test_relay_heartbeat(hands_db, monkeypatch):
     assert store.relay_alive() is True
     monkeypatch.setattr(time, "time", lambda: 10**10)
     assert store.relay_alive() is False
+def test_old_device_table_gains_witness_state_columns_with_safe_defaults(hands_db):
+    conn = sqlite3.connect(hands_db / "hands.db")
+    conn.execute(
+        "CREATE TABLE devices (device_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,"
+        " public_key TEXT NOT NULL, os TEXT NOT NULL, home TEXT NOT NULL,"
+        " policy_hash TEXT NOT NULL, reported_policy_hash TEXT NOT NULL,"
+        " policy_ok INTEGER NOT NULL DEFAULT 1, paired_at INTEGER NOT NULL,"
+        " last_seen INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO devices VALUES ('d1', 'laptop', ?, 'Linux', '/home/r', 'p0', 'p0', 1, 1, 1)",
+        (protocol.b64u(b"k" * 32),),
+    )
+    conn.commit()
+    conn.close()
+
+    device = store.device_by_id("d1")
+    assert device["witness"] is False
+    assert device["session_state"] == "normal"
+    assert device["capabilities"] == []
+    assert device["instance"] is None
+    assert device["agent_version"] is None
+    assert device["session_ended_at"] is None
+
+
+def test_record_seen_persists_witness_state_and_stop_time(hands_db):
+    device_id = _pair()
+    assert (
+        store.record_seen(
+            device_id,
+            policy_hash="p0",
+            instance="instance-1",
+            agent_version="0.2.0",
+            witness=True,
+            session_state="active",
+            capabilities=["witness-v1", "checkup-v1"],
+        )
+        is True
+    )
+    active = store.device_by_id(device_id)
+    assert active["witness"] is True
+    assert active["session_state"] == "active"
+    assert active["capabilities"] == ["witness-v1", "checkup-v1"]
+    assert active["instance"] == "instance-1"
+    assert active["agent_version"] == "0.2.0"
+    assert active["session_ended_at"] is None
+
+    assert (
+        store.record_seen(
+            device_id,
+            policy_hash="p0",
+            instance="instance-1",
+            witness=True,
+            session_state="stopping",
+            capabilities=["witness-v1", "checkup-v1"],
+        )
+        is True
+    )
+    stopping = store.device_by_id(device_id)
+    assert stopping["witness"] is False
+    assert stopping["session_state"] == "stopping"
+    assert stopping["capabilities"] == ["witness-v1", "checkup-v1"]
+    assert isinstance(stopping["session_ended_at"], int)

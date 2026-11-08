@@ -61,6 +61,9 @@ _INSTANCE_QUIET = (
     10  # seconds without contact before a job's agent counts as gone (it heartbeats every 5)
 )
 _INSTANCE_FORGOTTEN = 60  # seconds before a silent agent instance is no longer remembered
+_SESSION_STATES = {"normal", "active", "stopping", "stopped"}
+_STOPPING_STATES = {"stopping", "stopped"}
+_CAPABILITIES = {"witness-v1", "checkup-v1", "help-v1", "receipt-v1"}
 
 logger = logging.getLogger(__name__)
 
@@ -110,12 +113,14 @@ class _Job:
     job_id: str
     device_id: str
     device_name: str
+    job_type: str = "exec"
     chunks: dict[int, str] = field(default_factory=dict)  # by device seq, not yet handed out
     received: int = 0  # device seqs 0..received-1 have all arrived
     final_seq: int | None = None
     returncode: int | None = None
     error: str | None = None
     png_b64: str | None = None
+    checkup: dict | None = None
     done: bool = False
     picked: bool = False
     instance: str | None = None  # the agent process that picked it, when the poll named one
@@ -133,6 +138,56 @@ def _has(principal, scope: str) -> bool:
 def _bearer(headers) -> str:
     scheme, _, token = headers.get("authorization", "").partition(" ")
     return token.strip() if scheme.strip().lower() == "bearer" else ""
+
+
+def _optional_string(request: dict, key: str) -> str | None:
+    if key not in request:
+        return None
+    value = request[key]
+    if not isinstance(value, str):
+        raise ValueError(key)
+    return value
+
+
+def _required_string(request: dict, key: str) -> str:
+    value = request.get(key)
+    if not isinstance(value, str):
+        raise ValueError(key)
+    return value
+
+
+def _witness_fields(request: dict) -> tuple[bool, str, list[str]]:
+    if "witness" not in request:
+        state = request.get("session_state", "normal")
+        capabilities = request.get("capabilities", [])
+        if not isinstance(state, str) or state not in _SESSION_STATES:
+            raise ValueError("session_state")
+        if not isinstance(capabilities, list) or any(
+            not isinstance(capability, str) or capability not in _CAPABILITIES
+            for capability in capabilities
+        ):
+            raise ValueError("capabilities")
+        if len(capabilities) != len(set(capabilities)):
+            raise ValueError("duplicate capability")
+        return False, "normal", []
+
+    witness = request["witness"]
+    state = request.get("session_state")
+    capabilities = request.get("capabilities")
+    if type(witness) is not bool:
+        raise ValueError("witness")
+    if not isinstance(state, str) or state not in _SESSION_STATES:
+        raise ValueError("session_state")
+    if not isinstance(capabilities, list) or any(
+        not isinstance(capability, str) or capability not in _CAPABILITIES
+        for capability in capabilities
+    ):
+        raise ValueError("capabilities")
+    if len(capabilities) != len(set(capabilities)):
+        raise ValueError("duplicate capability")
+    if (state == "active") != witness and state not in _STOPPING_STATES:
+        raise ValueError("witness session_state")
+    return witness, state, capabilities
 
 
 def _pairing_detail(exc: store.PairingError) -> str:
@@ -210,7 +265,7 @@ class Relay:
         job.done, job.returncode, job.error = True, returncode, error
         self._wake_locked(job.job_id)
         queue = self._queues.setdefault(job.device_id, deque())
-        if job.picked:
+        if job.picked and self._accepting_work_locked(job.device_id):
             cancel = {"job_id": secrets.token_hex(8), "type": "cancel", "target_job_id": job.job_id}
             queue.append(cancel)
             self._wake_locked(job.device_id)
@@ -219,6 +274,28 @@ class Relay:
                 queue.remove(payload)
         if not queue:
             del self._queues[job.device_id]
+
+    def _accepting_work_locked(self, device_id: str) -> bool:
+        device = store.device_by_id(device_id)
+        return device is not None and device["session_state"] not in _STOPPING_STATES
+
+    def _stop_device_locked(self, device_id: str) -> None:
+        """Fail queued work and wake parked polls after the stored session enters STOPPING."""
+        self._supersede_polls_locked(device_id, [instance for dev, instance in self._polls if dev == device_id])
+        self._queues.pop(device_id, None)
+        for job in self._jobs.values():
+            if job.device_id == device_id and not job.done and not job.picked:
+                job.done, job.returncode, job.error = True, 130, "stopped_by_person"
+                self._wake_locked(job.job_id)
+
+    def _record_seen(self, device_id: str, **fields) -> tuple[bool | None, dict | None]:
+        """Persist a signed device update and stop queued work under the same relay lock."""
+        with self._lock:
+            ok = store.record_seen(device_id, **fields)
+            saved = store.device_by_id(device_id)
+            if saved is not None and saved["session_state"] in _STOPPING_STATES:
+                self._stop_device_locked(device_id)
+            return ok, saved
 
     def _cancel_locked(self, job: _Job) -> None:
         if not job.done:
@@ -287,7 +364,7 @@ class Relay:
         fetch whose reply was lost gets the same final chunks and exit code again."""
         for seq in [s for s in job.chunks if s < after]:
             del job.chunks[seq]
-        return {
+        output = {
             "chunks": [job.chunks[s] for s in range(after, job.received)],
             "next": max(after, job.received),
             "done": job.done,
@@ -295,6 +372,9 @@ class Relay:
             "error": job.error if job.done else None,
             "png_b64": job.png_b64 if job.done else None,
         }
+        if job.done and job.checkup is not None:
+            output["checkup"] = job.checkup
+        return output
 
     def _check_device(self, job: _Job) -> None:
         """Fail a job whose device was revoked, went offline or changed its deny-list, or whose agent
@@ -498,18 +578,24 @@ class Relay:
             return refusal
         try:
             request = json.loads(body)
-            wait = min(max(int(request.get("wait", MAX_POLL_WAIT)), 0), MAX_POLL_WAIT)
-            instance = None if request.get("instance") is None else str(request["instance"])
-            policy_hash = (
-                None if request.get("policy_hash") is None else str(request["policy_hash"])
-            )
+            if not isinstance(request, dict) or type(request.get("wait")) is not int:
+                raise ValueError("wait")
+            wait = min(max(request["wait"], 0), MAX_POLL_WAIT)
+            instance = _optional_string(request, "instance")
+            policy_hash = _optional_string(request, "policy_hash")
+            witness, session_state, capabilities = _witness_fields(request)
         except (ValueError, TypeError, AttributeError):
             return self._signed(
                 400, {"error": "bad_request", "detail": messages.BAD_REQUEST}, path, nonce
             )
-        # A job reply to a poll that carried a hash tells the device that hash is the accepted one.
-        ok = await asyncio.to_thread(
-            store.record_seen, device["device_id"], policy_hash=policy_hash
+        ok, _ = await asyncio.to_thread(
+            self._record_seen,
+            device["device_id"],
+            policy_hash=policy_hash,
+            instance=instance,
+            witness=witness,
+            session_state=session_state,
+            capabilities=capabilities,
         )
         refusal = self._seen_refusal(ok, device, path, nonce, peer)
         if refusal is not None:
@@ -517,6 +603,9 @@ class Relay:
         self._note_instance(device, instance)
         device_id, deadline = device["device_id"], time.monotonic() + wait
         with self._lock:
+            saved = store.device_by_id(device_id)
+            if saved is None or saved["session_state"] in _STOPPING_STATES:
+                return Reply(204)
             self._supersede_polls_locked(device_id, [instance])
             generation = self._polls[(device_id, instance)]
         while True:
@@ -543,22 +632,41 @@ class Relay:
             return refusal
         try:
             result = json.loads(body)
-            job_id, seq, chunk = (
-                str(result["job_id"]),
-                int(result["seq"]),
-                str(result.get("chunk", "")),
-            )
-            done, policy_hash = bool(result["done"]), str(result["policy_hash"])
-            returncode = None if result.get("returncode") is None else int(result["returncode"])
-            error, png_b64 = result.get("error"), result.get("png_b64")
-            if seq < 0 or (png_b64 is not None and not isinstance(png_b64, str)):
-                raise ValueError("bad seq or png_b64")
+            if not isinstance(result, dict):
+                raise ValueError("body")
+            job_id = _required_string(result, "job_id")
+            seq = result.get("seq")
+            chunk = _required_string(result, "chunk")
+            done = result.get("done")
+            policy_hash = _required_string(result, "policy_hash")
+            if type(seq) is not int or seq < 0 or type(done) is not bool:
+                raise ValueError("bad seq")
+            if done:
+                returncode = result.get("returncode")
+                error = result.get("error")
+                if (
+                    type(returncode) is not int
+                    or ("error" not in result and device["capabilities"])
+                    or (error is not None and not isinstance(error, str))
+                ):
+                    raise ValueError("bad final result")
+            elif "returncode" in result or "error" in result:
+                raise ValueError("non-final result has final fields")
+            else:
+                returncode, error = None, None
+            png_b64 = result.get("png_b64")
+            if "png_b64" in result and (not done or not isinstance(png_b64, str)):
+                raise ValueError("bad png_b64")
+            has_checkup = "checkup" in result
+            checkup = result.get("checkup")
+            if has_checkup and (not done or not isinstance(checkup, dict)):
+                raise ValueError("bad checkup")
         except (ValueError, KeyError, TypeError, AttributeError):
             return self._signed(
                 400, {"error": "bad_request", "detail": messages.BAD_REQUEST}, path, nonce
             )
-        ok = await asyncio.to_thread(
-            store.record_seen, device["device_id"], policy_hash=policy_hash
+        ok, _ = await asyncio.to_thread(
+            self._record_seen, device["device_id"], policy_hash=policy_hash
         )
         refusal = self._seen_refusal(ok, device, path, nonce, peer)
         if refusal is not None:
@@ -567,6 +675,12 @@ class Relay:
             job = self._jobs.get(job_id)
             if job is None or job.device_id != device["device_id"] or job.done:
                 return self._signed(200, {"ok": True, "cancel": True}, path, nonce)
+            if (has_checkup and job.job_type != "checkup") or (
+                job.job_type == "checkup" and png_b64 is not None
+            ):
+                return self._signed(
+                    400, {"error": "bad_request", "detail": messages.BAD_REQUEST}, path, nonce
+                )
             if png_b64 is not None and len(png_b64) > _MAX_PNG_B64:
                 self._finish_locked(job, UNREACHABLE, messages.SCREENSHOT_TOO_LARGE)
                 return self._signed(
@@ -579,7 +693,7 @@ class Relay:
                 job.chunks[seq] = chunk
                 if done:
                     job.final_seq, job.returncode = seq, returncode
-                    job.error, job.png_b64 = (str(error) if error else None), png_b64
+                    job.error, job.png_b64, job.checkup = error, png_b64, checkup
                 while job.received in job.chunks:
                     job.received += 1
                 if job.final_seq is not None and job.received > job.final_seq:
@@ -597,14 +711,29 @@ class Relay:
             return refusal
         try:
             beat = json.loads(body)
-            policy_hash, device_os, home = (str(beat[k]) for k in ("policy_hash", "os", "home"))
-            instance = None if beat.get("instance") is None else str(beat["instance"])
+            if not isinstance(beat, dict):
+                raise ValueError("body")
+            policy_hash = _required_string(beat, "policy_hash")
+            device_os = _required_string(beat, "os")
+            home = _required_string(beat, "home")
+            agent_version = _required_string(beat, "agent_version")
+            instance = _optional_string(beat, "instance")
+            witness, session_state, capabilities = _witness_fields(beat)
         except (ValueError, KeyError, TypeError, AttributeError):
             return self._signed(
                 400, {"error": "bad_request", "detail": messages.BAD_REQUEST}, path, nonce
             )
-        ok = await asyncio.to_thread(
-            store.record_seen, device["device_id"], policy_hash=policy_hash, os=device_os, home=home
+        ok, _ = await asyncio.to_thread(
+            self._record_seen,
+            device["device_id"],
+            policy_hash=policy_hash,
+            os=device_os,
+            home=home,
+            agent_version=agent_version,
+            instance=instance,
+            witness=witness,
+            session_state=session_state,
+            capabilities=capabilities,
         )
         refusal = self._seen_refusal(ok, device, path, nonce, peer)
         if refusal is not None:
@@ -627,6 +756,8 @@ class Relay:
             return refusal
         try:
             request = json.loads(body)
+            if not isinstance(request, dict):
+                raise ValueError("body")
             name, kind = str(request["device"]), str(request.get("type", "exec"))
             if kind == "exec":
                 extra = {
@@ -658,6 +789,10 @@ class Relay:
                         raise ValueError("stdin")
                     extra["stdin"] = stdin_text
                 extra["file_op"] = file_op
+            elif kind == "checkup":
+                if set(request) != {"device", "type"}:
+                    raise ValueError("checkup arguments")
+                extra = {}
             elif kind == "screenshot":
                 extra = {}
             else:
@@ -666,23 +801,44 @@ class Relay:
             return Reply.json(400, {"error": "bad_request", "detail": messages.BAD_REQUEST})
         if any(len(extra.get(key, "")) > MAX_JOB_TEXT for key in ("script", "stdin")):
             return Reply.json(413, {"error": "too_large", "detail": messages.JOB_TOO_LARGE})
-        device = await asyncio.to_thread(store.get_device, name)
-        if device is None:
-            return Reply.json(
-                404, {"error": "unknown_device", "detail": messages.unknown_device(name)}
-            )
-        if not device["policy_ok"]:
-            return Reply.json(
-                409, {"error": "policy_changed", "detail": messages.policy_changed(name)}
-            )
-        if not device["online"]:
-            return Reply.json(409, {"error": "offline", "detail": messages.offline(name)})
         job_id = secrets.token_hex(8)
         payload = {"job_id": job_id, "type": kind, **extra}
         with self._lock:
-            self._jobs[job_id] = _Job(job_id, device["device_id"], name)
-            self._queues.setdefault(device["device_id"], deque()).append(payload)
-            self._wake_locked(device["device_id"])
+            device = store.get_device(name)
+            if device is None:
+                return Reply.json(
+                    404, {"error": "unknown_device", "detail": messages.unknown_device(name)}
+                )
+            stored = store.device_by_id(device["device_id"])
+            if stored is None:
+                return Reply.json(
+                    404, {"error": "unknown_device", "detail": messages.unknown_device(name)}
+                )
+            if stored["session_state"] in _STOPPING_STATES:
+                return Reply.json(
+                    409,
+                    {
+                        "error": "stopped_by_person",
+                        "detail": "hands: this device session has stopped.",
+                    },
+                )
+            if not stored["policy_ok"]:
+                return Reply.json(
+                    409, {"error": "policy_changed", "detail": messages.policy_changed(name)}
+                )
+            if not stored["online"]:
+                return Reply.json(409, {"error": "offline", "detail": messages.offline(name)})
+            if kind == "checkup" and "checkup-v1" not in stored["capabilities"]:
+                return Reply.json(
+                    409,
+                    {
+                        "error": "unsupported_capability",
+                        "detail": "hands: this device does not advertise checkup-v1.",
+                    },
+                )
+            self._jobs[job_id] = _Job(job_id, stored["device_id"], name, job_type=kind)
+            self._queues.setdefault(stored["device_id"], deque()).append(payload)
+            self._wake_locked(stored["device_id"])
         return Reply.json(200, {"job_id": job_id})
 
     async def local_output(self, principal, headers, path: str, body: bytes) -> Reply:

@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from hands import messages, protocol, relay, store
+from hands import client, messages, protocol, relay, store
 from hands_fakes import LOCAL, Device, Principal, hands_db  # noqa: F401  (fixture)
 
 SEED = "0f" * 32
@@ -116,6 +116,556 @@ def test_exec_round_trip_in_seq_order(hub):
 def test_poll_times_out_with_204(hub):
     reply, _, _ = device_call(hub, Device(), "device_poll", "/device/poll", {"wait": 0})
     assert (reply.status, reply.body) == (204, b"")
+def witness_fields(*, witness=True, session_state="active", capabilities=None):
+    return {
+        "witness": witness,
+        "session_state": session_state,
+        "capabilities": (
+            ["witness-v1", "checkup-v1", "help-v1", "receipt-v1"] if capabilities is None else capabilities
+        ),
+    }
+
+
+def test_derive_keys_is_stable_and_separates_labels():
+    a, b = relay.derive_keys(SEED), relay.derive_keys(SEED)
+    assert a == b and a != relay.derive_keys("1" + SEED[1:])
+    assert len(a.relay_private) == 32 and len(a.relay_public) == 32
+    assert protocol.verify(a.relay_public, protocol.sign(a.relay_private, b"m"), b"m")
+    assert protocol.unb64u(a.local_bearer) != a.relay_private
+
+
+def test_exec_round_trip_in_seq_order(hub):
+    device = Device()
+    job_id = body(local(hub, "local_exec", {"device": "laptop", "script": "echo hi", "timeout": 30}))["job_id"]
+    reply, path, headers = device_call(hub, device, "device_poll", "/device/poll", {"wait": 1})
+    bearer_nonce = protocol.parse_bearer(headers["authorization"].split(" ", 1)[1]).nonce
+    job = verified(hub, reply, path, nonce=bearer_nonce)
+    assert job == {
+        "job_id": job_id,
+        "type": "exec",
+        "script": "echo hi",
+        "login": False,
+        "timeout": 30,
+        "file_op": False,
+    }
+    assert post_result(hub, device, job_id, 1, "world")[0].status == 200  # out of order: buffered
+    reply, path = post_result(hub, device, job_id, 0, "hello ")
+    assert verified(hub, reply, path) == {"ok": True, "cancel": False}
+    first = body(local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 0}))
+    assert (first["chunks"], first["next"], first["done"]) == (
+        ["hello ", "world"],
+        2,
+        False,
+    )
+    post_result(hub, device, job_id, 2, "", done=True, returncode=3)
+    post_result(hub, device, job_id, 2, "dup", done=True, returncode=9)
+    last = body(local(hub, "local_output", {"job_id": job_id, "after": 2, "wait": 1}))
+    assert (last["chunks"], last["done"], last["returncode"], last["error"]) == (
+        [""],
+        True,
+        3,
+        None,
+    )
+    # R63: the done reply can be fetched again (its first reply may have been lost), until _reap.
+    again = body(local(hub, "local_output", {"job_id": job_id, "after": 2, "wait": 0}))
+    assert again == last
+
+
+def test_poll_times_out_with_204(hub):
+    reply, _, _ = device_call(hub, Device(), "device_poll", "/device/poll", {"wait": 0})
+    assert (reply.status, reply.body) == (204, b"")
+
+
+@pytest.mark.parametrize(
+    ("handler", "route", "payload"),
+    [
+        (
+            "device_poll",
+            "/device/poll",
+            {"wait": True, "policy_hash": "p0", "instance": "i1", **witness_fields()},
+        ),
+        (
+            "device_poll",
+            "/device/poll",
+            {"wait": 0, "policy_hash": 1, "instance": "i1", **witness_fields()},
+        ),
+        (
+            "device_poll",
+            "/device/poll",
+            {"wait": 0, "policy_hash": None, "instance": "i1", **witness_fields()},
+        ),
+        (
+            "device_poll",
+            "/device/poll",
+            {"wait": 0, "policy_hash": "p0", "instance": 1, **witness_fields()},
+        ),
+        (
+            "device_poll",
+            "/device/poll",
+            {
+                "wait": 0,
+                "policy_hash": "p0",
+                "instance": "i1",
+                "witness": "true",
+                "session_state": "active",
+                "capabilities": [],
+            },
+        ),
+        (
+            "device_poll",
+            "/device/poll",
+            {
+                "wait": 0,
+                "policy_hash": "p0",
+                "instance": "i1",
+                "witness": True,
+                "session_state": "paused",
+                "capabilities": [],
+            },
+        ),
+        (
+            "device_poll",
+            "/device/poll",
+            {
+                "wait": 0,
+                "policy_hash": "p0",
+                "instance": "i1",
+                "witness": True,
+                "session_state": "active",
+                "capabilities": "checkup-v1",
+            },
+        ),
+        (
+            "device_poll",
+            "/device/poll",
+            {
+                "wait": 0,
+                "policy_hash": "p0",
+                "instance": "i1",
+                "witness": True,
+                "session_state": "active",
+                "capabilities": ["unknown-v1"],
+            },
+        ),
+        (
+            "device_heartbeat",
+            "/device/heartbeat",
+            {
+                "policy_hash": "p0",
+                "os": 1,
+                "home": "/home/r",
+                "agent_version": "0.2.0",
+                "instance": "i1",
+                **witness_fields(),
+            },
+        ),
+        (
+            "device_heartbeat",
+            "/device/heartbeat",
+            {
+                "policy_hash": "p0",
+                "os": "Linux",
+                "home": "/home/r",
+                "agent_version": "0.2.0",
+                "instance": "i1",
+                "witness": True,
+                "session_state": "active",
+                "capabilities": [1],
+            },
+        ),
+        (
+            "device_heartbeat",
+            "/device/heartbeat",
+            {
+                "policy_hash": 1,
+                "os": "Linux",
+                "home": "/home/r",
+                "agent_version": "0.2.0",
+                "instance": "i1",
+                **witness_fields(),
+            },
+        ),
+        (
+            "device_heartbeat",
+            "/device/heartbeat",
+            {
+                "policy_hash": "p0",
+                "os": "Linux",
+                "home": 1,
+                "agent_version": "0.2.0",
+                "instance": "i1",
+                **witness_fields(),
+            },
+        ),
+        (
+            "device_heartbeat",
+            "/device/heartbeat",
+            {
+                "policy_hash": "p0",
+                "os": "Linux",
+                "home": "/home/r",
+                "agent_version": 2,
+                "instance": "i1",
+                **witness_fields(),
+            },
+        ),
+        (
+            "device_heartbeat",
+            "/device/heartbeat",
+            {
+                "policy_hash": "p0",
+                "os": "Linux",
+                "home": "/home/r",
+                "agent_version": "0.2.0",
+                "instance": 1,
+                **witness_fields(),
+            },
+        ),
+        (
+            "device_heartbeat",
+            "/device/heartbeat",
+            {
+                "policy_hash": "p0",
+                "os": "Linux",
+                "home": "/home/r",
+                "agent_version": "0.2.0",
+                "instance": "i1",
+                "witness": True,
+                "session_state": 1,
+                "capabilities": [],
+            },
+        ),
+        (
+            "device_heartbeat",
+            "/device/heartbeat",
+            {
+                "policy_hash": "p0",
+                "os": "Linux",
+                "home": "/home/r",
+                "instance": "i1",
+                **witness_fields(),
+            },
+        ),
+    ],
+)
+def test_poll_and_heartbeat_reject_wrong_json_types(hub, handler, route, payload):
+    device = Device()
+    reply, path, headers = device_call(hub, device, handler, route, payload)
+    assert reply.status == 400
+    assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "bad_request"
+    saved = store.device_by_id(device.device_id)
+    assert saved["witness"] is False
+    assert saved["session_state"] == "normal"
+    assert saved["capabilities"] == []
+
+
+@pytest.mark.parametrize("route", ["/device/poll", "/device/heartbeat"])
+def test_signed_poll_and_heartbeat_persist_witness_fields_and_last_seen(hub, monkeypatch, route):
+    device = Device()
+    previous = store.device_by_id(device.device_id)["last_seen"]
+    seen_at = previous + 20
+    monkeypatch.setattr(store.time, "time", lambda: seen_at)
+    fields = {
+        "policy_hash": "p0",
+        "instance": "instance-1",
+        **witness_fields(capabilities=["witness-v1", "checkup-v1"]),
+    }
+    if route == "/device/poll":
+        payload = {"wait": 0, **fields}
+        handler = "device_poll"
+    else:
+        payload = {
+            **fields,
+            "os": "Linux",
+            "home": "/home/r",
+            "agent_version": "0.2.0",
+        }
+        handler = "device_heartbeat"
+
+    reply, _, _ = device_call(hub, device, handler, route, payload)
+    assert reply.status == (204 if route == "/device/poll" else 200)
+    saved = store.device_by_id(device.device_id)
+    assert saved["witness"] is True
+    assert saved["session_state"] == "active"
+    assert saved["capabilities"] == ["witness-v1", "checkup-v1"]
+    assert saved["instance"] == "instance-1"
+    assert saved["last_seen"] == seen_at
+
+
+def test_old_device_poll_defaults_witness_fields_without_reusing_previous_consent(hub):
+    device = Device()
+    active = {
+        "wait": 0,
+        "policy_hash": "p0",
+        "instance": "instance-1",
+        **witness_fields(),
+    }
+    assert device_call(hub, device, "device_poll", "/device/poll", active)[0].status == 204
+    older = {
+        "wait": 0,
+        "policy_hash": "p0",
+        "instance": "instance-1",
+        "session_state": "active",
+        "capabilities": ["checkup-v1"],
+    }
+    assert device_call(hub, device, "device_poll", "/device/poll", older)[0].status == 204
+    saved = store.device_by_id(device.device_id)
+    assert saved["witness"] is False
+    assert saved["session_state"] == "normal"
+    assert saved["capabilities"] == []
+
+
+def test_old_device_heartbeat_defaults_witness_fields_without_reusing_previous_consent(
+    hub,
+):
+    device = Device()
+    device_call(
+        hub,
+        device,
+        "device_poll",
+        "/device/poll",
+        {
+            "wait": 0,
+            "policy_hash": "p0",
+            "instance": "instance-1",
+            **witness_fields(),
+        },
+    )
+    older = {
+        "policy_hash": "p0",
+        "os": "Linux",
+        "home": "/home/r",
+        "agent_version": "0.1.0",
+        "instance": "instance-1",
+        "session_state": "active",
+        "capabilities": ["checkup-v1"],
+    }
+    assert device_call(hub, device, "device_heartbeat", "/device/heartbeat", older)[0].status == 200
+    saved = store.device_by_id(device.device_id)
+    assert saved["witness"] is False
+    assert saved["session_state"] == "normal"
+    assert saved["capabilities"] == []
+
+
+def test_checkup_jobs_are_capability_gated_and_have_no_caller_arguments(hub):
+    device = Device()
+    refused = local(hub, "local_exec", {"device": "laptop", "type": "checkup"})
+    assert (refused.status, body(refused)["error"]) == (409, "unsupported_capability")
+    with_args = local(
+        hub,
+        "local_exec",
+        {"device": "laptop", "type": "checkup", "script": "echo not allowed"},
+    )
+    assert (with_args.status, body(with_args)["error"]) == (400, "bad_request")
+
+    device_call(
+        hub,
+        device,
+        "device_poll",
+        "/device/poll",
+        {
+            "wait": 0,
+            "policy_hash": "p0",
+            "instance": "instance-1",
+            **witness_fields(witness=False, session_state="normal", capabilities=["checkup-v1"]),
+        },
+    )
+    queued = local(
+        hub,
+        "local_exec",
+        {"device": "laptop", "type": "checkup"},
+    )
+    job_id = body(queued)["job_id"]
+    reply, path, _ = device_call(
+        hub,
+        device,
+        "device_poll",
+        "/device/poll",
+        {
+            "wait": 0,
+            "policy_hash": "p0",
+            "instance": "instance-1",
+            **witness_fields(witness=False, session_state="normal", capabilities=["checkup-v1"]),
+        },
+    )
+    assert verified(hub, reply, path) == {"job_id": job_id, "type": "checkup"}
+    assert local(hub, "local_exec", {"device": "laptop", "type": "unknown"}).status == 400
+
+
+def test_checkup_result_round_trips_through_the_local_output(hub):
+    device = Device()
+    device_call(
+        hub,
+        device,
+        "device_poll",
+        "/device/poll",
+        {
+            "wait": 0,
+            "policy_hash": "p0",
+            "instance": "instance-1",
+            **witness_fields(witness=False, session_state="normal", capabilities=["checkup-v1"]),
+        },
+    )
+    job_id = body(local(hub, "local_exec", {"device": "laptop", "type": "checkup"}))["job_id"]
+    reply, path, _ = device_call(
+        hub,
+        device,
+        "device_poll",
+        "/device/poll",
+        {
+            "wait": 0,
+            "policy_hash": "p0",
+            "instance": "instance-1",
+            **witness_fields(witness=False, session_state="normal", capabilities=["checkup-v1"]),
+        },
+    )
+    assert verified(hub, reply, path) == {"job_id": job_id, "type": "checkup"}
+    checkup = {
+        "schema_version": 1,
+        "observed_at": "2026-11-08T10:00:00Z",
+        "platform": "Linux",
+        "facts": [
+            {
+                "id": "memory.available",
+                "label": "Available memory",
+                "value": 12,
+                "unit": "GiB",
+                "status": "ok",
+                "availability": "observed",
+                "source": "psutil",
+            }
+        ],
+        "inferences": [
+            {
+                "claim": "Memory is available for normal use.",
+                "evidence_ids": ["memory.available"],
+                "confidence": "medium",
+            }
+        ],
+    }
+    reply, path = post_result(hub, device, job_id, 0, done=True, returncode=0, error=None, checkup=checkup)
+    assert verified(hub, reply, path)["cancel"] is False
+    output = body(local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 0}))
+    assert output["done"] is True and output["checkup"] == checkup
+    malformed, path = post_result(hub, device, job_id, 1, done=True, returncode=0, checkup=checkup)
+    assert malformed.status == 400
+    assert verified(hub, malformed, path)["error"] == "bad_request"
+
+
+def test_client_request_checkup_returns_the_final_checkup(monkeypatch):
+    checkup = {"schema_version": 1, "facts": [], "inferences": []}
+    submitted = []
+    cursors = []
+    outputs = iter(
+        [
+            {"done": False, "next": 2},
+            {"done": True, "next": 2, "checkup": checkup},
+        ]
+    )
+
+    def post(route, payload):
+        submitted.append((route, payload))
+        return {"job_id": "job-1"}
+
+    def output(job_id, after):
+        cursors.append((job_id, after))
+        return next(outputs)
+
+    monkeypatch.setattr(client, "_post", post)
+    monkeypatch.setattr(client, "job_output", output)
+    assert client.request_checkup("laptop") == checkup
+    assert submitted == [("/local/exec", {"device": "laptop", "type": "checkup"})]
+    assert cursors == [("job-1", 0), ("job-1", 2)]
+
+
+def test_stopping_atomically_clears_witness_and_fails_unclaimed_work(hub, monkeypatch):
+    device = Device()
+    active = {
+        "wait": 0,
+        "policy_hash": "p0",
+        "instance": "instance-1",
+        **witness_fields(),
+    }
+    device_call(hub, device, "device_poll", "/device/poll", active)
+    job_id = body(
+        local(
+            hub,
+            "local_exec",
+            {"device": "laptop", "script": "echo queued", "timeout": 5},
+        )
+    )["job_id"]
+    heartbeat = {
+        "policy_hash": "p0",
+        "os": "Linux",
+        "home": "/home/r",
+        "agent_version": "0.2.0",
+        "instance": "instance-1",
+        **witness_fields(session_state="stopping"),
+    }
+    reply, _, _ = device_call(hub, device, "device_heartbeat", "/device/heartbeat", heartbeat)
+    assert reply.status == 200
+    stale_reply, _, _ = device_call(hub, device, "device_poll", "/device/poll", active)
+    assert (stale_reply.status, stale_reply.body) == (204, b"")
+    saved = store.device_by_id(device.device_id)
+    assert saved["witness"] is False and saved["session_state"] == "stopping"
+    assert isinstance(saved["session_ended_at"], int)
+    output = body(local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 0}))
+    assert (output["done"], output["returncode"], output["error"]) == (
+        True,
+        130,
+        "stopped_by_person",
+    )
+    assert device.device_id not in hub._queues
+    refused = local(
+        hub,
+        "local_exec",
+        {"device": "laptop", "script": "echo after stop", "timeout": 5},
+    )
+    assert (refused.status, body(refused)["error"]) == (409, "stopped_by_person")
+    # The device can disappear after the stopping request. Its persisted state remains safe.
+    monkeypatch.setattr(store, "OFFLINE_AFTER", -1)
+    assert store.device_by_id(device.device_id)["session_state"] == "stopping"
+
+
+def test_stopping_wakes_parked_poll_without_delivering_work(hub):
+    device = Device()
+    active_poll = started(
+        lambda: device_call(
+            hub,
+            device,
+            "device_poll",
+            "/device/poll",
+            {
+                "wait": 10,
+                "policy_hash": "p0",
+                "instance": "instance-1",
+                **witness_fields(),
+            },
+        )
+    )
+    until_waiting(hub, device.device_id)
+    heartbeat = {
+        "policy_hash": "p0",
+        "os": "Linux",
+        "home": "/home/r",
+        "agent_version": "0.2.0",
+        "instance": "instance-1",
+        **witness_fields(session_state="stopping"),
+    }
+    device_call(hub, device, "device_heartbeat", "/device/heartbeat", heartbeat)
+    reply, _, _ = active_poll()
+    assert (reply.status, reply.body) == (204, b"")
+    stopped = {
+        "wait": 0,
+        "policy_hash": "p0",
+        "instance": "instance-1",
+        **witness_fields(witness=False, session_state="stopped"),
+    }
+    reply, _, _ = device_call(hub, device, "device_poll", "/device/poll", stopped)
+    assert (reply.status, reply.body) == (204, b"")
+    saved = store.device_by_id(device.device_id)
+    assert saved["witness"] is False and saved["session_state"] == "stopped"
+    assert isinstance(saved["session_ended_at"], int)
 
 
 def started(call):
@@ -431,7 +981,7 @@ def test_screenshot_job_and_size_cap(hub):
     reply, path, _ = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
     assert verified(hub, reply, path) == {"job_id": job_id, "type": "screenshot"}
     png = base64.b64encode(b"\x89PNG fake").decode()
-    post_result(hub, device, job_id, 0, done=True, png_b64=png)
+    post_result(hub, device, job_id, 0, done=True, returncode=0, png_b64=png)
     assert (
         body(local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 0}))["png_b64"]
         == png
@@ -439,7 +989,13 @@ def test_screenshot_job_and_size_cap(hub):
     job_id = body(local(hub, "local_exec", {"device": "laptop", "type": "screenshot"}))["job_id"]
     device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
     reply, path = post_result(
-        hub, device, job_id, 0, done=True, png_b64="A" * (relay._MAX_PNG_B64 + 4)
+        hub,
+        device,
+        job_id,
+        0,
+        done=True,
+        returncode=0,
+        png_b64="A" * (relay._MAX_PNG_B64 + 4),
     )
     assert reply.status == 413
     out = body(local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 0}))
@@ -721,7 +1277,7 @@ def test_device_list_changes_are_flagged_once_for_the_pane(hub):
     device_id = body(paired)["device_id"]
     edited = Device("desk")
     edited.policy_hash = "edited"
-    beat = {"policy_hash": "edited", "os": "x", "home": "y"}
+    beat = {"policy_hash": "edited", "os": "x", "home": "y", "agent_version": "0.1.0"}
     first, _, _ = device_call(hub, edited, "device_heartbeat", "/device/heartbeat", beat)
     again, _, _ = device_call(hub, edited, "device_heartbeat", "/device/heartbeat", beat)
     assert first.status == again.status == 409

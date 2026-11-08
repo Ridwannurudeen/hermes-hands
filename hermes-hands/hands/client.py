@@ -132,8 +132,8 @@ def start_job(
 
 
 def job_output(job_id: str, after: int) -> dict:
-    """Long-poll the job: ``{"chunks", "next", "done", "returncode", "error", "png_b64"}``. Tried again
-    when the relay did not answer: the ``after`` cursor makes a repeat hand out the same chunks."""
+    """Long-poll a job result, including an optional final ``checkup`` object. Tried again when the
+    relay did not answer: the ``after`` cursor makes a repeat hand out the same chunks."""
     body = {"job_id": job_id, "after": after, "wait": MAX_OUTPUT_WAIT}
     for _ in range(_OUTPUT_RETRIES):
         try:
@@ -169,3 +169,20 @@ def request_screenshot(device_name: str) -> bytes:
             raise HandsError(messages.SCREENSHOT_FAILED) from exc
     cancel_job(job_id)
     raise HandsError(messages.SCREENSHOT_FAILED)
+
+
+def request_checkup(device_name: str) -> dict:
+    """Queue the device's compiled-in checkup and return its final typed result."""
+    queued = _post("/local/exec", {"device": device_name, "type": "checkup"})
+    job_id = queued.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        raise RelayUnavailable(messages.relay_refused(200), may_have_acted=True)
+    after = 0
+    while True:
+        output = job_output(job_id, after)
+        if output["done"]:
+            checkup = output.get("checkup")
+            if isinstance(checkup, dict):
+                return checkup
+            raise HandsError(str(output.get("error") or messages.BAD_REQUEST))
+        after = output["next"]
