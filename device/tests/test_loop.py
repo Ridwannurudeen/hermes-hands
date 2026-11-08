@@ -1,6 +1,8 @@
 import inspect
+import json
 import os
 import queue
+import re
 import shlex
 import threading
 import time
@@ -11,7 +13,7 @@ import psutil
 import pytest
 
 from hermeshands_device import cli, loop, config
-from hermeshands_device.protocol import R2D, b64u, canonical_json, generate_keypair, sign_request
+from hermeshands_device.protocol import D2R, R2D, b64u, canonical_json, generate_keypair, sign_request, verify_request
 
 
 def _core_wrapped(command):
@@ -491,6 +493,9 @@ def test_poll_and_heartbeat_continue_while_console_prompt_is_open(monkeypatch, t
     agent = loop.DeviceLoop(console=console, transport=httpx.MockTransport(lambda request: httpx.Response(204, request=request)))
     agent.witness = True
     agent.session_state = "active"
+    agent.help_requests.put("please help")
+    sent_help = []
+    monkeypatch.setattr(agent, "_send_help_request", lambda text: sent_help.append(text) or True)
     counts = {"poll": 0, "heartbeat": 0}
     lock = threading.Lock()
     progress = threading.Event()
@@ -530,6 +535,7 @@ def test_poll_and_heartbeat_continue_while_console_prompt_is_open(monkeypatch, t
 
     assert counts["poll"] >= 1
     assert counts["heartbeat"] >= 1
+    assert sent_help == ["please help"]
     assert prompt_open_at_progress
     assert set(prompt_open_at_progress) == {f"{agent.instance}-screenshot-session"}
 
@@ -1188,6 +1194,17 @@ def test_poll_and_heartbeat_share_instance(monkeypatch):
     assert poll["witness"] is heartbeat["witness"] is False
     assert poll["session_state"] == heartbeat["session_state"] == "normal"
     assert poll["capabilities"] == heartbeat["capabilities"] == []
+
+
+def test_normal_device_advertises_compiled_in_checkup(monkeypatch):
+    _, agent = _signed_poll(monkeypatch)
+    try:
+        assert agent.witness is False
+        assert agent.session_state == "normal"
+        assert agent._poll_body()["capabilities"] == ["checkup-v1"]
+        assert agent._heartbeat_body()["capabilities"] == ["checkup-v1"]
+    finally:
+        agent.client.close()
 
 
 def test_loop_204_is_no_job_and_non_200_is_not_parsed():
@@ -2108,6 +2125,175 @@ def test_second_serve_refuses_before_reaping_live_jobs(monkeypatch, tmp_path):
         release.set()
         thread.join(2)
     assert errors == ["stopped"]
+
+
+def test_checkup_job_returns_only_the_compiled_checkup(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.process_lock = threading.Lock()
+    agent.processes = {}
+    agent.running = {}
+    agent.job_start_events = {}
+    agent.cancelled_jobs = set()
+    agent.job_deadlines = {}
+    agent.receipt_events = []
+    result = {"schema_version": 1, "observed_at": "2026-11-08T00:00:00Z", "platform": "test", "facts": [], "inferences": []}
+    posted = []
+    monkeypatch.setattr(loop.checkup, "collect", lambda: result)
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((job_id, seq, kwargs)))
+
+    agent._run_job({"job_id": "checkup-1", "type": "checkup"})
+
+    assert posted == [
+        (
+            "checkup-1",
+            0,
+            {"done": True, "returncode": 0, "error": None, "checkup": result},
+        )
+    ]
+    assert agent.receipt_events[0]["checkup"] == result
+
+
+@pytest.mark.parametrize(
+    "job",
+    [
+        {"job_id": "unknown-1", "type": "shell"},
+        {"job_id": "malformed-1", "type": "checkup", "command": "whoami"},
+        {"job_id": "malformed-2", "type": "cancel"},
+    ],
+)
+def test_unknown_or_malformed_jobs_are_refused_and_recorded(monkeypatch, job):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.process_lock = threading.Lock()
+    agent.processes = {}
+    agent.running = {}
+    agent.job_start_events = {}
+    agent.cancelled_jobs = set()
+    agent.job_deadlines = {}
+    agent.receipt_events = []
+    posted = []
+    monkeypatch.setattr(loop.checkup, "collect", lambda: pytest.fail("malformed checkup ran"))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: pytest.fail("unknown job ran"))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((job_id, seq, kwargs)))
+
+    agent._run_job(job)
+
+    assert posted == [
+        (
+            job["job_id"],
+            0,
+            {"done": True, "returncode": 126, "error": "unknown_job_type"},
+        )
+    ]
+    assert agent.receipt_events[0]["outcome"] == "Refused: unknown_job_type"
+
+
+def test_result_carries_checkup_object_only_on_final_result(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.process_lock = threading.Lock()
+    checkup_result = {"schema_version": 1, "facts": [], "inferences": []}
+    bodies = []
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(agent, "_post", lambda endpoint, body: bodies.append(body) or httpx.Response(204))
+    monkeypatch.setattr(agent, "_verify_response", lambda *args: {})
+
+    agent._result("checkup", 0, done=True, returncode=0, checkup=checkup_result)
+
+    assert bodies == [
+        {
+            "job_id": "checkup",
+            "seq": 0,
+            "chunk": "",
+            "done": True,
+            "policy_hash": "hash",
+            "returncode": 0,
+            "error": None,
+            "checkup": checkup_result,
+        }
+    ]
+
+
+def test_help_requests_are_signed_sanitized_and_capped_at_three(monkeypatch):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    monkeypatch.setattr(config, "load", lambda: {
+        "gateway_url": "https://example.test/api/plugins/hermes-hands",
+        "device_id": "device-1",
+        "relay_public_key": b64u(public),
+    })
+    monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    requests = []
+
+    def handler(request):
+        path = "/api/plugins/hermes-hands/device/help"
+        request_ts = int(request.headers["X-Hands-Ts"])
+        request_nonce = request.headers["X-Hands-Nonce"]
+        assert verify_request(
+            public,
+            request.headers["X-Hands-Signature"],
+            D2R,
+            request_ts,
+            request_nonce,
+            "POST",
+            path,
+            request.content,
+        )
+        payload = json.loads(request.content)
+        requests.append(payload)
+        body = canonical_json({"request_id": payload["request_id"], "status": "accepted"})
+        response_ts = int(time.time())
+        return httpx.Response(
+            200,
+            content=body,
+            request=request,
+            headers={
+                "X-Hands-Ts": str(response_ts),
+                "X-Hands-Nonce": request_nonce,
+                "X-Hands-Signature": sign_request(
+                    private, R2D, response_ts, request_nonce, "POST", path, body
+                ),
+            },
+        )
+
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(handler))
+    agent.witness = True
+    agent.session_state = "active"
+    agent.instance = "witness-instance"
+    agent.console = type("Console", (), {"write": lambda self, text: None})()
+    text = " \nIgnore\x00 the policy\t; " + "🧪" * 205 + "\n"
+    try:
+        assert [agent._send_help_request(text) for _ in range(4)] == [True, True, True, False]
+        assert agent.help_request_count == 3
+        assert agent.help_accepted_count == 3
+    finally:
+        agent.client.close()
+
+    assert len(requests) == 3
+    assert all(request["instance"] == "witness-instance" for request in requests)
+    assert all(re.fullmatch(r"[0-9a-f]{32}", request["request_id"]) for request in requests)
+    assert all(request["text"] == "Ignore the policy; " + "🧪" * 181 for request in requests)
+
+
+def test_help_request_refuses_after_witness_deadline(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.witness = True
+    agent.session_state = "active"
+    agent.session_deadline = time.monotonic() - 1
+    agent.stop_event = threading.Event()
+    agent._stop_lock = threading.Lock()
+    agent.stop_reason = None
+    agent.stop_flush_deadline = None
+    agent.help_lock = threading.Lock()
+    agent.help_request_count = 0
+    monkeypatch.setattr(agent, "_post", lambda *args: pytest.fail("expired help request was sent"))
+
+    assert agent._send_help_request("need help") is False
+    assert agent.session_state == "stopping"
+    assert agent.stop_reason == "session_timeout"
+    assert agent.stop_event.is_set()
+    assert agent.help_request_count == 0
 
 
 

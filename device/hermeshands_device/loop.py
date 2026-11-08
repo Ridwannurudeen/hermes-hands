@@ -11,12 +11,13 @@ import re
 import secrets
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 
-from . import __version__, config, executor, policy, screen
+from . import __version__, checkup, config, executor, policy, screen
 from .console import (
     SCREENSHOT_REQUEST_PROMPT,
     SCREENSHOT_SESSION_PROMPT,
@@ -34,6 +35,7 @@ _STOP_FLUSH_SECONDS = 5
 _STOP_REQUEST_TIMEOUT = 2
 _SCREENSHOT_REQUEST_TIMEOUT = 30
 _WITNESS_SESSION_SECONDS = 30 * 60
+_MAX_HELP_REQUESTS = 3
 
 _BACKGROUND_PID_PROBE = re.compile(
     r"(?ms)^eval 'kill -0 \"\$\(cat "
@@ -46,6 +48,10 @@ _CORE_EVAL_COMMAND = re.compile(
 )
 _CORE_PLAIN_EVAL_COMMAND = re.compile(r"(?m)^eval '((?:[^']|'\\'')*)'$", re.DOTALL)
 _CORE_CWD = re.compile(r"(?m)^builtin cd -- (.+?)(?: 2>/dev/null \|\| true| \|\| exit 126)$")
+
+
+def _sanitize_help_text(text: str) -> str:
+    return "".join(character for character in text.strip() if character.isprintable()).strip()[:200]
 
 
 class DeviceLoop:
@@ -66,12 +72,16 @@ class DeviceLoop:
         self.stop_event = threading.Event()
         self.session_state = "normal"
         self.witness = False
-        self.capabilities: list[str] = []
+        self.capabilities: list[str] = ["checkup-v1"]
         self.session_deadline: float | None = None
         self.stop_reason: str | None = None
         self.stop_flush_deadline: float | None = None
         self._stop_lock = threading.Lock()
         self.help_requests: queue.Queue[str] = queue.Queue()
+        self.help_lock = threading.Lock()
+        self.help_request_count = 0
+        self.help_accepted_count = 0
+        self.receipt_events: list[dict] = []
         self.console_owner = ConsoleOwner(self.console, on_stop=self._begin_stopping, on_help=self.help_requests.put)
         self.fatal: list[Exception] = []
         self.policy_change_logged = False
@@ -109,6 +119,8 @@ class DeviceLoop:
                     self._expire_session_if_due()
                     raise InterruptedError("witness session expired")
                 request_options["timeout"] = session_remaining
+        elif endpoint == "/device/help":
+            request_options["timeout"] = _STOP_REQUEST_TIMEOUT
         return self.client.post(self.gateway_url + endpoint, content=body, headers=headers, **request_options)
 
     def _verify_response(self, response: httpx.Response, endpoint: str) -> dict:
@@ -315,7 +327,19 @@ class DeviceLoop:
             with self._stop_lock:
                 self.session_state = "stopped"
 
-    def _result(self, job_id: str, seq: int, *, chunk: str = "", done: bool = False, returncode: int = 0, error: str | None = None, png: bytes | None = None, policy_hash: str | None = None) -> None:
+    def _result(
+        self,
+        job_id: str,
+        seq: int,
+        *,
+        chunk: str = "",
+        done: bool = False,
+        returncode: int = 0,
+        error: str | None = None,
+        png: bytes | None = None,
+        policy_hash: str | None = None,
+        checkup: dict | None = None,
+    ) -> None:
         if not hasattr(self, "process_lock"):
             self.process_lock = threading.Lock()
         result = {"job_id": job_id, "seq": seq, "chunk": chunk, "done": done, "policy_hash": policy.digest() if policy_hash is None else policy_hash}
@@ -324,6 +348,10 @@ class DeviceLoop:
             result["error"] = error
         if png is not None:
             result["png_b64"] = base64.b64encode(png).decode("ascii")
+        if checkup is not None:
+            if not done:
+                raise ValueError("checkup data is only valid on a final result")
+            result["checkup"] = checkup
         while not self.stop_event.is_set() or self._is_stopping():
             if self._is_stopping() and not self._stop_flush_remaining():
                 break
@@ -360,6 +388,68 @@ class DeviceLoop:
             raise InterruptedError("stop result flush deadline expired")
         raise InterruptedError("device is stopping")
 
+    def _send_help_request(self, text: str) -> bool:
+        clean_text = _sanitize_help_text(text)
+        if not clean_text or self._expire_session_if_due() or not self.witness or self.session_state != "active":
+            return False
+        with self.help_lock:
+            if self.help_request_count >= _MAX_HELP_REQUESTS:
+                self.console.write("The witness session has reached its three-request help limit.\n")
+                return False
+            self.help_request_count += 1
+            request_id = secrets.token_hex(16)
+            request = {
+                "request_id": request_id,
+                "instance": self.instance,
+                "text": clean_text,
+            }
+            try:
+                response = self._post("/device/help", request)
+                if response.status_code >= 500:
+                    response.raise_for_status()
+                payload = self._verify_response(response, "/device/help")
+            except (httpx.HTTPError, PermissionError, ValueError, KeyError) as exc:
+                logger.warning("Help request was not accepted by the relay: %s", type(exc).__name__)
+                return False
+            if (
+                response.status_code != 200
+                or not isinstance(payload, dict)
+                or payload.get("request_id") != request_id
+                or payload.get("status") != "accepted"
+            ):
+                self.console.write("The relay did not accept the help request.\n")
+                return False
+            self.help_accepted_count += 1
+            self.receipt_events.append(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                    "label": "Help request",
+                    "outcome": "Accepted by relay",
+                    "delivery_status": "pending",
+                    "request_id": request_id,
+                }
+            )
+            self.console.write("The relay accepted the help request; owner delivery is pending.\n")
+            return True
+
+    def _help_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                text = self.help_requests.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            self._send_help_request(text)
+
+    def _refuse_unknown_job(self, job_id: str, seq: int) -> None:
+        self.receipt_events.append(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                "label": "Unknown job type",
+                "outcome": "Refused: unknown_job_type",
+            }
+        )
+        self._result(job_id, seq, done=True, returncode=126, error="unknown_job_type")
+
     def _run_job(self, job: dict, start_event: threading.Event | None = None) -> None:
         job_id, seq = job["job_id"], 0
         if not hasattr(self, "cancelled_jobs"):
@@ -393,9 +483,24 @@ class DeviceLoop:
             if self.stop_event.is_set():
                 start_event.set()
                 return
-            if job["type"] != "exec":
+            job_type = job.get("type")
+            malformed = not isinstance(job_type, str) or job_type not in {
+                "exec",
+                "checkup",
+                "screenshot",
+                "cancel",
+            }
+            malformed = malformed or (job_type == "exec" and not isinstance(job.get("script"), str))
+            malformed = malformed or (job_type == "checkup" and set(job) != {"job_id", "type"})
+            malformed = malformed or (job_type == "screenshot" and set(job) != {"job_id", "type"})
+            malformed = malformed or (job_type == "cancel" and not isinstance(job.get("target_job_id"), str))
+            if malformed:
                 start_event.set()
-            if job["type"] == "exec":
+                self._refuse_unknown_job(job_id, seq)
+                return
+            if job_type != "exec":
+                start_event.set()
+            if job_type == "exec":
                 current_policy_hash, policy_patterns = policy.snapshot()
                 if current_policy_hash != getattr(self, "accepted_policy_hash", None):
                     start_event.set()
@@ -473,7 +578,29 @@ class DeviceLoop:
                     self._result(job_id, seq, chunk=final, done=True, returncode=1, error="Output was truncated after the post-exit pipe idle limit")
                 else:
                     self._result(job_id, seq, chunk=final, done=True, returncode=exit_code[0])
-            elif job["type"] == "screenshot":
+            elif job_type == "checkup":
+                result = checkup.collect()
+                if self._is_stopping():
+                    returncode, error = self._stopped_result()
+                    self._result(job_id, seq, done=True, returncode=returncode, error=error)
+                    return
+                self.receipt_events.append(
+                    {
+                        "timestamp": result["observed_at"],
+                        "label": "System checkup",
+                        "outcome": "Completed",
+                        "checkup": result,
+                    }
+                )
+                self._result(
+                    job_id,
+                    seq,
+                    done=True,
+                    returncode=0,
+                    error=None,
+                    checkup=result,
+                )
+            elif job_type == "screenshot":
                 if getattr(self, "witness", False):
                     if not self.allow_screen:
                         self._result(
@@ -513,7 +640,7 @@ class DeviceLoop:
                         return
                 image = screen.capture(allow_screen=self.allow_screen)
                 self._result(job_id, seq, done=True, returncode=0, png=image)
-            elif job["type"] == "cancel":
+            elif job_type == "cancel":
                 with self.process_lock:
                     target = self.processes.get(job["target_job_id"])
                     if target is None:
@@ -643,11 +770,18 @@ class DeviceLoop:
             lock_file.close()
             raise RuntimeError("Another hermes-hands serve process is already running for this device home") from exc
         screenshot_consent_thread = None
+        help_thread = None
         try:
             executor.reap_recorded_processes()
             heartbeat = threading.Thread(target=self._heartbeat_loop, daemon=True)
             heartbeat.start()
             if getattr(self, "witness", False):
+                help_thread = threading.Thread(
+                    target=self._help_loop,
+                    name="hermes-hands-help-client",
+                    daemon=True,
+                )
+                help_thread.start()
                 screenshot_consent_thread = threading.Thread(
                     target=self._request_session_screenshot_consent,
                     name="hermes-hands-screenshot-consent",
@@ -713,6 +847,8 @@ class DeviceLoop:
             else:
                 self.stop_event.set()
                 self._cancel_running_jobs()
+            if help_thread is not None:
+                help_thread.join(0.1)
             if os.name == "nt":
                 import msvcrt
 
