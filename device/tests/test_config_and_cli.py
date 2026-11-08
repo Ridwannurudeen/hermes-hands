@@ -31,6 +31,7 @@ def test_status_and_policy_cli(monkeypatch, tmp_path, capsys):
 
 def test_pair_accepts_base_and_plugin_prefix_urls(monkeypatch, capsys):
     requests = []
+    monkeypatch.setattr(cli.config, "load", lambda: {})
     monkeypatch.setattr(cli, "get_or_create", lambda: (b"p" * 32, b"q" * 32))
     monkeypatch.setattr(cli.policy, "digest", lambda: "policy")
     monkeypatch.setattr(
@@ -54,6 +55,7 @@ def test_pair_accepts_base_and_plugin_prefix_urls(monkeypatch, capsys):
 
 
 def test_pair_refuses_insecure_non_loopback_url(monkeypatch, capsys):
+    monkeypatch.setattr(cli.config, "load", lambda: {})
     monkeypatch.setattr(cli, "get_or_create", lambda: (_ for _ in ()).throw(AssertionError("must validate first")))
     assert cli._pair("http://hands.example.com", "laptop", "code") == 1
     assert "https" in capsys.readouterr().err
@@ -64,6 +66,7 @@ def test_pair_refuses_insecure_non_loopback_url(monkeypatch, capsys):
 
 
 def test_pair_reports_httpx_transport_error(monkeypatch, capsys):
+    monkeypatch.setattr(cli.config, "load", lambda: {})
     monkeypatch.setattr(cli, "get_or_create", lambda: (b"p" * 32, b"q" * 32))
     monkeypatch.setattr(cli.policy, "digest", lambda: "policy")
     def fail(url, **kwargs):
@@ -73,6 +76,39 @@ def test_pair_reports_httpx_transport_error(monkeypatch, capsys):
     error = capsys.readouterr().err
     assert "https://hands.example.com/api/plugins/hermes-hands/pair" in error
     assert "connection refused" in error
+
+
+def test_pair_refuses_existing_pairing_without_force(monkeypatch, capsys):
+    requests = []
+    monkeypatch.setattr(cli.config, "load", lambda: {"device_id": "existing-device"})
+    monkeypatch.setattr(cli, "get_or_create", lambda: (b"p" * 32, b"q" * 32))
+    monkeypatch.setattr(cli.policy, "digest", lambda: "policy")
+    monkeypatch.setattr(
+        cli.httpx,
+        "post",
+        lambda url, **kwargs: requests.append(url)
+        or types.SimpleNamespace(status_code=401, text="unauthorized"),
+    )
+    saved = []
+    monkeypatch.setattr(cli.config, "save", lambda data: saved.append(data))
+
+    assert cli._pair("https://hands.example.com", "laptop", "code") == 1
+
+    assert requests == []
+    assert saved == []
+    assert "--force" in capsys.readouterr().err
+
+
+def test_pair_force_flag_is_parsed_and_forwarded(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "_pair",
+        lambda url, name, code, *, force=False: calls.append((url, name, code, force)) or 0,
+    )
+
+    assert cli.main(["pair", "https://hands.example.com", "--name", "laptop", "--code", "code", "--force"]) == 0
+    assert calls == [("https://hands.example.com", "laptop", "code", True)]
 
 
 def test_doctor_executes_python_probe_and_names_windowsapps(monkeypatch, capsys):

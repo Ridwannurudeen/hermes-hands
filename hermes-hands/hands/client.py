@@ -62,6 +62,8 @@ def _post(route: str, body: dict, *, timeout: float | None = None) -> dict:
         raise HandsError(messages.NOT_SET_UP)
     try:
         response = _http.post(route, json=body, **({"timeout": timeout} if timeout else {}))
+    except UnicodeEncodeError as exc:
+        raise HandsError(messages.BAD_SCRIPT_ENCODING) from exc
     except httpx.HTTPError as exc:
         raise RelayUnavailable(
             messages.RELAY_DOWN, may_have_acted=not isinstance(exc, _NOT_SENT)

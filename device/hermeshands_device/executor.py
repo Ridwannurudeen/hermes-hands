@@ -25,6 +25,8 @@ OUTPUT_QUEUE_SIZE = 8
 TASKKILL_TIMEOUT = 10
 _PROBED: dict[str, tuple[int, int, int]] = {}  # file identity for candidates whose probe passed
 _WINDOWS_JOBS: dict[int, int] = {}
+_WINDOWS_JOBS_LOCK = threading.Lock()
+_CREATE_SUSPENDED = 0x00000004
 
 
 def _is_stub(path: str) -> bool:
@@ -74,22 +76,8 @@ def resolve_bash() -> str | None:
 
 def _terminate(proc: subprocess.Popen, start_time: float) -> None:
     if os.name == "nt":
-        job = _WINDOWS_JOBS.get(proc.pid)
-        opened_job = job is None
-        if job is None:
-            job = _open_windows_job(proc.pid, start_time)
-        if job is not None:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-            terminated = bool(kernel32.TerminateJobObject(wintypes.HANDLE(job), 1))
-            if opened_job:
-                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-                kernel32.CloseHandle(wintypes.HANDLE(job))
-            if terminated:
-                return
+        if _terminate_windows_job(proc.pid, start_time):
+            return
         try:
             process = psutil.Process(proc.pid)
             current = process.create_time()
@@ -142,8 +130,69 @@ def _open_windows_job(pid: int, start_time: float) -> int | None:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenJobObjectW.restype = wintypes.HANDLE
     kernel32.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
-    job = kernel32.OpenJobObjectW(0x0001, False, _windows_job_name(pid, start_time))
+    job = kernel32.OpenJobObjectW(0x0008, False, _windows_job_name(pid, start_time))
     return int(job if isinstance(job, int) else job.value) if job else None
+
+
+def _terminate_windows_job(pid: int, start_time: float) -> bool:
+    with _WINDOWS_JOBS_LOCK:
+        job = _WINDOWS_JOBS.get(pid)
+        opened_job = job is None
+        if job is None:
+            job = _open_windows_job(pid, start_time)
+        if job is None:
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        terminated = bool(kernel32.TerminateJobObject(wintypes.HANDLE(job), 1))
+        if opened_job:
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle(wintypes.HANDLE(job))
+        return terminated
+
+
+def _windows_job_has_active_processes(job: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicAccountingInformation(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_int64),
+            ("TotalKernelTime", ctypes.c_int64),
+            ("ThisPeriodTotalUserTime", ctypes.c_int64),
+            ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+            ("TotalPageFaultCount", ctypes.c_uint32),
+            ("TotalProcesses", ctypes.c_uint32),
+            ("ActiveProcesses", ctypes.c_uint32),
+            ("TotalTerminatedProcesses", ctypes.c_uint32),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    info = BasicAccountingInformation()
+    queried = kernel32.QueryInformationJobObject(wintypes.HANDLE(job), 1, ctypes.byref(info), ctypes.sizeof(info), None)
+    return bool(queried and info.ActiveProcesses)
+
+
+def _wait_for_windows_job_exit(pid: int, job: int) -> None:
+    while True:
+        with _WINDOWS_JOBS_LOCK:
+            if _WINDOWS_JOBS.get(pid) != job:
+                return
+            if not _windows_job_has_active_processes(job):
+                del _WINDOWS_JOBS[pid]
+                import ctypes
+                from ctypes import wintypes
+
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+                kernel32.CloseHandle(wintypes.HANDLE(job))
+                return
+        time.sleep(0.1)
 
 
 def _create_windows_job(proc: subprocess.Popen, start_time: float) -> int | None:
@@ -156,51 +205,111 @@ def _create_windows_job(proc: subprocess.Popen, start_time: float) -> int | None
     kernel32.CreateJobObjectW.restype = wintypes.HANDLE
     kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
     kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
     job = kernel32.CreateJobObjectW(None, _windows_job_name(proc.pid, start_time))
     if not job:
-        logging.getLogger(__name__).warning("Could not create Windows job object: %s", ctypes.get_last_error())
-        return None
+        raise OSError(ctypes.get_last_error(), "Could not create Windows job object")
 
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-    process_handle = wintypes.HANDLE(int(proc._handle))
-    if not kernel32.AssignProcessToJobObject(job, process_handle):
-        logging.getLogger(__name__).warning("Could not assign job process to Windows job object: %s", ctypes.get_last_error())
-        kernel32.CloseHandle(job)
-        return None
     job_value = int(job if isinstance(job, int) else job.value)
-    ctypes.windll.kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-    ctypes.windll.kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    _WINDOWS_JOBS[proc.pid] = job_value
+    job_handle = wintypes.HANDLE(job_value)
+
+    class BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        )]
+
+    class ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimitInformation),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    limits = ExtendedLimitInformation()
+    limits.BasicLimitInformation.LimitFlags = 0x00002000
+    try:
+        if not kernel32.SetInformationJobObject(job_handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise OSError(ctypes.get_last_error(), "Could not set Windows job object limits")
+        process_handle = wintypes.HANDLE(int(proc._handle))
+        if not kernel32.AssignProcessToJobObject(job_handle, process_handle):
+            raise OSError(ctypes.get_last_error(), "Could not assign process to Windows job object")
+    except BaseException:
+        kernel32.CloseHandle(job_handle)
+        raise
+
+    with _WINDOWS_JOBS_LOCK:
+        _WINDOWS_JOBS[proc.pid] = job_value
+
+    threads = psutil.Process(proc.pid).threads()
+    if len(threads) != 1:
+        raise RuntimeError("Could not identify the suspended device process thread")
+    kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    thread = kernel32.OpenThread(0x0002, False, threads[0].id)
+    if not thread:
+        raise OSError(ctypes.get_last_error(), "Could not open the suspended device process thread")
+    thread_value = int(thread if isinstance(thread, int) else thread.value)
+    thread_handle = wintypes.HANDLE(thread_value)
+    try:
+        previous_suspend_count = kernel32.ResumeThread(thread_handle)
+        if previous_suspend_count == 0xFFFFFFFF:
+            raise OSError(ctypes.get_last_error(), "Could not resume the device process thread")
+        if previous_suspend_count != 1:
+            raise RuntimeError("The device process thread was not suspended exactly once")
+    finally:
+        kernel32.CloseHandle(thread_handle)
     return job_value
 
 
-def _close_windows_job(proc: subprocess.Popen, job: int | None) -> None:
-    if job is not None:
-        import ctypes
-        from ctypes import wintypes
-
-        _WINDOWS_JOBS.pop(proc.pid, None)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle(wintypes.HANDLE(job))
-
-
-def terminate_recorded(pid: int, start_time: float) -> None:
-    if os.name == "nt":
-        job = _WINDOWS_JOBS.get(pid) or _open_windows_job(pid, start_time)
-        if job is not None:
+def _close_windows_job(proc: subprocess.Popen, job: int | None, *, keep_active: bool = False) -> None:
+    reap_later = False
+    with _WINDOWS_JOBS_LOCK:
+        current_job = _WINDOWS_JOBS.get(proc.pid)
+        if current_job is None or (job is not None and current_job != job):
+            return
+        if keep_active and _windows_job_has_active_processes(current_job):
+            reap_later = True
+        else:
+            del _WINDOWS_JOBS[proc.pid]
             import ctypes
             from ctypes import wintypes
 
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-            terminated = bool(kernel32.TerminateJobObject(wintypes.HANDLE(job), 1))
-            if pid not in _WINDOWS_JOBS:
-                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-                kernel32.CloseHandle(wintypes.HANDLE(job))
-            if terminated:
-                return
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle(wintypes.HANDLE(current_job))
+    if reap_later:
+        watcher = threading.Thread(target=_wait_for_windows_job_exit, args=(proc.pid, current_job), daemon=True)
+        watcher.start()
+
+
+def terminate_recorded(pid: int, start_time: float) -> None:
+    if os.name == "nt" and _terminate_windows_job(pid, start_time):
+        return
     try:
         process = psutil.Process(pid)
         current = process.create_time()
@@ -233,7 +342,7 @@ def terminate_recorded(pid: int, start_time: float) -> None:
             logging.getLogger(__name__).warning("Could not reap process %s: %s", pid, exc)
     else:
         try:
-            os.killpg(pid, signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)  # windows-footgun: ok -- POSIX-only branch
         except ProcessLookupError:
             pass
 
@@ -318,7 +427,7 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
             script_file.write(script)
             script_path = Path(script_file.name)
         args = [bash, *(["-l"] if login else []), str(script_path)]
-        kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {"start_new_session": True}
+        kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0) | _CREATE_SUSPENDED} if os.name == "nt" else {"start_new_session": True}
         env = None
         if os.name == "nt":
             env = dict(os.environ)
@@ -346,8 +455,6 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
         _close_windows_job(proc, windows_job)
         if record_written:
             record_path(job_id).unlink(missing_ok=True)
-        if proc is not None:
-            _close_windows_job(proc, windows_job)
         raise
     chunks: queue.Queue[bytes | None] = queue.Queue(maxsize=OUTPUT_QUEUE_SIZE)
     deadline = time.monotonic() + timeout
@@ -380,11 +487,12 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
         backpressure = 0.0
 
         def post_exit_limit_reached() -> bool:
-            nonlocal post_exit_started
+            nonlocal post_exit_started, backpressure
             if proc.poll() is None:
                 return False
             if post_exit_started is None:
                 post_exit_started = time.monotonic()
+                backpressure = 0.0
             return time.monotonic() - post_exit_started - backpressure >= POST_EXIT_DRAIN_LIMIT
 
         def truncate_post_exit() -> None:
@@ -419,13 +527,10 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                     chunk = os.read(proc.stdout.fileno(), CHUNK_SIZE)
                 elif available_bytes.value == 0:
                     if proc.poll() is not None:
-                        if post_exit_limit_reached():
-                            truncate_post_exit()
-                            return
                         if idle_deadline is None:
                             idle_deadline = time.monotonic() + PIPE_DRAIN_GRACE
                         elif time.monotonic() >= idle_deadline:
-                            truncate_post_exit()
+                            send_end()
                             return
                     time.sleep(0.05)
                     continue
@@ -436,13 +541,10 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                 chunk = os.read(proc.stdout.fileno(), CHUNK_SIZE) if ready else None
                 if chunk is None:
                     if proc.poll() is not None:
-                        if post_exit_limit_reached():
-                            truncate_post_exit()
-                            return
                         if idle_deadline is None:
                             idle_deadline = time.monotonic() + PIPE_DRAIN_GRACE
                         elif time.monotonic() >= idle_deadline:
-                            truncate_post_exit()
+                            send_end()
                             return
                     continue
             if not chunk:
@@ -461,8 +563,6 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                 try:
                     chunks.put(chunk, timeout=0.05)
                     backpressure += time.monotonic() - blocked_at
-                    if idle_deadline is not None:
-                        idle_deadline += time.monotonic() - blocked_at
                     break
                 except queue.Full:
                     if exited.is_set():
@@ -479,6 +579,7 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
     reader.start()
     output_path = Path.home() / ".hermes-hands" / "out" / f"{job_id}.log"
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    completed = False
     try:
         with output_path.open("wb") as log:
             while True:
@@ -510,6 +611,7 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                 yield b"[output truncated at 64 MiB]\n"
                 return
             if truncated.is_set():
+                completed = True
                 if on_exit:
                     on_exit(1)
                 yield b"[output truncated after the post-exit idle limit]\n"
@@ -521,18 +623,20 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
             yield b"[device timeout]\n"
         elif on_exit:
             on_exit(proc.returncode)
+        completed = True
     finally:
         exited.set()
         reader_stop.set()
         timer.cancel()
         timer.join(timeout=TASKKILL_TIMEOUT + 1)
-        if proc.poll() is None:
+        if proc.poll() is None or (not completed and proc.pid in _WINDOWS_JOBS):
             terminate_once()
-            try:
-                proc.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
         reader.join(timeout=0.2)
         if proc.stdout is not None:
             proc.stdout.close()
@@ -542,4 +646,4 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
             stdin_path.unlink(missing_ok=True)
         record_path(job_id).unlink(missing_ok=True)
         if proc is not None:
-            _close_windows_job(proc, windows_job)
+            _close_windows_job(proc, windows_job, keep_active=completed and not timed_out.is_set() and not termination_started.is_set())

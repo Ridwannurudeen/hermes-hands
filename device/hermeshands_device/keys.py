@@ -33,10 +33,8 @@ def get_or_create() -> tuple[bytes, bytes]:
     if keyring:
         try:
             value = keyring.get_password(SERVICE, "device-private")
-        except Exception:
-            logger.warning("Keyring unavailable; using protected device key file")
-            keyring = None
-            value = None
+        except Exception as exc:
+            raise RuntimeError("Could not read the device key from the keyring; refusing to create a new device identity") from exc
         if value:
             private = unb64u(value)
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey

@@ -2,48 +2,24 @@
 
 from __future__ import annotations
 
-import ipaddress
 import secrets
-import shlex
-from urllib.parse import urlparse
 
 from . import client, commands, messages, store
 
-DEFAULT_DASHBOARD_URL = "http://127.0.0.1:9119"
-
-
-def _loopback(host: str) -> bool:
-    if not host:
-        return False
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
-def _loopback_url(url: str) -> bool:
-    return _loopback(urlparse(url).hostname or "")
-
-
-def _https_or_loopback(url: str) -> bool:
-    """The pairing URLs the device accepts (device hermeshands_device/cli.py:_pair)."""
-    parsed = urlparse(url)
-    return parsed.scheme == "https" or (parsed.scheme == "http" and _loopback(parsed.hostname or ""))
+DEFAULT_DASHBOARD_URL = commands.DEFAULT_DASHBOARD_URL
 
 
 def register_cli(ctx, *, has_seed: bool) -> None:
     def setup_parser(parser):
-        commands = parser.add_subparsers(dest="hands_action", required=True)
-        commands.add_parser("status")
-        commands.add_parser("devices")
-        revoke = commands.add_parser("revoke")
+        subparsers = parser.add_subparsers(dest="hands_action", required=True)
+        subparsers.add_parser("status")
+        subparsers.add_parser("devices")
+        revoke = subparsers.add_parser("revoke")
         revoke.add_argument("name")
         revoke.add_argument("--yes", action="store_true")
-        commands.add_parser("setup")
-        commands.add_parser("doctor")
-        pair = commands.add_parser("pair")
+        subparsers.add_parser("setup")
+        subparsers.add_parser("doctor")
+        pair = subparsers.add_parser("pair")
         pair.add_argument("name")
 
     def handler(args):
@@ -66,29 +42,7 @@ def register_cli(ctx, *, has_seed: bool) -> None:
                 print(f"{device['name']}: {'online' if device['online'] else 'offline'}")
             return
         if action == "pair":
-            if not has_seed:
-                print(messages.NOT_SET_UP)
-                return
-            from hermes_cli.config import load_config_readonly
-
-            name = args.name
-            dashboard = (load_config_readonly() or {}).get("dashboard") or {}
-            public_url = str(dashboard.get("public_url") or "").strip()
-            gateway_url = public_url or str(
-                ctx.get_config("dashboard_url", default=DEFAULT_DASHBOARD_URL) or ""
-            ).strip()
-            if not _https_or_loopback(gateway_url):
-                print(
-                    f"dashboard.public_url is {gateway_url}, and the device refuses a non-loopback http "
-                    "pairing URL. Set dashboard.public_url to the https URL of the Hands host, then run "
-                    "this again."
-                )
-                return
-            code = store.mint_pairing_code(name)
-            command = f"hermes-hands pair {gateway_url} --name {shlex.quote(name)} --code={shlex.quote(code)}"
-            print(f"Pair code: {code}\nRun on the device: {command}")
-            if _loopback_url(gateway_url):
-                print("Note: a loopback URL pairs only a device on the gateway host itself.")
+            print(commands.pair_reply(ctx, args.name, has_seed=has_seed))
             return
         if action == "revoke":
             if not args.yes and input(f"Revoke {args.name}? [y/N] ").strip().lower() != "y":
@@ -117,27 +71,29 @@ def register_cli(ctx, *, has_seed: bool) -> None:
                 print("Owner id was not saved.")
             return
         if action == "doctor":
-            from hermes_cli.config import load_config_readonly
+            failures = 0
 
-            cfg = load_config_readonly() or {}
+            def check(label: str, passed: bool, fix: str) -> None:
+                nonlocal failures
+                if not passed:
+                    failures += 1
+                print(f"{'PASS' if passed else 'FAIL'} {label}" + ("" if passed else f": {fix}"))
+
             backend = commands.terminal_backend()
-            dashboard = cfg.get("dashboard") or {}
-            dashboard_url = str(
+            raw_dashboard_url = str(
                 ctx.get_config("dashboard_url", default=DEFAULT_DASHBOARD_URL) or ""
             ).strip()
-            public_url = str(dashboard.get("public_url") or "").strip()
-            basic = dashboard.get("basic_auth") or {}
-            basic_ready = bool(str(basic.get("username") or "").strip()) and bool(
-                basic.get("password_hash") or basic.get("password")
-            )
-            _check(
+            dashboard_url = commands._normalise_public_url(raw_dashboard_url) or raw_dashboard_url
+            public_url, _ = commands._resolve_public_url()
+            basic_fix = commands.basic_auth_fix()
+            check(
                 "terminal.backend is hands",
                 backend == "hands",
                 f"It is {backend or 'not set'}. Run hermes config set terminal.backend hands, then restart the gateway.",
             )
-            _check(
+            check(
                 "dashboard_url is loopback",
-                _loopback_url(dashboard_url),
+                commands.loopback_url(dashboard_url),
                 f"It is {dashboard_url or 'not set'}. The gateway sends its local bearer and every job script "
                 f"there, so it must be a loopback address such as {DEFAULT_DASHBOARD_URL}.",
             )
@@ -148,20 +104,34 @@ def register_cli(ctx, *, has_seed: bool) -> None:
                 relay_error = ""
             except client.HandsError as exc:
                 relay_error = str(exc)
-            _check("Relay answers at dashboard_url", not relay_error, relay_error)
-            _check(
+            check("Relay answers at dashboard_url", not relay_error, relay_error)
+            if commands.loopback_url(public_url):
+                public_fix = (
+                    f"It is {public_url}. A loopback URL pairs only on the gateway host itself; "
+                    "leave dashboard.public_url unset for same-host testing, or set it to the https URL "
+                    "of the Hands host."
+                )
+            elif commands._parsed_http_url(public_url) is not None:
+                public_fix = (
+                    f"It is {public_url}. The device refuses a non-loopback http pairing URL, so set "
+                    "dashboard.public_url to the https URL of the Hands host."
+                )
+            else:
+                public_fix = (
+                    f"It is {public_url}. Set dashboard.public_url to the https URL of the Hands host, "
+                    "or unset it for same-host testing."
+                )
+            check(
                 "dashboard.public_url is https or unset",
-                not public_url or _https_or_loopback(public_url),
-                f"It is {public_url}. The device refuses a non-loopback http pairing URL, so set "
-                "dashboard.public_url to the https URL of the Hands host.",
+                not public_url or commands.https_url(public_url),
+                public_fix,
             )
-            _check(
+            check(
                 "dashboard.basic_auth on the public host",
-                not public_url or basic_ready,
-                "Set dashboard.basic_auth.username and password_hash. A redirect sign-in provider cannot "
-                "finish on the Hands host, which serves only the device routes.",
+                not public_url or not basic_fix,
+                basic_fix,
             )
-            _check(
+            check(
                 "Relay heartbeat row is visible after /local/state",
                 store.relay_alive(),
                 "Fix the relay check first."
@@ -169,8 +139,7 @@ def register_cli(ctx, *, has_seed: bool) -> None:
                 else "The relay answered but wrote no heartbeat row in this HERMES_HOME, so the gateway "
                 "and the dashboard use different plugin data directories.",
             )
-
-    def _check(label: str, passed: bool, fix: str) -> None:
-        print(f"{'PASS' if passed else 'FAIL'} {label}" + ("" if passed else f": {fix}"))
+            # Non-zero return exits via hermes_cli/main.py:3533-3537.
+            return 1 if failures else 0
 
     ctx.register_cli_command("hands", "Manage Hermes Hands", setup_parser, handler)

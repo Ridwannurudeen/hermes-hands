@@ -3,6 +3,7 @@ with a fake device agent on a thread."""
 
 import functools
 import os
+import threading
 
 import httpx
 import pytest
@@ -226,3 +227,27 @@ def test_request_screenshot_returns_png_bytes(wired):
     with Agent(hub, Device(), echo, png=b"\x89PNG\r\n\x1a\nfake"):
         assert client.request_screenshot("laptop") == b"\x89PNG\r\n\x1a\nfake"
         assert client.state()["devices"][0]["name"] == "laptop"
+
+
+def test_unencodable_script_returns_a_hands_error_instead_of_silent_255(wired, monkeypatch):
+    """A9: a lone surrogate in script text cannot be UTF-8 JSON-encoded; it must fail with a
+    clear hands: error rather than killing the worker thread with silent exit 255."""
+    hub, _ = wired
+    unhandled = []
+    monkeypatch.setattr(threading, "excepthook", unhandled.append)
+    with Agent(hub, Device(), lambda job: ("ok\n", 0)) as agent:
+        proc = RemoteProcessHandle("laptop", "echo \ud800", login=False, timeout=5)
+        output = read_all(proc).decode("utf-8")
+        assert proc.wait(5) == 255
+        assert output.strip() == messages.BAD_SCRIPT_ENCODING
+        assert unhandled == []
+        assert agent.jobs == []
+
+        # Surrogateescaped bytes in stdin still travel as stdin_b64 when the script itself is valid.
+        proc_stdin = RemoteProcessHandle(
+            "laptop", "cat > out", login=False, timeout=5, stdin="\udcff"
+        )
+        assert read_all(proc_stdin) == b"ok\n"
+        assert proc_stdin.wait(5) == 0
+        assert agent.jobs[0]["stdin_b64"] == "/w=="
+        assert "stdin" not in agent.jobs[0]

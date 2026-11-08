@@ -2,10 +2,176 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import shlex
+from urllib.parse import urlparse
 
 from . import client, messages, store, targets
+
+DEFAULT_DASHBOARD_URL = "http://127.0.0.1:9119"
+# Reject characters core refuses in dashboard.public_url (hermes_cli/dashboard_auth/prefix.py:24).
+_REJECT_CHARS = frozenset(('"', "'", "<", ">", " ", "\n", "\r", "\t"))
+# Unexpanded shell text core replaces with a random per-process key (plugins/dashboard_auth/basic/__init__.py:199).
+_UNEXPANDED_SHELL_MARKERS = ("$(", "`", "openssl rand")
+
+
+def _loopback(host: str) -> bool:
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _normalise_public_url(raw: str | None) -> str:
+    """Cleaned http(s) URL with trailing slash stripped, else empty (prefix.py:86-99)."""
+    url = raw.strip() if raw else ""
+    if not url or any(char in url for char in _REJECT_CHARS):
+        return ""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return url.rstrip("/")
+
+
+def _parsed_http_url(url: str):
+    clean = _normalise_public_url(url)
+    if not clean:
+        return None
+    try:
+        parsed = urlparse(clean)
+        _ = parsed.port
+    except ValueError:
+        return None
+    return parsed if parsed.hostname else None
+
+
+def loopback_url(url: str) -> bool:
+    parsed = _parsed_http_url(url)
+    return parsed is not None and _loopback(parsed.hostname or "")
+
+
+def https_url(url: str) -> bool:
+    parsed = _parsed_http_url(url)
+    return parsed is not None and parsed.scheme == "https"
+
+
+def https_or_loopback(url: str) -> bool:
+    """The pairing URLs the device accepts (device hermeshands_device/cli.py:_pair)."""
+    parsed = _parsed_http_url(url)
+    return parsed is not None and (
+        parsed.scheme == "https" or (parsed.scheme == "http" and _loopback(parsed.hostname or ""))
+    )
+
+
+def _dashboard_config() -> dict:
+    """The dashboard section of config.yaml as a dict, or {} (prefix.py:101-114, config.py:1985-1989)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+    except Exception:
+        return {}
+    section = cfg.get("dashboard") if isinstance(cfg, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def _resolve_public_url() -> tuple[str, str]:
+    """Resolve the dashboard public URL and its source setting, matching core precedence:
+    HERMES_DASHBOARD_PUBLIC_URL env first (blank or malformed falls through), then dashboard.public_url
+    in config.yaml (hermes_cli/dashboard_auth/prefix.py:117-137). When neither normalises to a valid
+    http(s) URL, return any raw value so pair and doctor refuse a typo instead of ignoring it."""
+    env_raw = os.environ.get("HERMES_DASHBOARD_PUBLIC_URL", "")
+    env_clean = _normalise_public_url(env_raw)
+    if env_clean:
+        return env_clean, "HERMES_DASHBOARD_PUBLIC_URL"
+    cfg_raw = str(_dashboard_config().get("public_url") or "")
+    cfg_clean = _normalise_public_url(cfg_raw)
+    if cfg_clean:
+        return cfg_clean, "dashboard.public_url"
+    if env_raw.strip():
+        return env_raw.strip(), "HERMES_DASHBOARD_PUBLIC_URL"
+    if cfg_raw.strip():
+        return cfg_raw.strip(), "dashboard.public_url"
+    return "", "dashboard.public_url"
+
+
+def _env_or_cfg(env_name: str, cfg_value: object) -> str:
+    """Env wins over config; blank env falls through (plugins/dashboard_auth/_shared.py:53-56)."""
+    return os.environ.get(env_name, "").strip() or str(cfg_value or "").strip()
+
+
+def basic_auth_fix() -> str:
+    """Empty when BasicAuthProvider will register, else the fix hint
+    (plugins/dashboard_auth/basic/__init__.py:126-133, 206-285)."""
+    raw_section = _dashboard_config().get("basic_auth")
+    section = raw_section if isinstance(raw_section, dict) else {}
+    username = _env_or_cfg("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", section.get("username"))
+    password_hash = _env_or_cfg(
+        "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", section.get("password_hash")
+    )
+    password = _env_or_cfg("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", section.get("password"))
+    if not username or not (password_hash or password):
+        return (
+            "Set dashboard.basic_auth.username with either dashboard.basic_auth.password or "
+            "dashboard.basic_auth.password_hash, or set HERMES_DASHBOARD_BASIC_AUTH_USERNAME with "
+            "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD or HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH. "
+            "A redirect sign-in provider cannot finish on the Hands host, which serves only the "
+            "device routes."
+        )
+    secret = _env_or_cfg("HERMES_DASHBOARD_BASIC_AUTH_SECRET", section.get("secret"))
+    if (
+        secret
+        and not any(marker in secret for marker in _UNEXPANDED_SHELL_MARKERS)
+        and len(secret.encode("utf-8")) < 16
+    ):
+        return (
+            "Set dashboard.basic_auth.secret (or HERMES_DASHBOARD_BASIC_AUTH_SECRET) to at least 16 "
+            "bytes, or leave it unset."
+        )
+    return ""
+
+
+def pair_reply(ctx, name: str, *, has_seed: bool) -> str:
+    """Mint and format a pairing reply for ``name``, or refuse without minting a code."""
+    if name == store.RESERVED_NAME:
+        return messages.PAIR_NAME_RESERVED
+    if not has_seed:
+        return messages.NOT_SET_UP
+    public_url, source_name = _resolve_public_url()
+    if public_url:
+        gateway_url = public_url
+    else:
+        raw_dashboard_url = str(
+            ctx.get_config("dashboard_url", default=DEFAULT_DASHBOARD_URL) or ""
+        ).strip()
+        gateway_url = _normalise_public_url(raw_dashboard_url) or raw_dashboard_url
+        source_name = "dashboard_url"
+    if not https_or_loopback(gateway_url):
+        if _parsed_http_url(gateway_url) is not None:
+            return (
+                f"{source_name} is {gateway_url}, and the device refuses a non-loopback http "
+                "pairing URL. Set dashboard.public_url to the https URL of the Hands host, then run "
+                "this again."
+            )
+        return (
+            f"{source_name} is {gateway_url or 'not set'}, which is not a valid https or loopback http "
+            "pairing URL. Set dashboard.public_url to the https URL of the Hands host, then run "
+            "this again."
+        )
+    code = store.mint_pairing_code(name)
+    command = f"hermes-hands pair {gateway_url} --name {shlex.quote(name)} --code={shlex.quote(code)}"
+    lines = [f"Pair code: {code}", f"Run on the device: {command}"]
+    if loopback_url(gateway_url):
+        lines.append("Note: a loopback URL pairs only a device on the gateway host itself.")
+    return "\n".join(lines)
 
 
 def _ids(value: object) -> set[str]:
@@ -127,20 +293,7 @@ def register_commands(ctx, *, has_seed: bool) -> None:
         if action == "pair":
             if _in_shared_chat(source):
                 return messages.PAIR_DIRECT_ONLY
-            if name == store.RESERVED_NAME:
-                return messages.PAIR_NAME_RESERVED
-            if not has_seed:
-                return messages.NOT_SET_UP
-            code = store.mint_pairing_code(name)
-            from hermes_cli.config import load_config_readonly
-
-            dashboard = (load_config_readonly() or {}).get("dashboard") or {}
-            gateway_url = (
-                dashboard.get("public_url")
-                or ctx.get_config("dashboard_url", default="http://127.0.0.1:9119")
-            )
-            command = f"hermes-hands pair {gateway_url} --name {shlex.quote(name)} --code={shlex.quote(code)}"
-            return f"Pair code: {code}\nRun on the device: {command}"
+            return pair_reply(ctx, name, has_seed=has_seed)
         if action == "use":
             if name != "server" and _in_shared_chat(source):
                 return messages.USE_DIRECT_ONLY

@@ -99,12 +99,17 @@ def install_doctor_modules(monkeypatch, config):
     monkeypatch.setattr(cli.commands, "terminal_backend", lambda: backend)
 
 
-def run_doctor(capsys, dashboard_url="http://127.0.0.1:9119"):
+def run_doctor_rc(capsys, dashboard_url="http://127.0.0.1:9119"):
     ctx = Context()
     ctx.config["dashboard_url"] = dashboard_url
     cli.register_cli(ctx, has_seed=True)
-    ctx.handler(types.SimpleNamespace(hands_action="doctor"))
-    return capsys.readouterr().out.splitlines()
+    rc = ctx.handler(types.SimpleNamespace(hands_action="doctor"))
+    return rc, capsys.readouterr().out.splitlines()
+
+
+def run_doctor(capsys, dashboard_url="http://127.0.0.1:9119"):
+    _, lines = run_doctor_rc(capsys, dashboard_url=dashboard_url)
+    return lines
 
 
 def healthy_config():
@@ -209,9 +214,11 @@ def test_doctor_fails_a_public_host_without_basic_auth(monkeypatch, capsys):
     monkeypatch.setattr(cli.client, "state", lambda: {"relay": True})
     monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
     assert run_doctor(capsys)[4] == (
-        "FAIL dashboard.basic_auth on the public host: Set dashboard.basic_auth.username and "
-        "password_hash. A redirect sign-in provider cannot finish on the Hands host, which serves "
-        "only the device routes."
+        "FAIL dashboard.basic_auth on the public host: Set dashboard.basic_auth.username with "
+        "either dashboard.basic_auth.password or dashboard.basic_auth.password_hash, or set "
+        "HERMES_DASHBOARD_BASIC_AUTH_USERNAME with HERMES_DASHBOARD_BASIC_AUTH_PASSWORD or "
+        "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH. A redirect sign-in provider cannot finish on "
+        "the Hands host, which serves only the device routes."
     )
 
 
@@ -353,3 +360,57 @@ def test_pair_cli_ignores_an_undeclared_public_url_setting(monkeypatch, capsys):
         "hermes-hands pair https://hands.example.com --name laptop --code=pair-code"
         in capsys.readouterr().out
     )
+
+
+def test_doctor_exits_nonzero_when_any_check_fails(monkeypatch, capsys):
+    """A6: hermes hands doctor returns 0 when all checks pass and non-zero when any check fails."""
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+    install_doctor_modules(monkeypatch, healthy_config())
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True, "devices": [], "alerts": []})
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
+    rc, lines = run_doctor_rc(capsys)
+    assert rc == 0 and all(line.startswith("PASS ") for line in lines)
+
+    broken = healthy_config()
+    broken["terminal"]["backend"] = "local"
+    install_doctor_modules(monkeypatch, broken)
+    rc, lines = run_doctor_rc(capsys)
+    assert rc == 1 and lines[0].startswith("FAIL ")
+
+
+def test_doctor_fails_a_loopback_http_public_url(monkeypatch, capsys):
+    """A6: dashboard.public_url must be https or unset; a loopback http public_url fails."""
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+    config = healthy_config()
+    config["dashboard"]["public_url"] = "http://127.0.0.1:9119"
+    install_doctor_modules(monkeypatch, config)
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True})
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
+    rc, lines = run_doctor_rc(capsys)
+    assert rc == 1
+    assert lines[3].startswith("FAIL dashboard.public_url is https or unset: It is http://127.0.0.1:9119")
+
+
+def test_doctor_honors_env_overrides_for_public_url_and_basic_auth(monkeypatch, capsys):
+    """A7: HERMES_DASHBOARD_PUBLIC_URL and HERMES_DASHBOARD_BASIC_AUTH_* override config.yaml."""
+    config = {"terminal": {"backend": "hands"}, "dashboard": {"public_url": "http://broken.example"}}
+    install_doctor_modules(monkeypatch, config)
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True})
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
+
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://hands.example.com/")
+    monkeypatch.setenv("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "owner")
+    monkeypatch.setenv("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "s3cret")
+    rc, lines = run_doctor_rc(capsys)
+    assert rc == 0 and all(line.startswith("PASS ") for line in lines)
+
+    # Blank env does not shadow config.yaml (prefix.py:119-120, 128-134).
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "   ")
+    rc, lines = run_doctor_rc(capsys)
+    assert rc == 1 and lines[3].startswith("FAIL dashboard.public_url is https or unset: It is http://broken.example")
+
+    # Secret under 16 bytes is rejected by BasicAuthProvider.__init__ (basic/__init__.py:131-132).
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://hands.example.com")
+    monkeypatch.setenv("HERMES_DASHBOARD_BASIC_AUTH_SECRET", "too-short")
+    rc, lines = run_doctor_rc(capsys)
+    assert rc == 1 and lines[4].startswith("FAIL dashboard.basic_auth on the public host:")

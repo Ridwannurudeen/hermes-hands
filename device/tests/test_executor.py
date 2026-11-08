@@ -1,9 +1,13 @@
 import os
 import base64
+import ctypes
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import psutil
@@ -113,13 +117,14 @@ def test_cmd_slash_switch_can_be_passed_without_msys_path_conversion(monkeypatch
     assert output.strip() == b"x"
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows background-job pipe inheritance regression")
-def test_background_process_survives_shell_exit(monkeypatch, tmp_path):
+@pytest.mark.skipif(os.name != "nt", reason="Windows background-job containment")
+def test_background_process_survives_shell_exit_until_job_finishes(monkeypatch, tmp_path):
     bash = executor.resolve_bash()
     if not bash:
         pytest.skip("Git Bash is unavailable")
     monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(executor, "_WINDOWS_JOBS", {})
     pid_file = tmp_path / "background.pid"
     script_file = tmp_path / "background.py"
     script_file.write_text(
@@ -127,23 +132,32 @@ def test_background_process_survives_shell_exit(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     started = time.monotonic()
-    output = b"".join(
-        executor.run(
-            f'nohup python "{script_file.as_posix()}" >/dev/null 2>&1 & echo $!', timeout=15
-        )
-    )
+    output = b"".join(executor.run(
+        f'nohup python "{script_file.as_posix()}" >/dev/null 2>&1 & child=$!; '
+        f'for i in {{1..100}}; do test -e "{pid_file.as_posix()}" && break; sleep 0.01; done; '
+        "echo $child",
+        timeout=15,
+    ))
     elapsed = time.monotonic() - started
     assert output.splitlines()[0].isdigit()
     deadline = time.monotonic() + 15
     while not pid_file.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
+    assert pid_file.exists()
+    assert elapsed < 17
     child_pid = int(pid_file.read_text(encoding="utf-8-sig"))
+    job_pids = tuple(executor._WINDOWS_JOBS)
     try:
-        assert elapsed < 17
         assert psutil.pid_exists(child_pid)
+        assert len(job_pids) == 1
     finally:
         if psutil.pid_exists(child_pid):
             psutil.Process(child_pid).kill()
+        if job_pids:
+            deadline = time.monotonic() + 2
+            while job_pids[0] in executor._WINDOWS_JOBS and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert job_pids[0] not in executor._WINDOWS_JOBS
 
 
 def test_chatty_background_writer_is_bounded_after_shell_exit(monkeypatch, tmp_path):
@@ -152,6 +166,7 @@ def test_chatty_background_writer_is_bounded_after_shell_exit(monkeypatch, tmp_p
         pytest.skip("bash is unavailable")
     monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(executor, "POST_EXIT_DRAIN_LIMIT", 0.2)
     pid_file = tmp_path / "writer.pid"
     script_file = tmp_path / "writer.py"
     script_file.write_text(
@@ -159,7 +174,8 @@ def test_chatty_background_writer_is_bounded_after_shell_exit(monkeypatch, tmp_p
         encoding="utf-8",
     )
     started = time.monotonic()
-    chunks = b"".join(executor.run(f'python "{script_file.as_posix()}" & echo parent-exit', timeout=15))
+    truncated = []
+    chunks = b"".join(executor.run(f'python "{script_file.as_posix()}" & echo parent-exit', timeout=15, on_truncated=lambda: truncated.append(True)))
     elapsed = time.monotonic() - started
     deadline = time.monotonic() + 15
     while not pid_file.exists() and time.monotonic() < deadline:
@@ -170,7 +186,49 @@ def test_chatty_background_writer_is_bounded_after_shell_exit(monkeypatch, tmp_p
             psutil.Process(child_pid).kill()
     assert b"parent-exit" in chunks
     assert b"tick" in chunks or b"[output truncated after the post-exit idle limit]" in chunks or b"[device timeout]" in chunks
+    assert truncated == [True]
     assert elapsed < 17
+
+
+def test_post_exit_drain_budget_ignores_pre_exit_backpressure(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(executor, "OUTPUT_QUEUE_SIZE", 1)
+    monkeypatch.setattr(executor, "POST_EXIT_DRAIN_LIMIT", 0.2)
+    pid_file = tmp_path / "writer.pid"
+    script = (
+        "head -c 65536 /dev/zero | tr '\\000' x; sleep 0.6; "
+        f'(for i in {{1..100}}; do printf y; sleep 0.05; done) & echo $! > "{pid_file.as_posix()}"; '
+        "printf 'PARENT_EXIT\\n'"
+    )
+    output = bytearray()
+    exit_marker_at = None
+    truncated_after_exit = None
+    slowed = False
+    started = time.monotonic()
+    try:
+        for chunk in executor.run(script, timeout=10):
+            output.extend(chunk)
+            if exit_marker_at is None and b"PARENT_EXIT" in output:
+                exit_marker_at = time.monotonic()
+            if exit_marker_at is not None and b"[output truncated after the post-exit idle limit]" in chunk:
+                truncated_after_exit = time.monotonic() - exit_marker_at
+            if not slowed and chunk and all(byte == ord("x") for byte in chunk):
+                slowed = True
+                time.sleep(0.5)
+    finally:
+        if pid_file.exists():
+            pid = int(pid_file.read_text(encoding="utf-8-sig"))
+            if psutil.pid_exists(pid):
+                psutil.Process(pid).kill()
+
+    assert exit_marker_at is not None
+    assert truncated_after_exit is not None
+    assert truncated_after_exit < 0.5
+    assert time.monotonic() - started < 5
 
 
 def test_large_script_runs_from_temp_file_and_is_removed(monkeypatch, tmp_path):
@@ -223,7 +281,7 @@ def test_recorded_process_reap_kills_process_group(monkeypatch):
     monkeypatch.setattr(executor.psutil, "Process", lambda pid: type("Process", (), {"create_time": lambda self: 1.0})())
     monkeypatch.setattr(executor.os, "killpg", lambda pid, sig: calls.append((pid, sig)))
     executor.terminate_recorded(4321, 1.0)
-    assert calls == [(4321, executor.signal.SIGKILL)]
+    assert calls == [(4321, getattr(executor.signal, "SIGKILL", executor.signal.SIGTERM))]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows taskkill tree behavior")
@@ -459,4 +517,136 @@ def test_recorded_posix_reap_kills_the_process_group(monkeypatch):
     monkeypatch.setattr(executor.psutil, "Process", lambda pid: process)
     monkeypatch.setattr(executor.os, "killpg", lambda pid, sig: killed.append((pid, sig)), raising=False)
     executor.terminate_recorded(1234, 2.0)
-    assert killed == [(1234, executor.signal.SIGKILL)]
+    assert killed == [(1234, getattr(executor.signal, "SIGKILL", executor.signal.SIGTERM))]
+
+
+def test_open_windows_job_requests_terminate_access(monkeypatch):
+    kernel32 = SimpleNamespace(OpenJobObjectW=Mock(return_value=4321))
+    monkeypatch.setattr(executor.os, "name", "nt")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel32, raising=False)
+
+    assert executor._open_windows_job(1234, 1.0) == 4321
+    assert kernel32.OpenJobObjectW.call_args.args[0] == 0x0008
+
+
+def test_create_windows_job_sets_kill_on_close_and_resumes_after_assignment(monkeypatch):
+    events = []
+    kernel32 = SimpleNamespace(
+        CreateJobObjectW=Mock(return_value=111),
+        SetInformationJobObject=Mock(side_effect=lambda job, kind, info, size: events.append(("set", info._obj.BasicLimitInformation.LimitFlags)) or 1),
+        AssignProcessToJobObject=Mock(side_effect=lambda job, process: events.append(("assign", job.value, process.value)) or 1),
+        OpenThread=Mock(side_effect=lambda access, inherit, thread_id: events.append(("open-thread", access, thread_id)) or 222),
+        ResumeThread=Mock(side_effect=lambda thread: events.append(("resume-thread", thread.value)) or 1),
+        CloseHandle=Mock(side_effect=lambda handle: events.append(("close-handle", handle.value))),
+        TerminateJobObject=Mock(),
+    )
+    monkeypatch.setattr(executor.os, "name", "nt")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel32, raising=False)
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(kernel32=kernel32), raising=False)
+    monkeypatch.setattr(executor.psutil, "Process", lambda pid: SimpleNamespace(threads=lambda: [SimpleNamespace(id=333)]))
+    monkeypatch.setattr(executor, "_WINDOWS_JOBS", {})
+    process = SimpleNamespace(pid=1234, _handle=444)
+
+    job = executor._create_windows_job(process, 5.0)
+
+    assert job == 111
+    assert events == [
+        ("set", 0x00002000),
+        ("assign", 111, 444),
+        ("open-thread", 0x0002, 333),
+        ("resume-thread", 222),
+        ("close-handle", 222),
+    ]
+    assert executor._WINDOWS_JOBS == {1234: 111}
+
+
+def test_windows_executor_starts_process_suspended_until_job_setup(monkeypatch, tmp_path):
+    flags = []
+
+    class Process:
+        pid = 1234
+        stdout = None
+
+        def poll(self):
+            return None
+
+        def wait(self):
+            return 1
+
+    process = Process()
+    monkeypatch.setattr(executor.os, "name", "nt")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: "bash.exe")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(executor.psutil, "Process", lambda pid: SimpleNamespace(create_time=lambda: 1.0))
+    monkeypatch.setattr(executor.subprocess, "Popen", lambda args, **kwargs: flags.append(kwargs["creationflags"]) or process)
+    monkeypatch.setattr(executor, "_create_windows_job", lambda *args: (_ for _ in ()).throw(RuntimeError("stop after process creation")))
+    monkeypatch.setattr(executor, "_terminate", lambda *args: None)
+    monkeypatch.setattr(executor, "_close_windows_job", lambda *args: None)
+
+    with pytest.raises(RuntimeError, match="stop after process creation"):
+        list(executor.run("echo hi"))
+
+    assert flags[0] & 0x00000004
+
+
+def test_windows_job_close_waits_for_inflight_termination(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    events = []
+
+    def terminate(job, code):
+        events.append("terminate-start")
+        entered.set()
+        assert release.wait(2)
+        events.append("terminate-end")
+        return 1
+
+    def close(handle):
+        events.append("close")
+        closed.set()
+
+    kernel32 = SimpleNamespace(TerminateJobObject=Mock(side_effect=terminate), CloseHandle=Mock(side_effect=close))
+    monkeypatch.setattr(executor.os, "name", "nt")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel32, raising=False)
+    monkeypatch.setattr(executor, "_WINDOWS_JOBS", {1234: 5678})
+    process = SimpleNamespace(pid=1234)
+    terminator = threading.Thread(target=executor._terminate, args=(process, 1.0))
+    closer = threading.Thread(target=executor._close_windows_job, args=(process, 5678))
+    terminator.start()
+    try:
+        assert entered.wait(1)
+        closer.start()
+        assert not closed.wait(0.05)
+    finally:
+        release.set()
+        terminator.join(2)
+        if closer.ident is not None:
+            closer.join(2)
+
+    assert events == ["terminate-start", "terminate-end", "close"]
+
+
+def test_close_windows_job_keeps_handle_until_active_process_exits(monkeypatch):
+    active_processes = [1]
+    closed = threading.Event()
+
+    def query(job, info_class, info, size, returned):
+        info._obj.ActiveProcesses = active_processes[0]
+        return 1
+
+    kernel32 = SimpleNamespace(
+        QueryInformationJobObject=Mock(side_effect=query),
+        CloseHandle=Mock(side_effect=lambda handle: closed.set()),
+    )
+    monkeypatch.setattr(executor.os, "name", "nt")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel32, raising=False)
+    monkeypatch.setattr(executor, "_WINDOWS_JOBS", {1234: 5678})
+    process = SimpleNamespace(pid=1234)
+
+    executor._close_windows_job(process, 5678, keep_active=True)
+
+    assert executor._WINDOWS_JOBS == {1234: 5678}
+    active_processes[0] = 0
+    assert closed.wait(1)
+    assert executor._WINDOWS_JOBS == {}

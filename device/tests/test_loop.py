@@ -213,6 +213,7 @@ def test_pair_accepts_correctly_signed_reply(monkeypatch):
     _, device_public = generate_keypair()
     monkeypatch.setattr(cli, "get_or_create", lambda: (private, device_public))
     monkeypatch.setattr(cli.policy, "digest", lambda: "policy-hash")
+    monkeypatch.setattr(config, "load", lambda: {})
     saved = []
     monkeypatch.setattr(config, "save", lambda data: saved.append(data))
     body = canonical_json({"device_id": "device-1", "relay_public_key": b64u(public)})
@@ -561,7 +562,7 @@ def test_loop_drains_all_output_when_result_posts_are_slow(monkeypatch, tmp_path
     assert "".join(output).encode() == b"x" * 200_000
 
 
-def test_loop_marks_post_exit_output_truncation(monkeypatch, tmp_path):
+def test_loop_finishes_when_post_exit_pipe_is_idle(monkeypatch, tmp_path):
     bash = loop.executor.resolve_bash()
     if not bash:
         pytest.skip("bash is unavailable")
@@ -579,13 +580,36 @@ def test_loop_marks_post_exit_output_truncation(monkeypatch, tmp_path):
 
     agent._run_job({"job_id": "idle-pipe", "type": "exec", "script": "sleep 0.6 & echo early", "timeout": 5})
     time.sleep(0.7)
-    assert posted[-1] == {
-        "chunk": "early\n[output truncated after the post-exit idle limit]\n",
+    assert "".join(item.get("chunk", "") for item in posted) == "early\n"
+    assert posted[-1]["done"] is True
+    assert posted[-1]["returncode"] == 0
+
+
+def test_model_workdir_inside_eval_is_checked_for_self_protection(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.accepted_policy_hash = "hash"
+    agent.processes = {}
+    agent.running = {}
+    agent.cancelled_jobs = set()
+    agent.job_deadlines = {}
+    agent.process_lock = threading.Lock()
+    posted = []
+    ran = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: ran.append(args[0]) or iter(()))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    script = "builtin cd -- '/home/u/project' 2>/dev/null || true\n" + _core_wrapped(
+        "builtin cd -- ~/.hermes-hands || exit 126\ncat device.json"
+    )
+
+    agent._run_job({"job_id": "model-workdir", "type": "exec", "script": script})
+
+    assert ran == []
+    assert posted == [{
+        "chunk": f"Policy refused command matching: {loop.policy.DEFAULTS[1]}\n",
         "done": True,
-        "returncode": 1,
-        "error": "Output was truncated after the post-exit pipe idle limit",
-    }
-    assert any("early" in item.get("chunk", "") for item in posted)
+        "returncode": 126,
+    }]
 
 
 def test_cancel_remembered_before_registration_reaches_terminate(monkeypatch):

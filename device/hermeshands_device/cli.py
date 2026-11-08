@@ -22,7 +22,7 @@ from . import service
 API = "/api/plugins/hermes-hands"
 
 
-def _pair(url: str, name: str, code: str) -> int:
+def _pair(url: str, name: str, code: str, *, force: bool = False) -> int:
     base_url = url.rstrip("/")
     if base_url.endswith(API):
         base_url = base_url[: -len(API)].rstrip("/")
@@ -35,6 +35,9 @@ def _pair(url: str, name: str, code: str) -> int:
             pass
     if parsed_url.scheme != "https" and not (parsed_url.scheme == "http" and loopback):
         print("Pairing requires an https URL unless the gateway host is loopback", file=sys.stderr)
+        return 1
+    if config.load().get("device_id") and not force:
+        print("This device is already paired. Pass --force to replace the pairing.", file=sys.stderr)
         return 1
     pair_url = base_url + API + "/pair"
     private, public = get_or_create()
@@ -131,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     pair.add_argument("gateway_url")
     pair.add_argument("--name", required=True)
     pair.add_argument("--code", required=True)
+    pair.add_argument("--force", action="store_true")
     serve = subs.add_parser("serve")
     serve.add_argument("--allow-screen", action="store_true")
     subs.add_parser("status")
@@ -144,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
     subs.add_parser("unpair")
     args = parser.parse_args(argv)
     if args.command == "pair":
-        return _pair(args.gateway_url, args.name, args.code)
+        return _pair(args.gateway_url, args.name, args.code, force=args.force)
     if args.command == "serve":
         from .loop import DeviceLoop
         from .janitor import start as start_janitor

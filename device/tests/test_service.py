@@ -47,7 +47,7 @@ def test_install_service_uses_absolute_pythonw_and_ignores_cwd_command(monkeypat
     arguments = calls[0][2].findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns)
     assert command == str(pythonw)
     assert service.Path(command).is_absolute()
-    assert arguments == "-m hermeshands_device.cli serve"
+    assert arguments == "-I -m hermeshands_device.cli serve"
 
 
 def test_install_service_dry_run_prints_command_without_running(monkeypatch, tmp_path, capsys):
@@ -65,7 +65,7 @@ def test_install_service_dry_run_prints_command_without_running(monkeypatch, tmp
     assert "RestartOnFailure" in output and "<Count>3</Count>" in output
     assert "LAPTOP\\A User" in output
     assert str(pythonw) in output
-    assert "-m hermeshands_device.cli serve" in output
+    assert "-I -m hermeshands_device.cli serve" in output
 
 
 def test_install_service_passes_allow_screen_to_task(monkeypatch, tmp_path, capsys):
@@ -76,7 +76,7 @@ def test_install_service_passes_allow_screen_to_task(monkeypatch, tmp_path, caps
     assert service.install(dry_run=True, allow_screen=True) == 0
     output = capsys.readouterr().out
     assert str(pythonw) in output
-    assert "-m hermeshands_device.cli serve --allow-screen" in output
+    assert "-I -m hermeshands_device.cli serve --allow-screen" in output
 
 
 def test_install_service_refuses_relative_python_executable(monkeypatch, capsys):
@@ -116,7 +116,7 @@ def test_task_xml_has_current_user_logon_and_unlimited_restartable_settings():
     assert root.findtext("t:Settings/t:ExecutionTimeLimit", namespaces=ns) == "PT0S"
     assert root.findtext("t:Settings/t:RestartOnFailure/t:Count", namespaces=ns) == "3"
     assert root.findtext("t:Actions/t:Exec/t:Command", namespaces=ns) == r"C:\Program Files\pythonw.exe"
-    assert root.findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns) == "-m hermeshands_device.cli serve"
+    assert root.findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns) == "-I -m hermeshands_device.cli serve"
     assert root.findtext("t:Actions/t:Exec/t:WorkingDirectory", namespaces=ns) == str(service.Path.home())
 
 

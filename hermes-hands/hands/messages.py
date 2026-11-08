@@ -45,6 +45,9 @@ REPLAYED = "hands: this request was already used once."
 JOB_TOO_LARGE = (
     "hands: the command or its input is longer than 16 million characters, so nothing ran."
 )
+BAD_SCRIPT_ENCODING = (
+    "hands: the command contains characters that cannot be encoded as UTF-8, so nothing ran."
+)
 STORE_SPLIT = (
     "hands: the relay answers but uses a different store from this gateway, so pairing codes and "
     "devices do not reach it. Run the gateway and the dashboard with the same HERMES_HOME."

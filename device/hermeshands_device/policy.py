@@ -9,14 +9,14 @@ from . import config
 from .protocol import canonical_json, policy_hash
 
 DEFAULTS = [
-    r"(?:^|[\s;&|(`])hermes-?hands(?:\.exe)?\s+(?:pair|unpair|serve|install-service|policy)\b|\b(?:pipx|pip|runpip|uv\s+(?:tool|pip))\s+uninstall\s+hermes-?hands\b|\bpython\s+-m\s+pip\s+uninstall\s+hermes-?hands\b|^\s*hermeshands\s*$",
+    r"(?:^|[\s;&|(`'\"])(?:(?:\"[^\"]*[\\/]|'[^']*[\\/]|[^\s;&|()'\"`]+[\\/])*)hermes-?hands(?:\.exe)?[\"']?\s+(?:pair|unpair|serve|install-service|policy)\b|\b(?:pipx|pip|runpip|uv\s+(?:tool|pip))\s+uninstall\s+hermes-?hands\b|\bpython\s+-m\s+pip\s+uninstall\s+hermes-?hands\b|\bpython(?:w|[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?\s+-m\s+hermeshands_device(?:\.cli)?\s+(?:pair|unpair|serve|install-service|policy)\b|^\s*hermeshands\s*$",
     r"\.hermes-hands(?:[/\\]|\b)",
     r"\b(?:taskkill|Stop-Process|kill)\b.*(?:\$PPID|<agent-pid>)",
     r"\b(?:schtasks\s+/{1,2}(?:End|Delete)|Stop-ScheduledTask|Unregister-ScheduledTask)\b.*HermesHands|\btaskkill\b.*(?:/|//|-)(?:F|IM)\b.*hermes-?hands(?:\.exe)?\b|\bkillall\s+hermes-?hands(?:\.exe)?\b",
     r"\bsudo\b",
     r"(?:rm\s+-rf\s+(?:/(?:\s|$)|['\"]?(?:~/?|\$HOME/?)['\"]?(?:\s|$))|\bRemove-Item\b.*(?:[A-Za-z]:\\|[/\\])(?:\s|$).*?-Recurse)",
     r"\bmkfs(?:\.[\w-]+)?\b|\bdd\b.*\bof=/dev/",
-    r"\bdiskpart\b|(?:^|[\r\n;&|()])\s*(?:cmd(?:\.exe)?\s+/c\s+)?(?:[A-Za-z]:\\(?:[^\\\s;&|()]+\\)*)?format(?:\.com)?\s+[A-Za-z]:",
+    r"\bdiskpart\b|(?:^|[\r\n;&|()])\s*(?:MSYS_NO_PATHCONV=1\s+)?(?:cmd(?:\.exe)?\s+/c\s+)?(?:[A-Za-z]:\\(?:[^\\\s;&|()]+\\)*)?format(?:\.com)?\s+[A-Za-z]:",
     r"\b(?:shutdown|reboot|Stop-Computer)\b",
     r"(?:curl|wget|Invoke-WebRequest).*\|\s*(?:sh|bash|pwsh|powershell)",
     r"(?:taskkill\s+/PID\s+<agent-pid>\b|Stop-Process\b.*-Id\s+<agent-pid>\b|\bkill\s+-?9?\s+<agent-pid>\b)",

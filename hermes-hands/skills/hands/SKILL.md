@@ -62,11 +62,12 @@ The line names the cause:
 - `... is offline, so nothing ran` (the device agent is not running or the laptop is asleep)
 - `no paired device is named ...` (revoked or never paired)
 - `the relay ... is not reachable, so nothing ran on the device` (the dashboard on the gateway is
-  down). In the rare case that it went down just as it took the command, the command may still run,
-  so check before you repeat anything that is not safe to run twice.
+  down)
 - `the deny-list on ... changed since it was paired` (the relay refuses that device)
 - `the command or its input is longer than 16 million characters, so nothing ran` (split the work,
   or write the file in smaller parts)
+- `the command contains characters that cannot be encoded as UTF-8, so nothing ran` (remove invalid
+  surrogate characters before trying again)
 - `the relay cannot read the Hermes Hands store ... and refused this request` (the relay refused the
   command before it ran; the cause is in the dashboard log on the gateway, so tell the user)
 
@@ -75,9 +76,11 @@ server, or the fix the line names (start `hermes-hands serve` on the device, or 
 <device>` if they changed the deny-list themselves). Do not retry in a loop, and do not try to reach
 the device some other way.
 
-When the line says the command **may have run**, it started on the device and Hands lost track of
-it, so it may have partly run or may still be running there, and any output you have is partial:
+When the line says the command **may have run**, it may have been queued or started on the device
+before Hands lost track of it, so it may run, may have partly run, or may still be running there,
+and any output you have is partial:
 
+- `the relay stopped answering after the command was sent to it, so it may have been queued and may run on ...`
 - `contact with the relay was lost after the command started on ..., so it may still be running there`
 - `the device agent on ... restarted while the command ran, so it may have partly run there`
 - `... went offline before the command finished; any output above is partial`

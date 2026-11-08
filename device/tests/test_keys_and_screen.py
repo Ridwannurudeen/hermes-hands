@@ -18,7 +18,7 @@ def test_file_key_fallback_is_private_on_posix(monkeypatch, tmp_path):
         assert config.KEY_PATH.stat().st_mode & 0o777 == 0o600
 
 
-def test_keyring_backend_error_falls_back_to_file(monkeypatch, tmp_path, caplog):
+def test_keyring_backend_error_refuses_to_mint_a_new_key(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ROOT", tmp_path)
     monkeypatch.setattr(config, "KEY_PATH", tmp_path / "device.json")
 
@@ -37,13 +37,12 @@ def test_keyring_backend_error_falls_back_to_file(monkeypatch, tmp_path, caplog)
             raise KeyringError("no backend")
 
     monkeypatch.setattr(keys, "_keyring", lambda: BrokenKeyring)
-    pair = keys.get_or_create()
-    assert keys.get_or_create() == pair
-    assert config.KEY_PATH.exists()
-    assert "using protected device key file" in caplog.text
+    with pytest.raises(RuntimeError, match="refusing to create a new device identity"):
+        keys.get_or_create()
+    assert not config.KEY_PATH.exists()
 
 
-def test_non_keyring_error_while_loading_key_falls_back_to_file(monkeypatch, tmp_path, caplog):
+def test_non_keyring_error_while_loading_key_refuses_to_mint_a_new_key(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ROOT", tmp_path)
     monkeypatch.setattr(config, "KEY_PATH", tmp_path / "device.json")
 
@@ -58,10 +57,9 @@ def test_non_keyring_error_while_loading_key_falls_back_to_file(monkeypatch, tmp
             raise RuntimeError("keyring backend failed unexpectedly")
 
     monkeypatch.setattr(keys, "_keyring", lambda: BrokenKeyring)
-    pair = keys.get_or_create()
-    assert keys.get_or_create() == pair
-    assert config.KEY_PATH.exists()
-    assert "using protected device key file" in caplog.text
+    with pytest.raises(RuntimeError, match="refusing to create a new device identity"):
+        keys.get_or_create()
+    assert not config.KEY_PATH.exists()
 
 
 def test_existing_file_key_is_authoritative_when_keyring_appears(monkeypatch, tmp_path):

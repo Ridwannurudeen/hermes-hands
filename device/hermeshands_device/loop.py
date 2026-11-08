@@ -227,9 +227,11 @@ class DeviceLoop:
                 if not wrapped_command:
                     wrapped_command = _CORE_PLAIN_EVAL_COMMAND.search(policy_script)
                 if wrapped_command:
+                    cwd = _CORE_CWD.search(policy_script[: wrapped_command.start()])
                     policy_script = wrapped_command.group(1).replace("'\\''", "'")
-                cwd = _CORE_CWD.search(script)
-                policy_script = _CORE_CWD.sub("", policy_script)
+                else:
+                    cwd = _CORE_CWD.search(policy_script)
+                    policy_script = _CORE_CWD.sub("", policy_script, count=1)
                 if cwd and policy.refusal(cwd.group(1), policy_patterns[:4]):
                     refused = policy.refusal(cwd.group(1), policy_patterns[:4])
                 elif job.get("file_op"):

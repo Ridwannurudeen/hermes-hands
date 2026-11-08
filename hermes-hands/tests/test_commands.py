@@ -117,11 +117,14 @@ def test_the_device_cli_accepts_a_printed_code_that_starts_with_a_dash(monkeypat
     reply = ctx.handler("pair laptop", session_key="s", platform="telegram", source=Source())
     command = shlex.split(reply.split("Run on the device: ", 1)[1])
     calls = []
-    monkeypatch.setattr(device_cli, "_pair", lambda *args: calls.append(args) or 0)
+    monkeypatch.setattr(
+        device_cli, "_pair", lambda *args, **kwargs: calls.append((args, kwargs)) or 0
+    )
     assert command[0] == "hermes-hands"
     assert device_cli.main(command[1:]) == 0
-    assert calls[0][0] == "https://hands.example.com"
-    assert "-Q3xk_Abc" in calls[0]
+    assert calls[0][0][0] == "https://hands.example.com"
+    assert "-Q3xk_Abc" in calls[0][0]
+    assert calls[0][1] == {"force": False}
 
 
 def test_pair_refuses_without_a_relay_seed(monkeypatch):
@@ -304,3 +307,126 @@ def test_revoke_requires_exact_yes(monkeypatch):
     ctx.choice = "yes"
     assert ctx.handler("revoke laptop", session_key="s", platform="telegram", source=Source()) == "Device revoked."
     assert calls == ["laptop"]
+
+
+def test_pair_command_and_cli_agree_on_urls_env_overrides_and_refusals(monkeypatch, capsys):
+    """A7: /hands pair and hermes hands pair print the same URL (including HERMES_DASHBOARD_PUBLIC_URL)
+    and refuse the same bad URLs without minting codes."""
+    import argparse
+    from hands import cli
+
+    minted = []
+    monkeypatch.setattr(
+        commands.store, "mint_pairing_code", lambda name: minted.append(name) or "pair-code"
+    )
+
+    def run_both(cfg, *, dashboard_url=None, name="laptop"):
+        install_config(monkeypatch, cfg)
+        chat_ctx = setup(monkeypatch, ["telegram:42"])
+        c_ctx = type(
+            "CliCtx",
+            (),
+            {
+                "config": {} if dashboard_url is None else {"dashboard_url": dashboard_url},
+                "get_config": lambda self, k, default=None: self.config.get(k, default),
+                "register_cli_command": lambda self, n, h, s, fn: setattr(self, "setup_fn", s)
+                or setattr(self, "handler", fn),
+            },
+        )()
+        if dashboard_url is not None:
+            chat_ctx.config["dashboard_url"] = dashboard_url
+        cli.register_cli(c_ctx, has_seed=True)
+        parser = argparse.ArgumentParser()
+        c_ctx.setup_fn(parser)
+        chat_out = chat_ctx.handler(
+            f"pair {shlex.quote(name)}", session_key="s", platform="telegram", source=Source()
+        )
+        c_ctx.handler(parser.parse_args(["pair", name]))
+        cli_out = capsys.readouterr().out.rstrip("\n")
+        return chat_out, cli_out
+
+    # 1. HERMES_DASHBOARD_PUBLIC_URL overrides dashboard.public_url and strips trailing slash.
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://env.example.com/")
+    chat_out, cli_out = run_both({"dashboard": {"public_url": "https://cfg.example.com"}})
+    assert chat_out == cli_out
+    assert "hermes-hands pair https://env.example.com --name laptop --code=pair-code" in chat_out
+    assert len(minted) == 2
+
+    # 2. Non-loopback http in HERMES_DASHBOARD_PUBLIC_URL overrides valid config and is refused by both.
+    minted.clear()
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "http://env.example.com")
+    chat_out, cli_out = run_both({"dashboard": {"public_url": "https://cfg.example.com"}})
+    assert chat_out == cli_out
+    assert "refuses a non-loopback http pairing URL" in chat_out
+    assert minted == []
+
+    # 3. Non-loopback http in dashboard.public_url is refused by both.
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+    chat_out, cli_out = run_both({"dashboard": {"public_url": "http://hands.example.com"}})
+    assert chat_out == cli_out
+    assert chat_out.startswith("dashboard.public_url is http://hands.example.com")
+    assert minted == []
+
+    # 4. Malformed dashboard.public_url (missing scheme) is refused instead of falling back to loopback.
+    chat_out, cli_out = run_both({"dashboard": {"public_url": "hands.example.com"}})
+    assert chat_out == cli_out
+    assert "hands.example.com" in chat_out and "Pair code:" not in chat_out
+    assert minted == []
+
+    # 5. Non-loopback http dashboard_url when public_url is unset is refused by both.
+    chat_out, cli_out = run_both({"dashboard": {}}, dashboard_url="http://192.168.1.20:9119")
+    assert chat_out == cli_out
+    assert "http://192.168.1.20:9119" in chat_out and minted == []
+
+    # 6. Loopback fallback and reserved name "server" agree too.
+    chat_out, cli_out = run_both({"dashboard": {}}, dashboard_url="http://127.0.0.1:9119/")
+    assert chat_out == cli_out
+    assert "hermes-hands pair http://127.0.0.1:9119 --name laptop --code=pair-code" in chat_out
+    assert "a loopback URL pairs only a device on the gateway host itself" in chat_out
+
+    minted.clear()
+    chat_out, cli_out = run_both({"dashboard": {"public_url": "https://hands.example.com"}}, name="server")
+    assert chat_out == cli_out == commands.messages.PAIR_NAME_RESERVED
+    assert minted == []
+
+
+def test_public_url_and_basic_auth_resolution_match_hermes_core(monkeypatch, tmp_path):
+    """A7: verify against real Hermes v0.23.0 prefix.resolve_public_url and basic._settings."""
+    prefix = pytest.importorskip("hermes_cli.dashboard_auth.prefix")
+    basic = pytest.importorskip("plugins.dashboard_auth.basic")
+    shared = pytest.importorskip("plugins.dashboard_auth._shared")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for var in (
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+        "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
+        "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
+        "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    (tmp_path / "config.yaml").write_text(
+        "dashboard:\n  public_url: https://cfg.example.com/\n  basic_auth:\n    username: cfguser\n",
+        encoding="utf-8",
+    )
+    assert commands._resolve_public_url()[0] == prefix.resolve_public_url() == "https://cfg.example.com"
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "https://env.example.com/")
+    assert commands._resolve_public_url()[0] == prefix.resolve_public_url() == "https://env.example.com"
+    # Malformed env falls through to valid config in core (prefix.py:128-137).
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "missing-scheme.example.com")
+    assert commands._resolve_public_url()[0] == prefix.resolve_public_url() == "https://cfg.example.com"
+
+    # BasicAuthProvider skips until password or password_hash is provided, then registers with env override.
+    with pytest.raises(shared.SkipRegistration):
+        basic._settings()
+    assert commands.basic_auth_fix()
+
+    monkeypatch.setenv("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "hunter2")
+    assert basic.BasicAuthProvider(**basic._settings()) is not None
+    assert not commands.basic_auth_fix()
+
+    monkeypatch.setenv("HERMES_DASHBOARD_BASIC_AUTH_SECRET", "short")
+    with pytest.raises(ValueError):
+        basic.BasicAuthProvider(**basic._settings())
+    assert commands.basic_auth_fix()
