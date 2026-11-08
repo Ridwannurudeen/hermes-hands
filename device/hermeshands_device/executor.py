@@ -240,12 +240,11 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                 ready = ctypes.windll.kernel32.PeekNamedPipe(
                     msvcrt.get_osfhandle(proc.stdout.fileno()), None, 0, None, ctypes.byref(available_bytes), None
                 )
-                if not ready or available_bytes.value == 0:
-                    if proc.poll() is not None and not ready:
-                        chunk = b""
-                    else:
-                        time.sleep(0.05)
-                        continue
+                if not ready:
+                    chunk = os.read(proc.stdout.fileno(), CHUNK_SIZE)
+                elif available_bytes.value == 0:
+                    time.sleep(0.05)
+                    continue
                 else:
                     chunk = os.read(proc.stdout.fileno(), min(CHUNK_SIZE, available_bytes.value))
             else:
@@ -300,8 +299,6 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                 try:
                     chunk = chunks.get(timeout=min(PIPE_DRAIN_GRACE if proc.poll() is not None else 0.1, max(0.01, (drain_deadline[0] - now) if drain_deadline[0] else 0.1)))
                 except queue.Empty:
-                    if proc.poll() is not None:
-                        break
                     continue
                 if chunk is None:
                     break

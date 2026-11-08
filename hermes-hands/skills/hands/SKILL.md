@@ -23,10 +23,12 @@ Take paths from the note's home. Do not reuse paths from the server (or from ano
 a switch; they do not exist there. `hands_devices` lists the paired devices and whether each is
 online.
 
-Terminal commands on a device start in its home folder. File tools do not follow the device's
-working folder, not even after a `cd`, so on a device always give `read_file`, `write_file`, `patch`
-and `search_files` absolute device paths built from the note's home (`/c/Users/ridwan/...` on
-Windows, `/home/ridwan/...` on Linux). A relative path can land in a different folder.
+Terminal commands on a device start in its home folder. A relative path in `read_file`,
+`write_file`, `patch` or `search_files` resolves against the device's current terminal folder, but
+a working folder configured on the gateway still wins over it, so on a device prefer absolute device
+paths built from the note's home (`/c/Users/ridwan/...` on Windows, `/home/ridwan/...` on Linux). A
+`~/...` path lands in the device home, though the tool result may show the server's home in its
+`resolved_path`.
 
 Do not use `sudo` on a device: its default deny list refuses it with exit 126.
 

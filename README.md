@@ -98,6 +98,8 @@ On Windows, in PowerShell:
 
 4. Make `python3` work inside Git Bash. In Git Bash, `python3 -c "import sys; print(sys.version)"` must print a Python version. The python.org build from step 1 has no `python3.exe`, so Git Bash finds the Microsoft Store alias instead, which only prints "Python was not found". Installing the Python Install Manager gives Git Bash a working `python3`; on the laptop used for the live checks it runs the Python 3.12 from step 1. `hermes-hands doctor` runs the same check in Git Bash and names the Store alias if that is what it finds.
 
+Upgrading the device agent changes its default deny list, and with it the policy hash, so the relay refuses a device paired on an older version until the owner sends `/hands accept-policy <device>` once. It is a chat command (Telegram, the Desktop or the Hermes CLI chat); there is no `hermes hands accept-policy` command.
+
 Pair using the command printed by `/hands pair laptop`, substituting the displayed URL, name, and code. Mint the code after the device is installed: it works once and expires after 10 minutes.
 
 ```powershell
@@ -117,7 +119,7 @@ In Git Bash, native Windows commands that take `/switches` need the slash double
 
 With Hermes 0.23.0, Hands routes these tools through the selected device terminal backend: `terminal`, `execute_code`, `read_file`, `write_file`, `patch`, and `search_files`. `execute_code` needs Python available inside Git Bash. Hands also registers `hands_screenshot` and `hands_devices` as its own tools.
 
-The target is selected for each terminal call. The first terminal result after a target change identifies the target and device home. Terminal commands on a device start in the device's home folder. File tools do not follow the device's working folder, so the bundled skill tells the model to give them absolute device paths. `search_files` patterns reach the device exactly as the model wrote them. `/hands use server` switches terminal calls back to the gateway host. A chat that never chose a target uses `default_target`, which defaults to `server`; cron execution always uses `server`. The target belongs to the chat, so `/new` and `/reset` keep it: send `/hands use server` first when a fresh conversation should run on the gateway. A device command never falls back to the gateway.
+The target is selected for each terminal call. The first terminal result after a target change identifies the target and device home. Terminal commands on a device start in the device's home folder. A relative path in a file tool resolves against the device's current terminal folder, as on a local backend, except that a `terminal.cwd` configured on the gateway still wins; the bundled skill tells the model to prefer absolute device paths. `search_files` patterns reach the device exactly as the model wrote them. `/hands use server` switches terminal calls back to the gateway host. A chat that never chose a target uses `default_target`, which defaults to `server`; cron execution always uses `server`. The target belongs to the chat, so `/new` and `/reset` keep it: send `/hands use server` first when a fresh conversation should run on the gateway. A device command never falls back to the gateway.
 
 ## Known limits
 
@@ -125,6 +127,7 @@ The target is selected for each terminal call. The first terminal result after a
 - If a background job's pid is in use on two targets at once, `process kill` refuses that pid instead of guessing, until one of the jobs exits.
 - If the gateway loses the relay's reply just after the relay queued a command, Hands reports the relay as unreachable and says nothing ran, although the command may still run on the device.
 - When the device agent restarts, the gateway notices within about 10 seconds and then fails a command the old agent had taken, saying it may have partly run.
+- A file tool path written as `~/...` lands in the device home, but the tool result's `resolved_path` shows the gateway's home, because core expands `~` on the gateway.
 - A background job a device started with `nohup` keeps running after the device is revoked; stop it on the device yourself.
 - The device deny list checks the whole command a tool sends, so a file read, write or search whose path or search pattern contains a listed word such as `sudo` or `shutdown` is refused with exit 126. Rename the path, or search with the terminal instead.
 - A command handed to a connection the device can no longer read, for example during a Wi-Fi switch while the same agent process keeps running, is not delivered again; it fails when the gateway's terminal timeout ends.
