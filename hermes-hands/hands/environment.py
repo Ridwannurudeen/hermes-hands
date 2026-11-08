@@ -277,6 +277,8 @@ class HandsEnvironment(BaseEnvironment):
             self._store_failed()
             self._record_owner = None
         self._files_target: str | None = None
+        # target -> where its last terminal command that core records ended
+        self._session_cwd: dict[str, str] = {}
         # Create the first target now so ``cwd`` is already absolute when core stamps the sandbox
         # home right after create_environment (terminal_tool_backends.py:213-233, 256).
         self._current()
@@ -448,31 +450,35 @@ class HandsEnvironment(BaseEnvironment):
         """Where a terminal command or a background launch runs ("" keeps the target's own cwd), and
         whether core records where it ends. Core passes ``workdir=``, which it never records, else the
         session's recorded cwd, else the configured default or workspace (terminal_tool.py:1014-1061,
-        terminal_tool_background.py:173-176, terminal_tool_result.py:222-225)."""
+        terminal_tool_background.py:173-176, terminal_tool_result.py:222-225). Core's record key is
+        not always this object's (the raw task id, terminal_tool.py:1528-1530), so the cwd each
+        target's last recorded command ended in is kept here too."""
         from tools.approval import get_current_session_key
         from tools.terminal_tool import _get_env_config, get_session_cwd, resolve_task_overrides
 
-        # core's key for the record and the override (terminal_tool.py:1528-1530, 615-630)
-        key = get_current_session_key(default="") or self._task_id
+        session_key = get_current_session_key(default="")
+        key = session_key or self._task_id
         recorded = get_session_cwd(key)
         defaults = {_get_env_config().get("cwd"), resolve_task_overrides(key).get("cwd")}
+        known = self._session_cwd.get(target)
         if cwd == "~":
-            # On the server core drops a /home or /Users record outside the live cwd
-            # (terminal_tool.py:1041-1059); the record is still this host's.
-            if (
-                target == targets.SERVER
-                and self._record_owner == targets.SERVER
-                and recorded
-                and os.path.isdir(recorded)
-            ):
-                return recorded, True
-            return "", True
+            # Core drops a /home or /Users record outside the sandbox home (terminal_tool.py:
+            # 1041-1059); the session's cwd on this target is still where it was.
+            if known is None and target == targets.SERVER and self._record_owner == targets.SERVER:
+                known = recorded if recorded and os.path.isdir(recorded) else None
+            return known or "", True
         if target != targets.SERVER and cwd in defaults and not self._in_home(sub, cwd):
             return "", True  # a gateway directory: terminal.cwd or a Desktop, TUI or ACP workspace
-        if cwd == recorded:
-            # Written after a terminal command that printed where it ended, on its owner's target.
-            return (cwd if self._record_owner in (None, target) else ""), True
-        return cwd, cwd in defaults
+        if cwd == known:
+            return cwd, True
+        foreign = any(cwd == seen for other, seen in self._session_cwd.items() if other != target)
+        if foreign or (cwd == recorded and self._record_owner not in (None, target)):
+            return known or "", True  # another target's record
+        # Without a session key the record may sit under a task id this object never sees, so a
+        # first cwd is taken as the record; with one, an unrecorded cwd is a workdir=.
+        if cwd == recorded or cwd in defaults or (known is None and not session_key):
+            return cwd, True
+        return cwd, False  # workdir=
 
     @staticmethod
     def _in_home(sub: BaseEnvironment, cwd: str) -> bool:
@@ -512,6 +518,7 @@ class HandsEnvironment(BaseEnvironment):
         result = sub.execute(command, cwd, **kwargs)
         if result.get("cwd_observed"):
             if records:
+                self._session_cwd[target] = result["cwd"]
                 self._recorded_on(target)
             elif sub.cwd == result.get("cwd"):
                 # Core records the cwd only after a terminal command without workdir=; execute_code
@@ -587,11 +594,13 @@ class HandsEnvironment(BaseEnvironment):
 
     @property
     def _hermes_sandbox_home(self) -> str | None:
-        """The current target's home, which core reads to anchor relative file-tool paths and to keep
-        recorded cwds (terminal_tool_config.py:188-201, file_tools_paths.py:281-301,
-        terminal_tool.py:1041-1047): a device's paired home, the server's cwd."""
-        target, sub = self._current()
-        return sub.cwd if target == targets.SERVER else sub.home
+        """The current target's terminal cwd, which core reads to anchor relative file-tool paths when
+        it finds no cwd record under the tool's task id, as in the gateway (file_tools_paths.py:
+        131-144, 276-301), and to keep recorded cwds (terminal_tool.py:1041-1047). Reads pass a
+        relative path to the shell, which runs in this same cwd (file_tools.py:685), so writes,
+        patches, reads and searches all land where the terminal is, as on the local backend."""
+        cwd = self._current()[1].cwd
+        return cwd if posixpath.isabs(device_path(cwd)) else None  # "~": a device never paired
 
     @_hermes_sandbox_home.setter
     def _hermes_sandbox_home(self, value: str) -> None:

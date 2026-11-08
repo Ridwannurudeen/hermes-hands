@@ -790,6 +790,51 @@ def file_tools_on_laptop(laptop, hands_backend, tmp_path, monkeypatch):
     file_tools.clear_file_ops_cache()
 
 
+@pytest.mark.parametrize("session_key", ["", "s1"], ids=["cli", "gateway"])
+def test_relative_file_tool_paths_follow_the_terminal_cwd(
+    file_tools_on_laptop, hands_backend, monkeypatch, session_key
+):
+    """Core's own tools after a cd, as the live run did: write and patch anchor relative paths on the
+    session's cwd record or the sandbox home (file_tools_paths.py:131-144, 276-301), read and search
+    pass them to the shell (file_tools.py:685, 1102). On the local backend all of them follow the
+    terminal's cwd. Without a session key core records under the task id (terminal_tool.py:1530); in
+    the gateway the session key and the file tools' task id differ (run_turn_runner.py:983-987)."""
+    from tools.terminal_tool import clear_session_cwd, terminal_tool
+
+    file_tools, home = file_tools_on_laptop
+    hands_backend._ctx.config["default_target"] = "laptop"
+    if session_key:
+        store.set_session_target(session_key, "laptop")
+    else:
+        monkeypatch.delenv("HERMES_SESSION_KEY")
+    task = "live-1"
+    clear_session_cwd(task)  # a cwd record a previous test left under this task id
+    base = device_path(str(home))
+    assert json.loads(terminal_tool("uname -a; pwd", task_id=task))["exit_code"] == 0
+    moved = json.loads(
+        terminal_tool(f"mkdir -p '{base}/proj' && cd '{base}/proj' && pwd", task_id=task)
+    )
+    assert moved["output"].strip().endswith("/proj"), moved
+    assert json.loads(terminal_tool("pwd", task_id=task))["output"].strip().endswith("/proj")
+    written = json.loads(file_tools.write_file_tool("notes/nl.txt", "line one\n", task_id=task))
+    assert not written.get("error"), written
+    assert (home / "proj" / "notes" / "nl.txt").read_bytes() == b"line one\n"
+    read = json.loads(file_tools.read_file_tool("notes/nl.txt", task_id=task))
+    assert "line one" in read.get("content", ""), read
+    patched = json.loads(
+        file_tools.patch_tool(
+            mode="replace", path="notes/nl.txt", old_string="one", new_string="two", task_id=task
+        )
+    )
+    assert not patched.get("error"), patched
+    assert (home / "proj" / "notes" / "nl.txt").read_bytes() == b"line two\n"
+    found = json.loads(file_tools.search_tool(pattern="line two", path="notes", task_id=task))
+    assert found.get("total_count") == 1, found
+    shown = json.loads(terminal_tool("cat notes/nl.txt", task_id=task))
+    assert shown["output"].strip() == "line two", shown
+    clear_session_cwd(task)
+
+
 def test_file_tools_absolute_and_relative_paths_land_on_the_device(file_tools_on_laptop):
     file_tools, home = file_tools_on_laptop
     spaced = f"{device_path(str(home))}/My Projects/notes v1.txt"
