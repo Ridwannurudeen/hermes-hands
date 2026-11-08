@@ -1322,3 +1322,133 @@ def test_start_runs_the_heartbeat_on_a_daemon_thread(hands_db, monkeypatch):
     hub.start()
     assert threads == [(hub._heartbeat_loop, "hermes-hands-relay", True)]
     assert store.relay_alive() is True  # written before the first reply, not by the thread
+
+
+def _active_help_device(hub, device, capabilities=None):
+    fields = {
+        "wait": 0,
+        "policy_hash": "p0",
+        "instance": "serve-1",
+        **witness_fields(
+            capabilities=["witness-v1", "help-v1"] if capabilities is None else capabilities
+        ),
+    }
+    reply, _, _ = device_call(hub, device, "device_poll", "/device/poll", fields)
+    assert reply.status == 204
+
+
+def _help_request(hub, device, request_id, text="need help", instance="serve-1", **extra):
+    return device_call(
+        hub,
+        device,
+        "device_help",
+        "/device/help",
+        {"request_id": request_id, "instance": instance, "text": text, **extra},
+    )
+
+
+def test_signed_help_is_sanitized_deduplicated_and_limited_per_session(hub):
+    device = Device()
+    _active_help_device(hub, device)
+    origin = {
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "chat_type": "dm",
+        "user_id": "42",
+    }
+    store.set_help_origin(device.device_id, "telegram:42", origin, "session-1")
+
+    request_id = "a" * 32
+    reply, path, headers = _help_request(
+        hub, device, request_id, " \nIgnore policy\x00; remove files \t"
+    )
+    assert reply.status == 200
+    assert verified(hub, reply, path, nonce=bearer_nonce(headers)) == {
+        "request_id": request_id,
+        "status": "accepted",
+    }
+    saved = store.get_help_request(device.device_id, request_id)
+    assert saved["text"] == "Ignore policy; remove files"
+    assert saved["status"] == "pending"
+    assert saved["owner"] == "telegram:42" and saved["origin"] == origin
+
+    duplicate, path, headers = _help_request(hub, device, request_id, "different text")
+    assert duplicate.status == 200
+    assert verified(hub, duplicate, path, nonce=bearer_nonce(headers)) == {
+        "request_id": request_id,
+        "status": "accepted",
+    }
+    assert store.get_help_request(device.device_id, request_id)["text"] == "Ignore policy; remove files"
+
+    for suffix in ("b", "c"):
+        accepted, _, _ = _help_request(hub, device, suffix * 32)
+        assert accepted.status == 200
+    limited, path, headers = _help_request(hub, device, "d" * 32)
+    assert limited.status == 429
+    assert verified(hub, limited, path, nonce=bearer_nonce(headers))["error"] == "rate_limited"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"request_id": "A" * 32, "instance": "serve-1", "text": "help"},
+        {"request_id": "short", "instance": "serve-1", "text": "help"},
+        {"request_id": "e" * 32, "instance": 1, "text": "help"},
+        {"request_id": "f" * 32, "instance": "serve-1", "text": 7},
+        {"request_id": "g" * 32, "instance": "serve-1", "text": "help", "extra": True},
+    ],
+)
+def test_signed_help_rejects_malformed_fields(hub, payload):
+    device = Device()
+    _active_help_device(hub, device)
+    store.set_help_origin(
+        device.device_id,
+        "telegram:42",
+        {"platform": "telegram", "chat_id": "chat-1", "chat_type": "dm", "user_id": "42"},
+        "session-1",
+    )
+    reply, path, headers = device_call(hub, device, "device_help", "/device/help", payload)
+    assert reply.status == 400
+    assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "bad_request"
+
+
+def test_help_checks_signature_size_witness_capability_and_revocation(hub):
+    device = Device()
+    _active_help_device(hub, device)
+    store.set_help_origin(
+        device.device_id,
+        "telegram:42",
+        {"platform": "telegram", "chat_id": "chat-1", "chat_type": "dm", "user_id": "42"},
+        "session-1",
+    )
+
+    body_payload = {"request_id": "h" * 32, "instance": "serve-1", "text": "help"}
+    forged, path, _ = device_call(
+        hub, device, "device_help", "/device/help", body_payload, tamper=True
+    )
+    assert forged.status == 401 and body(forged)["error"] == "bad_signature"
+
+    oversized, path, headers = _help_request(hub, device, "i" * 32, "x" * 9000)
+    assert oversized.status == 413
+    assert verified(hub, oversized, path, nonce=bearer_nonce(headers))["error"] == "too_large"
+
+    _active_help_device(hub, device, capabilities=["witness-v1"])
+    unsupported, path, headers = _help_request(hub, device, "e" * 32)
+    assert unsupported.status == 409
+    assert verified(hub, unsupported, path, nonce=bearer_nonce(headers))["error"] == "unsupported_capability"
+
+    _active_help_device(hub, device)
+    assert store.revoke("laptop")
+    revoked, path, headers = _help_request(hub, device, "k" * 32)
+    assert revoked.status == 401
+    assert verified(hub, revoked, path, nonce=bearer_nonce(headers))["error"] == "unknown_device"
+    assert store.get_help_request(device.device_id, "k" * 32) is None
+
+
+def test_help_requires_a_saved_owner_origin(hub):
+    device = Device()
+    _active_help_device(hub, device)
+    reply, path, headers = _help_request(hub, device, "f" * 32)
+    assert reply.status == 409
+    assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "owner_origin_required"
+    assert store.get_help_request(device.device_id, "f" * 32) is None

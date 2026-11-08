@@ -22,6 +22,20 @@ class Source:
         self.chat_type = chat_type
 
 
+class DirectSource(Source):
+    def __init__(self, user_id="42", platform=Platform.TELEGRAM, chat_id="chat-1"):
+        super().__init__(user_id=user_id, platform=platform, chat_type="dm")
+        self.chat_id = chat_id
+
+    def to_dict(self):
+        return {
+            "platform": self.platform.value,
+            "chat_id": self.chat_id,
+            "chat_type": self.chat_type,
+            "user_id": self.user_id,
+        }
+
+
 class Context:
     def __init__(self, owner_ids=None):
         self.owner_ids = owner_ids or []
@@ -260,6 +274,72 @@ def test_use_binds_the_target_to_the_person_who_sent_it(monkeypatch):
     ctx.handler("use laptop", session_key="d", platform="telegram", source=Source())
     ctx.handler("use laptop", session_key="k", platform="desktop", source=None)
     assert bound == [("d", "laptop", "telegram:42"), ("k", "laptop", "local")]
+
+
+def test_use_saves_the_validated_owner_chat_origin_for_device_help(monkeypatch):
+    ctx = setup(monkeypatch, ["telegram:42"])
+    monkeypatch.setattr(commands, "terminal_backend", lambda: "hands")
+    monkeypatch.setattr(
+        commands.store, "get_device", lambda name: {"name": name, "device_id": "device-1"}
+    )
+    targets, origins = [], []
+    monkeypatch.setattr(
+        commands.store,
+        "set_session_target",
+        lambda key, name, owner: targets.append((key, name, owner)),
+    )
+    monkeypatch.setattr(
+        commands.store,
+        "set_help_origin",
+        lambda device_id, owner, origin, session_key: origins.append(
+            (device_id, owner, origin, session_key)
+        ),
+    )
+
+    source = DirectSource()
+    reply = ctx.handler("use laptop", session_key="chat-session", platform="telegram", source=source)
+    assert reply.startswith("Target set to laptop")
+    assert targets == [("chat-session", "laptop", "telegram:42")]
+    assert origins == [
+        (
+            "device-1",
+            "telegram:42",
+            {
+                "platform": "telegram",
+                "chat_id": "chat-1",
+                "chat_type": "dm",
+                "user_id": "42",
+            },
+            "chat-session",
+        )
+    ]
+
+
+def test_use_does_not_save_an_unvalidated_or_foreign_help_origin(monkeypatch):
+    ctx = setup(monkeypatch, ["telegram:42"])
+    monkeypatch.setattr(commands, "terminal_backend", lambda: "hands")
+    monkeypatch.setattr(
+        commands.store, "get_device", lambda name: {"name": name, "device_id": "device-1"}
+    )
+    monkeypatch.setattr(commands.store, "set_session_target", lambda *args, **kwargs: None)
+    saved = []
+    monkeypatch.setattr(
+        commands.store,
+        "set_help_origin",
+        lambda *args: saved.append(args),
+    )
+
+    class BadSource(DirectSource):
+        def to_dict(self):
+            return {"platform": "telegram", "chat_id": "", "chat_type": "dm", "user_id": "42"}
+
+    assert ctx.handler(
+        "use laptop", session_key="chat-session", platform="telegram", source=BadSource()
+    ).startswith("Target set to laptop")
+    assert ctx.handler(
+        "use laptop", session_key="other-session", platform="telegram", source=DirectSource("7")
+    ) == "Hands: owner access required."
+    assert saved == []
 
 
 def test_a_slack_group_dm_is_a_shared_chat(monkeypatch):

@@ -122,6 +122,11 @@ async def device_heartbeat(request: Request) -> Response:
     return await _relay_call(request, "device_heartbeat", peer=_peer(request))
 
 
+@router.post("/device/help")
+async def device_help(request: Request) -> Response:
+    return await _relay_call(request, "device_help", peer=_peer(request))
+
+
 @router.post("/local/exec")
 async def local_exec(request: Request) -> Response:
     return await _relay_call(request, "local_exec")

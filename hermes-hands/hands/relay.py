@@ -14,10 +14,12 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import secrets
 import sqlite3
 import threading
 import time
+import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -36,6 +38,7 @@ TOKEN_ROUTES = tuple(
         "/device/poll",
         "/device/result",
         "/device/heartbeat",
+        "/device/help",
         "/local/exec",
         "/local/output",
         "/local/cancel",
@@ -54,6 +57,7 @@ MAX_OUTPUT_WAIT = 20
 MAX_JOB_TEXT = 16_000_000  # characters in an exec job's script, and in its stdin
 MAX_PNG_BYTES = 2 * 1024 * 1024
 _MAX_PNG_B64 = 4 * -(-MAX_PNG_BYTES // 3)
+MAX_HELP_BODY_BYTES = 8192
 _LIVENESS_EVERY = 1.0
 _ABANDONED_AFTER = 60  # seconds without a gateway fetch: the caller is gone, cancel the job
 _HEARTBEAT_EVERY = 5
@@ -154,6 +158,15 @@ def _required_string(request: dict, key: str) -> str:
     if not isinstance(value, str):
         raise ValueError(key)
     return value
+
+
+def _help_text(value: str) -> str:
+    cleaned = "".join(
+        character for character in value.strip() if unicodedata.category(character) != "Cc"
+    )[:200]
+    if not cleaned:
+        raise ValueError("text")
+    return cleaned
 
 
 def _witness_fields(request: dict) -> tuple[bool, str, list[str]]:
@@ -623,6 +636,76 @@ class Relay:
             if waiter is None:
                 return Reply(204)
             await self._wait(device_id, waiter, remaining)
+
+    async def device_help(self, principal, headers, path: str, body: bytes, peer: str) -> Reply:
+        """Accept a bounded help message from the currently witnessed paired device."""
+        device, nonce, refusal = await asyncio.to_thread(
+            self._device, principal, headers, path, body, peer
+        )
+        if refusal is not None:
+            return refusal
+        if len(body) > MAX_HELP_BODY_BYTES:
+            return self._signed(
+                413, {"error": "too_large", "detail": messages.BAD_REQUEST}, path, nonce
+            )
+        try:
+            request = json.loads(body)
+            if (
+                not isinstance(request, dict)
+                or set(request) != {"request_id", "instance", "text"}
+                or not isinstance(request["request_id"], str)
+                or re.fullmatch(r"[0-9a-f]{32}", request["request_id"]) is None
+                or not isinstance(request["instance"], str)
+                or not request["instance"]
+                or not isinstance(request["text"], str)
+            ):
+                raise ValueError("help request")
+            text = _help_text(request["text"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return self._signed(
+                400, {"error": "bad_request", "detail": messages.BAD_REQUEST}, path, nonce
+            )
+
+        result = await asyncio.to_thread(
+            store.accept_help_request,
+            device["device_id"],
+            request_id=request["request_id"],
+            instance=request["instance"],
+            text=text,
+        )
+        if result == "unknown_device":
+            return self._unknown(device["device_id"], path, nonce, peer)
+        if result in {"accepted", "duplicate"}:
+            return self._signed(
+                200, {"request_id": request["request_id"], "status": "accepted"}, path, nonce
+            )
+        if result == "rate_limited":
+            return self._signed(
+                429,
+                {"error": "rate_limited", "detail": "hands: this witness session reached its help limit."},
+                path,
+                nonce,
+            )
+        if result == "unsupported_capability":
+            return self._signed(
+                409,
+                {"error": "unsupported_capability", "detail": "hands: this device does not advertise help-v1."},
+                path,
+                nonce,
+            )
+        if result == "owner_origin_required":
+            return self._signed(
+                409,
+                {"error": "owner_origin_required", "detail": "hands: select this device from an owner direct message first."},
+                path,
+                nonce,
+            )
+        return self._signed(
+            409,
+            {"error": "witness_inactive", "detail": "hands: this device has no active witness session."},
+            path,
+            nonce,
+        )
 
     async def device_result(self, principal, headers, path: str, body: bytes, peer: str) -> Reply:
         device, nonce, refusal = await asyncio.to_thread(

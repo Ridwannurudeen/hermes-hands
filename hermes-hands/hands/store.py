@@ -25,6 +25,8 @@ RELAY_STALE_AFTER = 15  # seconds; the relay writes its heartbeat row every 5
 TOMBSTONE_TTL = 7 * 24 * 3600  # seconds a revoked device's key can still be told to stop
 STOP_GRACE = 3600  # seconds the stop keeps being sent after the first one, in case it was lost
 RESERVED_NAME = "server"  # the gateway host's own target name; no device may take it
+HELP_RETRY_MAX_SECONDS = 60.0
+_HELP_LEASE_SECONDS = 30.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -65,6 +67,30 @@ CREATE TABLE IF NOT EXISTS session_targets (
 CREATE TABLE IF NOT EXISTS session_marks (
     session_key TEXT PRIMARY KEY,
     last_run TEXT
+);
+CREATE TABLE IF NOT EXISTS device_help_origins (
+    device_id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS help_requests (
+    device_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    instance TEXT NOT NULL,
+    text TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL,
+    lease_token TEXT,
+    lease_until REAL,
+    created_at REAL NOT NULL,
+    queued_at REAL,
+    PRIMARY KEY (device_id, request_id)
 );
 CREATE TABLE IF NOT EXISTS relay_heartbeat (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -331,6 +357,14 @@ def revoke(name: str) -> bool:
     with _db() as conn:
         conn.execute("DELETE FROM revoked_devices WHERE revoked_at <= ?", (now - TOMBSTONE_TTL,))
         conn.execute(
+            "DELETE FROM help_requests WHERE device_id IN (SELECT device_id FROM devices WHERE name = ?)",
+            (name,),
+        )
+        conn.execute(
+            "DELETE FROM device_help_origins WHERE device_id IN (SELECT device_id FROM devices WHERE name = ?)",
+            (name,),
+        )
+        conn.execute(
             "INSERT INTO revoked_devices (device_id, public_key, revoked_at)"
             " SELECT device_id, public_key, ? FROM devices WHERE name = ?",
             (now, name),
@@ -367,6 +401,167 @@ def get_session_target(session_key: str) -> tuple[str, str] | None:
             "SELECT target, owner FROM session_targets WHERE session_key = ?", (session_key,)
         ).fetchone()
     return None if row is None else (row["target"], row["owner"])
+
+
+def set_help_origin(device_id: str, owner: str, origin: dict, session_key: str) -> bool:
+    """Bind a selected device's help requests to the owner's validated chat origin."""
+    encoded = json.dumps(origin, ensure_ascii=False, separators=(",", ":"))
+    with _db() as conn:
+        if conn.execute("SELECT 1 FROM devices WHERE device_id = ?", (device_id,)).fetchone() is None:
+            return False
+        conn.execute(
+            "INSERT INTO device_help_origins (device_id, owner, origin, session_key, updated_at)"
+            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_id) DO UPDATE SET owner = excluded.owner,"
+            " origin = excluded.origin, session_key = excluded.session_key, updated_at = excluded.updated_at",
+            (device_id, owner, encoded, session_key, time.time()),
+        )
+    return True
+
+
+def get_help_origin(device_id: str) -> dict | None:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT owner, origin, session_key FROM device_help_origins WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"owner": row["owner"], "origin": json.loads(row["origin"]), "session_key": row["session_key"]}
+
+
+def accept_help_request(device_id: str, *, request_id: str, instance: str, text: str) -> str:
+    """Persist one accepted help message with the device's selected owner origin."""
+    now = time.time()
+    with _db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        device = conn.execute(
+            "SELECT witness, session_state, capabilities, instance FROM devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if device is None:
+            return "unknown_device"
+        duplicate = conn.execute(
+            "SELECT 1 FROM help_requests WHERE device_id = ? AND request_id = ?",
+            (device_id, request_id),
+        ).fetchone()
+        if duplicate is not None:
+            return "duplicate"
+        if (
+            not device["witness"]
+            or device["session_state"] != "active"
+            or device["instance"] != instance
+        ):
+            return "inactive"
+        if "help-v1" not in json.loads(device["capabilities"]):
+            return "unsupported_capability"
+        origin = conn.execute(
+            "SELECT owner, origin, session_key FROM device_help_origins WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if origin is None:
+            return "owner_origin_required"
+        count = conn.execute(
+            "SELECT COUNT(*) FROM help_requests WHERE device_id = ? AND instance = ?",
+            (device_id, instance),
+        ).fetchone()[0]
+        if count >= 3:
+            return "rate_limited"
+        conn.execute(
+            "INSERT INTO help_requests"
+            " (device_id, request_id, instance, text, owner, origin, session_key, next_attempt_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                device_id,
+                request_id,
+                instance,
+                text,
+                origin["owner"],
+                origin["origin"],
+                origin["session_key"],
+                now,
+                now,
+            ),
+        )
+    return "accepted"
+
+
+def get_help_request(device_id: str, request_id: str) -> dict | None:
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT * FROM help_requests WHERE device_id = ? AND request_id = ?",
+            (device_id, request_id),
+        ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["origin"] = json.loads(result["origin"])
+    return result
+
+
+def lease_help_request() -> dict | None:
+    """Lease the next due request; an expired lease makes an interrupted delivery retryable."""
+    now = time.time()
+    with _db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM help_requests WHERE"
+            " (status = 'pending' AND next_attempt_at <= ?)"
+            " OR (status = 'leased' AND lease_until <= ?)"
+            " ORDER BY created_at, request_id LIMIT 1",
+            (now, now),
+        ).fetchone()
+        if row is None:
+            return None
+        token = secrets.token_hex(16)
+        attempts = row["attempts"] + 1
+        lease_until = now + _HELP_LEASE_SECONDS
+        conn.execute(
+            "UPDATE help_requests SET status = 'leased', attempts = ?, lease_token = ?, lease_until = ?"
+            " WHERE device_id = ? AND request_id = ?",
+            (attempts, token, lease_until, row["device_id"], row["request_id"]),
+        )
+        request = dict(row)
+    request.update(
+        status="leased", attempts=attempts, lease_token=token, lease_until=lease_until
+    )
+    request["origin"] = json.loads(request["origin"])
+    return request
+
+
+def mark_help_queued(request_id: str, lease_token: str) -> bool:
+    """Record host acceptance of an injection; it does not claim that the message was delivered."""
+    with _db() as conn:
+        return (
+            conn.execute(
+                "UPDATE help_requests SET status = 'queued', queued_at = ?, lease_token = NULL,"
+                " lease_until = NULL WHERE request_id = ? AND status = 'leased' AND lease_token = ?",
+                (time.time(), request_id, lease_token),
+            ).rowcount
+            > 0
+        )
+
+
+def retry_help_request(request_id: str, lease_token: str) -> bool:
+    """Return an unaccepted lease to pending with an exponential delay capped at one minute."""
+    now = time.time()
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT attempts FROM help_requests WHERE request_id = ? AND status = 'leased'"
+            " AND lease_token = ?",
+            (request_id, lease_token),
+        ).fetchone()
+        if row is None:
+            return False
+        delay = min(2.0 ** max(row["attempts"] - 1, 0), HELP_RETRY_MAX_SECONDS)
+        return (
+            conn.execute(
+                "UPDATE help_requests SET status = 'pending', next_attempt_at = ?,"
+                " lease_token = NULL, lease_until = NULL WHERE request_id = ?"
+                " AND status = 'leased' AND lease_token = ?",
+                (now + delay, request_id, lease_token),
+            ).rowcount
+            > 0
+        )
 
 
 def get_last_run(session_key: str) -> str | None:

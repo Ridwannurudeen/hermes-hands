@@ -13,7 +13,7 @@ description: >
 requires_hermes: ">=0.23.0"
 python_dependencies: []
 provides_tools: [hands_screenshot, hands_devices]
-provides_hooks: []
+provides_hooks: [pre_tool_call]
 requires_env: []
 config_schema:
   HANDS_RELAY_SEED: {type: secret, env: HANDS_RELAY_SEED, description: "Relay signing seed. Written once by hermes hands setup."}

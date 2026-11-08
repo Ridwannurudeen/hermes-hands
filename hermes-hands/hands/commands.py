@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import shlex
+import unicodedata
 from urllib.parse import urlparse
 
 from . import client, messages, store, targets
@@ -206,6 +208,47 @@ def _caller(platform: str, source) -> str:
     return targets.caller_id(_platform(platform, source), str(getattr(source, "user_id", "") or ""))
 
 
+def _help_origin(platform: str, source) -> dict | None:
+    """A direct, owner-addressable SessionSource, in Hermes's persisted origin shape."""
+    if source is None or _in_shared_chat(source):
+        return None
+    to_dict = getattr(source, "to_dict", None)
+    if not callable(to_dict):
+        return None
+    try:
+        origin = to_dict()
+    except Exception:
+        return None
+    if not isinstance(origin, dict):
+        return None
+    source_platform = _platform(platform, source)
+    callback_platform = str(getattr(platform, "value", platform) or "").lower()
+    chat_id = getattr(source, "chat_id", None)
+    chat_type = getattr(source, "chat_type", None)
+    user_id = getattr(source, "user_id", None)
+    if (
+        source_platform in {"", "local", "cli", "tui", "desktop", "acp"}
+        or (callback_platform and callback_platform != source_platform)
+        or not isinstance(chat_id, str)
+        or not chat_id.strip()
+        or not isinstance(chat_type, str)
+        or chat_type.strip().lower() != "dm"
+        or not isinstance(user_id, str)
+        or not user_id.strip()
+        or origin.get("platform") != source_platform
+        or origin.get("chat_id") != chat_id
+        or origin.get("chat_type") != chat_type
+        or origin.get("user_id") != user_id
+        or any(unicodedata.category(char) == "Cc" for value in (source_platform, chat_id, user_id) for char in value)
+    ):
+        return None
+    try:
+        json.dumps(origin, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+    return origin
+
+
 def terminal_backend() -> str:
     """The terminal backend Hermes resolves for this profile: config.yaml terminal.backend, else
     TERMINAL_ENV from the profile .env or this process's environment (terminal_scope.py:114)."""
@@ -309,7 +352,12 @@ def register_commands(ctx, *, has_seed: bool) -> None:
                 return f"No paired device named {name}."
             if not session_key:
                 return "Hands: no session key is available."
-            store.set_session_target(session_key, name, owner=_caller(platform, source))
+            owner = _caller(platform, source)
+            store.set_session_target(session_key, name, owner=owner)
+            if name != "server":
+                origin = _help_origin(platform, source)
+                if origin is not None:
+                    store.set_help_origin(device["device_id"], owner, origin, session_key)
             targets.notify_target_changed(session_key)
             return f"Target set to {name}; it applies from the next command."
         if action == "revoke":

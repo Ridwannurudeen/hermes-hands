@@ -292,3 +292,119 @@ def test_record_seen_persists_witness_state_and_stop_time(hands_db):
     assert stopping["session_state"] == "stopping"
     assert stopping["capabilities"] == ["witness-v1", "checkup-v1"]
     assert isinstance(stopping["session_ended_at"], int)
+
+
+def test_help_origin_and_outbox_retry_are_persistent_and_owner_scoped(hands_db, monkeypatch):
+    device_id = _pair()
+    origin = {
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "chat_type": "dm",
+        "user_id": "42",
+    }
+    store.record_seen(
+        device_id,
+        instance="serve-1",
+        witness=True,
+        session_state="active",
+        capabilities=["witness-v1", "help-v1"],
+    )
+    store.set_help_origin(device_id, "telegram:42", origin, "session-1")
+    assert store.get_help_origin(device_id) == {
+        "owner": "telegram:42",
+        "origin": origin,
+        "session_key": "session-1",
+    }
+
+    assert (
+        store.accept_help_request(
+            device_id,
+            request_id="a" * 32,
+            instance="serve-1",
+            text="please check this",
+        )
+        == "accepted"
+    )
+    assert (
+        store.accept_help_request(
+            device_id,
+            request_id="a" * 32,
+            instance="serve-1",
+            text="changed duplicate text",
+        )
+        == "duplicate"
+    )
+
+    request = store.lease_help_request()
+    assert request["request_id"] == "a" * 32
+    assert request["text"] == "please check this"
+    assert request["owner"] == "telegram:42"
+    assert request["origin"] == origin
+    assert request["session_key"] == "session-1"
+    assert request["attempts"] == 1
+
+    assert store.retry_help_request(request["request_id"], request["lease_token"])
+    delayed = store.get_help_request(device_id, "a" * 32)
+    assert delayed["status"] == "pending"
+    assert 0 < delayed["next_attempt_at"] - time.time() <= store.HELP_RETRY_MAX_SECONDS
+    monkeypatch.setattr(store.time, "time", lambda: delayed["next_attempt_at"] - 0.1)
+    assert store.lease_help_request() is None
+    monkeypatch.setattr(store.time, "time", lambda: delayed["next_attempt_at"] + 0.1)
+    retried = store.lease_help_request()
+    assert retried["attempts"] == 2
+    assert store.mark_help_queued(retried["request_id"], retried["lease_token"])
+    queued = store.get_help_request(device_id, "a" * 32)
+    assert queued["status"] == "queued"
+    assert queued["queued_at"] is not None
+
+
+def test_help_requests_require_the_current_active_help_session(hands_db):
+    device_id = _pair()
+    origin = {
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "chat_type": "dm",
+        "user_id": "42",
+    }
+    store.set_help_origin(device_id, "telegram:42", origin, "session-1")
+    assert (
+        store.accept_help_request(
+            device_id,
+            request_id="b" * 32,
+            instance="serve-1",
+            text="help",
+        )
+        == "inactive"
+    )
+    store.record_seen(
+        device_id,
+        instance="serve-1",
+        witness=True,
+        session_state="active",
+        capabilities=["witness-v1"],
+    )
+    assert (
+        store.accept_help_request(
+            device_id,
+            request_id="c" * 32,
+            instance="serve-1",
+            text="help",
+        )
+        == "unsupported_capability"
+    )
+    store.record_seen(
+        device_id,
+        instance="serve-2",
+        witness=True,
+        session_state="active",
+        capabilities=["witness-v1", "help-v1"],
+    )
+    assert (
+        store.accept_help_request(
+            device_id,
+            request_id="d" * 32,
+            instance="serve-1",
+            text="help",
+        )
+        == "inactive"
+    )

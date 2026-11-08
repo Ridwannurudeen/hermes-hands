@@ -86,6 +86,9 @@ def test_desktop_file_parses_as_an_es_module(tmp_path):
 
 
 class SkillCtx(RegisterCtx):
+    def register_hook(self, hook_name, callback, *, hold_stream=False):
+        self.calls.append(("hook", hook_name))
+
     def register_skill(self, name, path, description="", frontmatter=None):
         self.skill = (name, path, description)
 
@@ -101,6 +104,7 @@ def test_register_bundles_the_hands_skill(hands_db, monkeypatch):
     monkeypatch.delenv("HANDS_RELAY_SEED", raising=False)
     ctx = SkillCtx()
     load_plugin_package().register(ctx)
+    assert ("hook", "pre_tool_call") in ctx.calls
     provider = dict((kind, obj) for kind, obj in ctx.calls if kind == "auth")["auth"]
     try:
         name, path, description = ctx.skill
