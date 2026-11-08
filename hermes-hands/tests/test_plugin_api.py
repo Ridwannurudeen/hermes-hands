@@ -85,7 +85,11 @@ def test_register_wires_everything(plugin):
     kinds = [kind for kind, _ in ctx.calls]
     assert kinds.count("terminal") == 1 and kinds.count("auth") == 1
     assert ("command", "hands") in ctx.calls and ("cli", "hands") in ctx.calls
-    assert {("tool", "hands_screenshot"), ("tool", "hands_devices")} <= set(ctx.calls)
+    assert {
+        ("tool", "hands_screenshot"),
+        ("tool", "hands_devices"),
+        ("tool", "hands_checkup"),
+    } <= set(ctx.calls)
     assert [(name, callback) for name, callback in ctx._hands_hooks if name == "pre_tool_call"]
     kinds = [kind for kind, _ in ctx.calls]
     assert kinds.index("hook") < kinds.index("unload")
@@ -210,6 +214,81 @@ def test_device_and_local_routes_end_to_end(plugin):
 
     ui = api.get(base + "/ui/state")
     assert ui.status_code == 200 and ui.json() == {"relay": True, "devices": [], "alerts": []}
+
+
+def test_checkup_result_keeps_facts_and_inferences_through_plugin_routes(plugin):
+    _, hands, provider = plugin
+    api = make_app(load_plugin_api())
+    base = "/api/plugins/hermes-hands"
+    device = Device("checkup-laptop")
+    local = {"Authorization": f"Bearer {provider.keys.local_bearer}"}
+    poll_fields = {
+        "wait": 0,
+        "policy_hash": "p0",
+        "instance": "serve-checkup",
+        "witness": False,
+        "session_state": "normal",
+        "capabilities": ["checkup-v1"],
+    }
+    _, headers, path, raw = device.request("/device/poll", poll_fields)
+    assert api.post(path, content=raw, headers=headers).status_code == 204
+
+    queued = api.post(
+        base + "/local/exec",
+        headers=local,
+        json={"device": device.name, "type": "checkup"},
+    )
+    assert queued.status_code == 200, queued.text
+    job_id = queued.json()["job_id"]
+    _, headers, path, raw = device.request("/device/poll", poll_fields)
+    delivered = api.post(path, content=raw, headers=headers)
+    assert delivered.status_code == 200, delivered.text
+    assert delivered.json() == {"job_id": job_id, "type": "checkup"}
+
+    checkup = {
+        "schema_version": 1,
+        "observed_at": "2026-11-08T20:00:00Z",
+        "platform": "Windows",
+        "facts": [
+            {
+                "id": "disk-c-free",
+                "label": "C free space",
+                "value": 12,
+                "unit": "GiB",
+                "status": "warn",
+                "availability": "observed",
+                "source": "psutil.disk_usage",
+            }
+        ],
+        "inferences": [
+            {
+                "claim": "The system disk has limited free space.",
+                "evidence_ids": ["disk-c-free"],
+                "confidence": "medium",
+            }
+        ],
+    }
+    result_fields = {
+        "job_id": job_id,
+        "seq": 0,
+        "chunk": "",
+        "done": True,
+        "policy_hash": "p0",
+        "returncode": 0,
+        "error": None,
+        "checkup": checkup,
+    }
+    _, headers, path, raw = device.request("/device/result", result_fields)
+    accepted = api.post(path, content=raw, headers=headers)
+    assert accepted.status_code == 200 and accepted.json() == {"ok": True, "cancel": False}
+
+    output = api.post(
+        base + "/local/output",
+        headers=local,
+        json={"job_id": job_id, "after": 0, "wait": 0},
+    )
+    assert output.status_code == 200, output.text
+    assert output.json()["checkup"] == checkup
 
 
 def test_a_forged_device_bearer_cannot_drain_the_gateway(plugin, monkeypatch, tmp_path):

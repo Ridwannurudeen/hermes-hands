@@ -81,6 +81,64 @@ def test_screenshot_refuses_server(monkeypatch):
     assert "device" in result["error"]
 
 
+def test_checkup_refuses_server(monkeypatch):
+    monkeypatch.setattr(store, "get_session_target", lambda key: None)
+    ctx = load_tools(monkeypatch, session_key="session")
+    result = json.loads(ctx.handlers["hands_checkup"]({}))
+    assert "device" in result["error"]
+
+
+def test_checkup_refuses_cron(monkeypatch):
+    ctx = load_tools(monkeypatch, session_key="session")
+    ctx.cron = object()
+    result = json.loads(ctx.handlers["hands_checkup"]({}))
+    assert "cron" in result["error"]
+
+
+def test_checkup_returns_observed_facts_and_separate_inferences(monkeypatch):
+    ctx = load_tools(monkeypatch, session_key="session")
+    import hands
+
+    checkup = {
+        "schema_version": 1,
+        "observed_at": "2026-11-08T20:00:00Z",
+        "platform": "Windows",
+        "facts": [
+            {
+                "id": "disk-c-free",
+                "label": "C free space",
+                "value": 12,
+                "unit": "GiB",
+                "status": "warn",
+                "availability": "observed",
+                "source": "psutil.disk_usage",
+            }
+        ],
+        "inferences": [
+            {
+                "claim": "The system disk has limited free space.",
+                "evidence_ids": ["disk-c-free"],
+                "confidence": "medium",
+            }
+        ],
+    }
+    monkeypatch.setattr(hands.targets, "resolve_target", lambda **kwargs: "laptop")
+    monkeypatch.setattr(store, "get_device", lambda name: {"name": name})
+    requested = []
+    monkeypatch.setattr(
+        hands.client,
+        "request_checkup",
+        lambda name: requested.append(name) or checkup,
+        raising=False,
+    )
+    result = json.loads(ctx.handlers["hands_checkup"]({}))
+
+    assert result == checkup
+    assert result["facts"] == checkup["facts"]
+    assert result["inferences"] == checkup["inferences"]
+    assert requested == ["laptop"]
+
+
 def test_screenshot_returns_media_line(monkeypatch, tmp_path):
     constants = types.ModuleType("hermes_constants")
     constants.get_hermes_home = lambda: tmp_path
@@ -130,7 +188,7 @@ def test_the_model_gets_each_tool_with_a_description_and_parameters(monkeypatch,
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     manager = PluginManager()
-    names = {"hands_screenshot", "hands_devices"}
+    names = {"hands_screenshot", "hands_devices", "hands_checkup"}
     importlib.import_module("hands.tools").register_tools(
         PluginContext(PluginManifest(name="hermes-hands", kind="backend"), manager)
     )
@@ -146,6 +204,7 @@ def test_the_model_gets_each_tool_with_a_description_and_parameters(monkeypatch,
         assert function["description"]
         assert function["parameters"]["type"] == "object"
         assert function["parameters"]["properties"] == {}
+        assert function["parameters"]["additionalProperties"] is False
 
 
 def test_screenshot_errors_are_json(monkeypatch):

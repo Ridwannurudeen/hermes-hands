@@ -12,7 +12,7 @@ description: >
   fails closed. Select it with terminal.backend: hands.
 requires_hermes: ">=0.23.0"
 python_dependencies: []
-provides_tools: [hands_screenshot, hands_devices]
+provides_tools: [hands_screenshot, hands_devices, hands_checkup]
 provides_hooks: [pre_tool_call]
 requires_env: []
 config_schema:

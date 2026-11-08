@@ -68,6 +68,28 @@ def register_tools(ctx) -> None:
         except Exception as exc:
             return json.dumps({"error": str(exc) or "Could not list devices."})
 
+    def checkup(_arguments: dict) -> str:
+        try:
+            if ctx.current_cron_execution() is not None:
+                return json.dumps({"error": "Checkups are unavailable in cron."})
+            from gateway.session_context import get_session_env
+
+            session_key = get_session_env("HERMES_SESSION_KEY", "")
+            target = targets.resolve_target(
+                session_key=session_key,
+                in_cron=False,
+                default_target=ctx.get_config("default_target", default="server"),
+            )
+            if target == "server":
+                return json.dumps(
+                    {"error": "Select a device with /hands use before requesting a checkup."}
+                )
+            if store.get_device(target) is None:
+                return json.dumps({"error": f"No paired device named {target}."})
+            return json.dumps(client.request_checkup(target), ensure_ascii=False, indent=2)
+        except Exception as exc:
+            return json.dumps({"error": str(exc) or "Checkup failed."})
+
     ctx.register_tool(
         name="hands_screenshot",
         toolset="hands",
@@ -87,4 +109,17 @@ def register_tools(ctx) -> None:
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         handler=devices,
+    )
+    ctx.register_tool(
+        name="hands_checkup",
+        toolset="hands",
+        schema={
+            "name": "hands_checkup",
+            "description": (
+                "Run the selected paired device's built-in read-only checkup, "
+                "with observed facts separate from inferences."
+            ),
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+        handler=checkup,
     )

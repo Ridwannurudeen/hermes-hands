@@ -120,6 +120,16 @@ def test_register_bundles_the_hands_skill(hands_db, monkeypatch):
         token_auth.clear_token_routes()
 
 
+def test_manifest_advertises_the_checkup_tool():
+    import yaml
+
+    manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8-sig"))
+
+    assert {"hands_screenshot", "hands_devices", "hands_checkup"} <= set(
+        manifest["provides_tools"]
+    )
+
+
 def _pane_pattern(name: str) -> re.Pattern[str]:
     """One of the pane's regexes for reading /hands output; written to mean the same in Python."""
     source = PLUGIN_JS.read_text(encoding="utf-8-sig")

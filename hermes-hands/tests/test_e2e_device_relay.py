@@ -16,6 +16,7 @@ import json
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -230,6 +231,54 @@ def test_pairing_then_terminal_and_file_writes(rig):
         written = files.write_file(f"{rig.device_home}/{name}", content)
         assert written.error is None and written.verified is True, written.to_dict()
         assert (rig.home / name).read_bytes() == content.encode("utf-8")
+
+
+def test_compiled_in_checkup_round_trips_through_the_selected_device(rig):
+    until(
+        lambda: "checkup-v1"
+        in rig.hands.store.device_by_id(
+            rig.hands.store.get_device("laptop")["device_id"]
+        )["capabilities"],
+        what="the device to advertise checkup-v1",
+    )
+    checkup = rig.hands.client.request_checkup("laptop")
+
+    assert set(checkup) == {
+        "schema_version",
+        "observed_at",
+        "platform",
+        "facts",
+        "inferences",
+    }
+    assert checkup["schema_version"] == 1
+    assert checkup["platform"]
+    assert checkup["observed_at"].endswith("Z")
+    observed_at = datetime.fromisoformat(checkup["observed_at"].replace("Z", "+00:00"))
+    assert observed_at.utcoffset().total_seconds() == 0
+    assert isinstance(checkup["facts"], list)
+    assert isinstance(checkup["inferences"], list)
+
+    fact_ids = set()
+    for fact in checkup["facts"]:
+        assert set(fact) == {
+            "id",
+            "label",
+            "value",
+            "unit",
+            "status",
+            "availability",
+            "source",
+        }
+        assert fact["status"] in {"ok", "warn", "bad", "unknown"}
+        assert fact["availability"] in {"observed", "unsupported", "error"}
+        fact_ids.add(fact["id"])
+    for inference in checkup["inferences"]:
+        assert set(inference) == {"claim", "evidence_ids", "confidence"}
+        assert inference["confidence"] in {"low", "medium", "high"}
+        assert set(inference["evidence_ids"]) <= fact_ids
+
+    [job] = [job for job in rig.delivered if job.get("type") == "checkup"]
+    assert set(job) == {"job_id", "type"}
 
 
 def test_timeout_and_cancel_stop_the_work_on_the_device(rig):
