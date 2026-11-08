@@ -171,7 +171,9 @@ A skill can explain how to use a feature, but cannot register a terminal backend
 
 ## Tests and validation
 
-[COUNT_AT_PIN] tests run against Hermes 0.23.0: [COUNT_AT_PIN] plugin tests, [COUNT_AT_PIN] of them end to end with the real device agent and the real relay in one process, and [COUNT_AT_PIN] device tests. On Windows [COUNT_AT_PIN] pass and [COUNT_AT_PIN] are skipped by design (one needs a Linux gateway, one is POSIX only). CI runs the plugin suite on Ubuntu and Windows and the device suite on Ubuntu, Windows and macOS.
+[COUNT_AT_PIN] tests run against Hermes 0.23.0: [COUNT_AT_PIN] plugin tests, [COUNT_AT_PIN] of them end to end with the real device agent and the real relay in one process, and [COUNT_AT_PIN] device tests. On Windows [COUNT_AT_PIN] pass and [COUNT_AT_PIN] are skipped by design (one needs a Linux gateway, one is POSIX only).
+
+The workflows in `.github/workflows/` cover the plugin on Ubuntu and Windows and the device on Ubuntu, Windows and macOS. No run has reached its first step yet: GitHub stops every job with a billing message for the repository owner's account, so the numbers above were produced by a local run against Hermes 0.23.0 on Linux and have not been reproduced on Windows.
 
 The device CI tests on Python 3.11 and 3.12. Plugin CI validates the plugin and doctor, runs the plugin suite against Hermes 0.23.0, validates catalog shape, scans plugin payloads, and checks Python changes for Windows footguns.
 
