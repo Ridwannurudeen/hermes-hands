@@ -25,6 +25,27 @@ class Context:
         self.handlers[name] = handler
 
 
+class HookContext:
+    def __init__(self):
+        self.hooks = {}
+
+    def register_hook(self, name, callback):
+        self.hooks[name] = callback
+
+
+def witness_hook(monkeypatch):
+    from hands import witness
+
+    monkeypatch.setattr(
+        witness,
+        "_witness_device",
+        lambda ctx: {"name": "laptop", "witness": True, "session_state": "active"},
+    )
+    ctx = HookContext()
+    witness.register(ctx)
+    return ctx.hooks["pre_tool_call"]
+
+
 def load_tools(monkeypatch, screenshot=None, session_key=""):
     client = types.ModuleType("hands.client")
     client.request_screenshot = screenshot or (lambda device: b"png")
@@ -135,3 +156,126 @@ def test_screenshot_errors_are_json(monkeypatch):
     monkeypatch.setattr(store, "get_device", lambda name: {"name": name})
     ctx = load_tools(monkeypatch, screenshot=lambda device: (_ for _ in ()).throw(RuntimeError("offline")), session_key="session")
     assert json.loads(ctx.handlers["hands_screenshot"]({})) == {"error": "offline"}
+
+
+def test_witness_registers_pre_tool_call():
+    from hands import witness
+
+    ctx = HookContext()
+    witness.register(ctx)
+
+    assert tuple(ctx.hooks) == ("pre_tool_call",)
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["pwd", "whoami", "hostname", "uname -a", "df -h", "free -h", "ipconfig /all", "tasklist"],
+)
+def test_witness_allows_only_exact_read_only_terminal_commands(monkeypatch, command):
+    hook = witness_hook(monkeypatch)
+
+    assert hook(tool_name="terminal", args={"command": command}) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pwd; whoami",
+        "pwd && whoami",
+        "pwd | cat",
+        "pwd > report.txt",
+        "pwd $(whoami)",
+        "python -c 'print(1)'",
+        "bash -lc 'pwd'",
+        "powershell -Command Get-Process",
+        "./repair.ps1",
+        "uname --all",
+        "ipconfig /renew",
+        "pwd\nwhoami",
+        "pwd 'unterminated",
+        "",
+    ],
+)
+def test_witness_blocks_shell_composition_scripts_and_malformed_commands(
+    monkeypatch, command
+):
+    hook = witness_hook(monkeypatch)
+    result = hook(tool_name="terminal", args={"command": command})
+
+    assert result["action"] == "block"
+
+
+def test_witness_approvals_are_unique_per_call(monkeypatch):
+    hook = witness_hook(monkeypatch)
+    first = hook(tool_name="terminal", args={"command": "rm -rf /tmp/hands-test"})
+    second = hook(tool_name="terminal", args={"command": "rm -rf /tmp/hands-test"})
+
+    assert first["action"] == second["action"] == "approve"
+    assert first["rule_key"] != second["rule_key"]
+
+
+@pytest.mark.parametrize("tool_name", ["write_file", "patch"])
+def test_witness_file_mutations_require_approval(monkeypatch, tool_name):
+    hook = witness_hook(monkeypatch)
+    result = hook(tool_name=tool_name, args={"path": "notes.txt", "content": "updated"})
+
+    assert result["action"] == "approve"
+    assert result["rule_key"]
+
+
+def test_witness_blocks_execute_code(monkeypatch):
+    hook = witness_hook(monkeypatch)
+    result = hook(tool_name="execute_code", args={"code": "print('hello')"})
+
+    assert result["action"] == "block"
+
+
+def test_witness_does_not_gate_non_witness_targets(monkeypatch):
+    from hands import witness
+
+    monkeypatch.setattr(witness, "_witness_device", lambda ctx: None)
+    ctx = HookContext()
+    witness.register(ctx)
+
+    assert ctx.hooks["pre_tool_call"](tool_name="terminal", args={"command": "rm -rf /"}) is None
+
+
+def test_witness_preserves_core_dangerous_command_approval(monkeypatch):
+    hook = witness_hook(monkeypatch)
+    result = hook(tool_name="terminal", args={"command": "rm -rf /"})
+
+    assert result["action"] == "approve"
+
+
+@pytest.mark.parametrize(
+    ("gate_result", "expected"),
+    [
+        ({"approved": True}, None),
+        ({"approved": False, "message": "approval denied"}, "approval denied"),
+        (TimeoutError, "BLOCKED: plugin approval gate failed for terminal"),
+    ],
+)
+def test_witness_approval_uses_hermes_gate_fail_closed(monkeypatch, gate_result, expected):
+    plugins = pytest.importorskip("hermes_cli.plugins")
+    from tools import approval
+
+    hook = witness_hook(monkeypatch)
+    decision = hook(tool_name="terminal", args={"command": "rm -rf /"})
+    calls = []
+
+    def request(tool_name, reason, *, rule_key, approval_callback=None):
+        calls.append((tool_name, reason, rule_key))
+        if gate_result is TimeoutError:
+            raise TimeoutError
+        return gate_result
+
+    monkeypatch.setattr(approval, "request_tool_approval", request)
+    details = types.SimpleNamespace(
+        action=decision["action"],
+        message=decision["message"],
+        rule_key=decision["rule_key"],
+    )
+    result = plugins._resolve_block_from_details(details, "terminal")
+
+    assert result == expected
+    assert calls == [("terminal", decision["message"], decision["rule_key"])]

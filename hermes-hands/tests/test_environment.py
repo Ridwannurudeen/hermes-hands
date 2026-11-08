@@ -571,6 +571,57 @@ def test_cron_runs_on_the_server(laptop):
     assert env.execute("echo ${HANDS_FAKE_DEVICE:-server}")["output"].strip() == "server"
 
 
+def test_witness_uses_environment_owner_target_not_tool_target_arguments(laptop, monkeypatch):
+    from hands import witness
+
+    ctx = Ctx()
+    store.set_session_target("s1", "laptop", "telegram:42")
+    monkeypatch.setattr(
+        store, "get_device", lambda name: {"name": name, "device_id": "device-id"}
+    )
+
+    def device_by_id(device_id):
+        assert device_id == "device-id"
+        return {
+            "name": "laptop",
+            "witness": True,
+            "session_state": "active",
+            "capabilities": ["witness-v1"],
+        }
+
+    monkeypatch.setattr(store, "device_by_id", device_by_id)
+    caller = ["telegram:7"]
+    monkeypatch.setattr(environment.targets, "current_caller", lambda: caller[0])
+
+    guest = witness.pre_tool_call(
+        ctx,
+        "terminal",
+        {"command": "rm -rf /tmp/hands-test", "target": "laptop"},
+    )
+    assert guest is None
+
+    caller[0] = "telegram:42"
+    owner = witness.pre_tool_call(
+        ctx,
+        "terminal",
+        {"command": "rm -rf /tmp/hands-test", "target": "server"},
+    )
+    assert owner["action"] == "approve"
+
+
+def test_witness_target_resolver_exception_blocks_protected_action(laptop, monkeypatch):
+    from hands import witness
+
+    def fail(ctx):
+        raise RuntimeError("target resolver failed")
+
+    monkeypatch.setattr(environment, "resolve_current_target", fail)
+
+    result = witness.pre_tool_call(Ctx(), "terminal", {"command": "pwd"})
+
+    assert result["action"] == "block"
+
+
 def test_the_relay_seed_never_reaches_a_server_command(laptop, hands_backend, monkeypatch):
     monkeypatch.setenv("HANDS_RELAY_SEED", "ab" * 32)
     store.set_session_target("s1", "server")

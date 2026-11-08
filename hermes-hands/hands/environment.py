@@ -96,6 +96,14 @@ def _gateway_home() -> str | None:
     return home if home and posixpath.isabs(home) else None
 
 
+def resolve_current_target(ctx) -> str:
+    return targets.resolve_target(
+        session_key=get_session_env("HERMES_SESSION_KEY", ""),
+        in_cron=ctx.current_cron_execution() is not None,
+        default_target=str(ctx.get_config("default_target", targets.SERVER)),
+    )
+
+
 def _hands_failure(result: dict) -> bool:
     """A result the gateway half made up (handle.py, relay.py): a non-zero exit with a ``hands:`` line."""
     output = result.get("output") or ""
@@ -329,13 +337,7 @@ class HandsEnvironment(BaseEnvironment):
 
     def _resolve(self) -> tuple[str, BaseEnvironment]:
         """This call's target and its sub-environment; raises ``sqlite3.Error`` if the store is unreadable."""
-        target, sub = self._sub(
-            targets.resolve_target(
-                session_key=get_session_env("HERMES_SESSION_KEY", ""),
-                in_cron=self._ctx.current_cron_execution() is not None,
-                default_target=str(self._ctx.get_config("default_target", targets.SERVER)),
-            )
-        )
+        target, sub = self._sub(resolve_current_target(self._ctx))
         if target != self._files_target:
             if self._files_target is not None:
                 self._switched(target, sub)

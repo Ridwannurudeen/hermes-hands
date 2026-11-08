@@ -37,6 +37,18 @@ PAIR_NAME_RESERVED = (
 )
 PAIR_BAD_SIGNATURE = "hands: the pairing request is not signed by the public key it carries."
 TARGET_NOTE_SERVER = "hands: now on server (the gateway host)"
+WITNESS_APPROVAL = (
+    "This action can change files or run a command on {device}. Review the tool arguments and "
+    "approve this call to continue."
+)
+WITNESS_COMMAND_BLOCKED = (
+    "Hermes Hands blocks shell composition, scripts, redirects, malformed commands, and unsupported "
+    "flags during an active witness session."
+)
+WITNESS_EXECUTE_CODE_BLOCKED = "Hermes Hands blocks execute_code during an active witness session."
+WITNESS_TARGET_BLOCKED = (
+    "Hermes Hands could not verify the active device and owner, so it blocked this tool call."
+)
 STORE_DOWN = (
     "hands: the Hermes Hands store (plugin-data/hermes-hands/hands.db) is unreadable, so this "
     "conversation's target is unknown and nothing ran anywhere. See the gateway log."
