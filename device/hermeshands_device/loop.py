@@ -43,6 +43,7 @@ class DeviceLoop:
         self.device_id = pairing.get("device_id", "")
         self.relay_public_key = config.relay_public_key()
         self.running: dict[str, threading.Thread] = {}
+        self.job_start_events: dict[str, threading.Event] = {}
         self.processes: dict[str, tuple[object, float]] = {}
         self.cancelled_jobs: set[str] = set()
         self.process_lock = threading.Lock()
@@ -147,19 +148,26 @@ class DeviceLoop:
         return {"policy_hash": policy.digest(), "os": platform.platform(), "home": str(Path.home()), "agent_version": __version__, "instance": self.instance}
 
     def _cancel_all(self) -> None:
+        """On revoke, stop foreground and detached Windows jobs before serve exits."""
         self.stop_event.set()
         self._cancel_running_jobs()
 
     def _cancel_running_jobs(self) -> None:
         if not hasattr(self, "process_lock"):
             self.process_lock = threading.Lock()
+        if not hasattr(self, "job_start_events"):
+            self.job_start_events = {}
         with self.process_lock:
             processes = list(self.processes.values())
         for proc, started in processes:
-            if proc.poll() is None:
-                from .executor import _terminate
-
-                _terminate(proc, started)
+            executor._terminate(proc, started)
+        executor._terminate_windows_jobs()
+        if self.stop_event.is_set():
+            with self.process_lock:
+                starting = list(self.job_start_events.values())
+            for started in starting:
+                started.wait()
+            executor._terminate_windows_jobs()
 
     def _result(self, job_id: str, seq: int, *, chunk: str = "", done: bool = False, returncode: int | None = None, error: str | None = None, png: bytes | None = None, policy_hash: str | None = None) -> None:
         if not hasattr(self, "process_lock"):
@@ -197,7 +205,7 @@ class DeviceLoop:
         logger.debug("Stopping result delivery for %s because the device is stopping", job_id)
         raise InterruptedError("device is stopping")
 
-    def _run_job(self, job: dict) -> None:
+    def _run_job(self, job: dict, start_event: threading.Event | None = None) -> None:
         job_id, seq = job["job_id"], 0
         if not hasattr(self, "cancelled_jobs"):
             self.cancelled_jobs = set()
@@ -205,13 +213,22 @@ class DeviceLoop:
             self.process_lock = threading.Lock()
         if not hasattr(self, "job_deadlines"):
             self.job_deadlines = {}
+        if not hasattr(self, "job_start_events"):
+            self.job_start_events = {}
+        if start_event is None:
+            start_event = threading.Event()
+            with self.process_lock:
+                self.job_start_events[job_id] = start_event
         if not hasattr(self, "instance"):
             self.instance = secrets.token_hex(8)
         tail = b""
         try:
+            if job["type"] != "exec":
+                start_event.set()
             if job["type"] == "exec":
                 current_policy_hash, policy_patterns = policy.snapshot()
                 if current_policy_hash != getattr(self, "accepted_policy_hash", None):
+                    start_event.set()
                     self._result(
                         job_id,
                         seq,
@@ -239,6 +256,7 @@ class DeviceLoop:
                 else:
                     refused = policy.refusal(policy_script, policy_patterns)
                 if refused:
+                    start_event.set()
                     self._result(job_id, seq, chunk=f"Policy refused command matching: {refused}\n", done=True, returncode=126)
                     return
                 exit_code = [0]
@@ -250,10 +268,14 @@ class DeviceLoop:
                 def on_start(proc, started):
                     with self.process_lock:
                         self.processes[job_id] = (proc, started)
-                        cancelled = job_id in self.cancelled_jobs
+                        stopping = self.stop_event.is_set()
+                        cancelled = job_id in self.cancelled_jobs or stopping
                         self.cancelled_jobs.discard(job_id)
                     if cancelled:
                         executor._terminate(proc, started)
+                        if stopping:
+                            executor._terminate_windows_jobs()
+                    start_event.set()
                 for chunk in executor.run(job["script"], login=job.get("login", False), timeout=timeout, job_id=job_id, stdin=job.get("stdin"), stdin_b64=job.get("stdin_b64"), on_start=on_start, on_exit=lambda code: exit_code.__setitem__(0, code), on_capped=capped.set, on_truncated=truncated.set):
                     with self.process_lock:
                         process = self.processes.get(job_id)
@@ -316,8 +338,10 @@ class DeviceLoop:
             except Exception:
                 logger.debug("Could not deliver job failure for %s", job_id, exc_info=True)
         finally:
+            start_event.set()
             with self.process_lock:
                 self.processes.pop(job_id, None)
+                self.job_start_events.pop(job_id, None)
                 self.cancelled_jobs.discard(job_id)
             self.running.pop(job_id, None)
             self.job_deadlines.pop(job_id, None)
@@ -378,9 +402,17 @@ class DeviceLoop:
                     if self.fatal:
                         raise self.fatal[0]
                     if job:
-                        thread = threading.Thread(target=self._run_job, args=(job,), daemon=True)
-                        self.running[job["job_id"]] = thread
-                        thread.start()
+                        if not hasattr(self, "process_lock"):
+                            self.process_lock = threading.Lock()
+                        if not hasattr(self, "job_start_events"):
+                            self.job_start_events = {}
+                        start_event = threading.Event()
+                        thread = threading.Thread(target=self._run_job, args=(job, start_event), daemon=True)
+                        with self.process_lock:
+                            if not self.stop_event.is_set():
+                                self.job_start_events[job["job_id"]] = start_event
+                                self.running[job["job_id"]] = thread
+                                thread.start()
                     self.poll_retry_delay = 1
                     if self.fatal:
                         raise self.fatal[0]

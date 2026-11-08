@@ -187,7 +187,12 @@ def test_chatty_background_writer_is_bounded_after_shell_exit(monkeypatch, tmp_p
     )
     started = time.monotonic()
     truncated = []
-    chunks = b"".join(executor.run(f'python "{script_file.as_posix()}" & echo parent-exit', timeout=15, on_truncated=lambda: truncated.append(True)))
+    command = (
+        f'python "{script_file.as_posix()}" & '
+        f'for i in {{1..100}}; do test -s "{pid_file.as_posix()}" && break; sleep 0.01; done; '
+        "sleep 0.1; echo parent-exit"
+    )
+    chunks = b"".join(executor.run(command, timeout=15, on_truncated=lambda: truncated.append(True)))
     elapsed = time.monotonic() - started
     deadline = time.monotonic() + 15
     while not pid_file.exists() and time.monotonic() < deadline:

@@ -307,6 +307,30 @@ def _close_windows_job(proc: subprocess.Popen, job: int | None, *, keep_active: 
         watcher.start()
 
 
+def _terminate_windows_jobs() -> None:
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    while True:
+        with _WINDOWS_JOBS_LOCK:
+            for pid, job in list(_WINDOWS_JOBS.items()):
+                if not _windows_job_has_active_processes(job):
+                    if _WINDOWS_JOBS.get(pid) == job:
+                        del _WINDOWS_JOBS[pid]
+                        kernel32.CloseHandle(wintypes.HANDLE(job))
+                    continue
+                if not kernel32.TerminateJobObject(wintypes.HANDLE(job), 1) and _windows_job_has_active_processes(job):
+                    raise OSError(ctypes.get_last_error(), "Could not terminate Windows job object")
+            if not _WINDOWS_JOBS:
+                return
+        time.sleep(0.05)
+
+
 def terminate_recorded(pid: int, start_time: float) -> None:
     if os.name == "nt" and _terminate_windows_job(pid, start_time):
         return

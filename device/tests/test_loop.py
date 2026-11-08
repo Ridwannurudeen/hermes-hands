@@ -4,6 +4,7 @@ import threading
 import time
 
 import httpx
+import psutil
 import pytest
 
 from hermeshands_device import cli, loop, config
@@ -342,6 +343,7 @@ def test_loop_distinguishes_output_cap_from_exit_125(monkeypatch, capped, expect
     agent.cancelled_jobs = set()
     agent.job_deadlines = {}
     agent.process_lock = threading.Lock()
+    agent.stop_event = threading.Event()
     posted = []
     monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
@@ -387,6 +389,122 @@ def test_signed_unknown_device_stops_agent(monkeypatch):
             agent._verify_response(response, "/device/poll")
         assert agent.stop_event.is_set()
     finally:
+        agent.client.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows background-job revoke containment")
+def test_signed_unknown_device_kills_background_child_after_shell_exit(monkeypatch, tmp_path):
+    bash = loop.executor.resolve_bash()
+    if not bash:
+        pytest.skip("Git Bash is unavailable")
+    monkeypatch.setattr(loop.executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(loop.executor.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(loop.executor, "_WINDOWS_JOBS", {})
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
+    monkeypatch.setattr(config, "device_id", lambda: "device-1")
+    monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    monkeypatch.setattr(config, "load", lambda: {
+        "gateway_url": "https://example.test/api/plugins/hermes-hands",
+        "device_id": "device-1",
+        "relay_public_key": b64u(public),
+    })
+
+    def handler(request):
+        if request.url.path.endswith("/device/poll"):
+            body = canonical_json({"error": "unknown_device"})
+            nonce = request.headers["X-Hands-Nonce"]
+            path = "/api/plugins/hermes-hands/device/poll"
+            ts = int(time.time())
+            return httpx.Response(401, content=body, request=request, headers={
+                "X-Hands-Ts": str(ts),
+                "X-Hands-Nonce": nonce,
+                "X-Hands-Signature": sign_request(private, R2D, ts, nonce, "POST", path, body),
+            })
+        return httpx.Response(204, request=request)
+
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(handler))
+    agent.accepted_policy_hash = loop.policy.snapshot()[0]
+    heartbeat_finished = threading.Event()
+    heartbeat_loop = agent._heartbeat_loop
+
+    def watch_heartbeat():
+        try:
+            heartbeat_loop()
+        finally:
+            heartbeat_finished.set()
+
+    agent._heartbeat_loop = watch_heartbeat
+    job_id = "revoke-background"
+    pid_file = tmp_path / "child.pid"
+    python_code = "import os,time; print(os.getpid(), flush=True); time.sleep(60)"
+    command = f"nohup python -c {shlex.quote(python_code)} >{shlex.quote(pid_file.as_posix())} 2>/dev/null &"
+    agent._run_job({"job_id": job_id, "type": "exec", "script": command})
+    serve_errors = []
+    serve_thread = None
+    stop_times = []
+    exit_states = []
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 5
+        pid_text = ""
+        while not pid_text and time.monotonic() < deadline:
+            if pid_file.exists():
+                pid_text = pid_file.read_text(encoding="utf-8-sig").strip()
+            time.sleep(0.05)
+        assert pid_text
+        child_pid = int(pid_text)
+        assert job_id not in agent.processes
+        assert psutil.pid_exists(child_pid)
+        job_entries = tuple(loop.executor._WINDOWS_JOBS.items())
+        assert job_entries and loop.executor._windows_job_has_active_processes(job_entries[0][1])
+        terminate_calls = []
+        terminate_jobs = loop.executor._terminate_windows_jobs
+
+        def track_termination():
+            terminate_calls.append(tuple(loop.executor._WINDOWS_JOBS))
+            terminate_jobs()
+
+        monkeypatch.setattr(loop.executor, "_terminate_windows_jobs", track_termination)
+        cancel_all = agent._cancel_all
+
+        def cancel_for_revoke():
+            stop_times.append(time.monotonic())
+            cancel_all()
+
+        agent._cancel_all = cancel_for_revoke
+
+        def serve():
+            try:
+                agent.run_forever()
+            except PermissionError as exc:
+                serve_errors.append(exc)
+            finally:
+                exit_states.append((time.monotonic(), psutil.pid_exists(child_pid)))
+
+        serve_thread = threading.Thread(target=serve)
+        serve_thread.start()
+        serve_thread.join(timeout=5)
+        assert not serve_thread.is_alive()
+        assert heartbeat_finished.wait(2)
+        assert serve_errors and str(serve_errors[0]) == "unknown_device"
+        assert agent.stop_event.is_set()
+        assert terminate_calls and job_entries[0][0] in terminate_calls[0]
+        assert not exit_states[0][1], (job_entries, terminate_calls, psutil.Process(child_pid).ppid())
+        assert exit_states[0][0] - stop_times[0] < 3
+    finally:
+        if serve_thread is not None and serve_thread.is_alive():
+            agent.stop_event.set()
+            serve_thread.join(timeout=5)
+        if child_pid is not None and psutil.pid_exists(child_pid):
+            child = psutil.Process(child_pid)
+            child.kill()
+            psutil.wait_procs([child], timeout=2)
+        deadline = time.monotonic() + 2
+        while loop.executor._WINDOWS_JOBS and time.monotonic() < deadline:
+            time.sleep(0.05)
         agent.client.close()
 
 
@@ -575,6 +693,7 @@ def test_loop_finishes_when_post_exit_pipe_is_idle(monkeypatch, tmp_path):
     agent.accepted_policy_hash = "hash"
     agent.processes, agent.running = {}, {}
     agent.cancelled_jobs, agent.job_deadlines = set(), {}
+    agent.stop_event = threading.Event()
     posted = []
     agent._result = lambda job_id, seq, **kwargs: posted.append(kwargs)
 
@@ -620,6 +739,7 @@ def test_cancel_remembered_before_registration_reaches_terminate(monkeypatch):
     agent.cancelled_jobs = {"job"}
     agent.job_deadlines = {}
     agent.process_lock = threading.Lock()
+    agent.stop_event = threading.Event()
     terminated = []
     process = type("Proc", (), {"poll": lambda self: None})()
 
@@ -707,6 +827,7 @@ def test_loop_sends_output_read_after_exit_with_done(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.processes = {}
     agent.running = {}
+    agent.stop_event = threading.Event()
     exited = []
 
     class Process:
