@@ -12,6 +12,7 @@ from typing import Callable, Protocol
 WITNESS_CAPABILITIES = ("witness-v1", "checkup-v1", "help-v1", "receipt-v1")
 WITNESS_START_PROMPT = "Start witness mode? [Y/N]: "
 SCREENSHOT_SESSION_PROMPT = "Allow screenshot requests this session?"
+SCREENSHOT_REQUEST_PROMPT = "Allow this screenshot?"
 WITNESS_CONSOLE_CLOSED = "Witness mode declined because the console closed.\n"
 WITNESS_DECLINED = "Witness mode declined. No session was started.\n"
 WITNESS_STOPPED_BEFORE_START = "Witness mode stopped before the session started.\n"

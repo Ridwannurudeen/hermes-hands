@@ -255,6 +255,29 @@ def test_late_answer_is_bound_to_expired_prompt_id():
     assert "new-request" in console.prompt_text()
 
 
+def test_stop_during_screenshot_request_releases_prompt():
+    console = FakeConsole()
+    stopped = threading.Event()
+    answers = []
+    owner = ConsoleOwner(console, on_stop=stopped.set, on_help=lambda text: None)
+    owner.start()
+    assert console.read_started.wait(1)
+    request = threading.Thread(
+        target=lambda: answers.append(
+            owner.request("screen-request", "Allow this screenshot?", timeout=30)
+        )
+    )
+    request.start()
+    assert _wait_for(lambda: "screen-request" in console.output())
+
+    console.feed("S")
+    request.join(1)
+    owner.join(1)
+
+    assert stopped.is_set()
+    assert answers == ["S"]
+
+
 def test_expired_queued_prompt_is_not_shown_later():
     console = FakeConsole()
     stopped = threading.Event()

@@ -18,6 +18,7 @@ import httpx
 
 from . import __version__, config, executor, policy, screen
 from .console import (
+    SCREENSHOT_REQUEST_PROMPT,
     SCREENSHOT_SESSION_PROMPT,
     SCREENSHOTS_DISABLED,
     ConsoleInput,
@@ -31,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 _STOP_FLUSH_SECONDS = 5
 _STOP_REQUEST_TIMEOUT = 2
+_SCREENSHOT_REQUEST_TIMEOUT = 30
+_WITNESS_SESSION_SECONDS = 30 * 60
 
 _BACKGROUND_PID_PROBE = re.compile(
     r"(?ms)^eval 'kill -0 \"\$\(cat "
@@ -64,6 +67,8 @@ class DeviceLoop:
         self.session_state = "normal"
         self.witness = False
         self.capabilities: list[str] = []
+        self.session_deadline: float | None = None
+        self.stop_reason: str | None = None
         self.stop_flush_deadline: float | None = None
         self._stop_lock = threading.Lock()
         self.help_requests: queue.Queue[str] = queue.Queue()
@@ -97,6 +102,13 @@ class DeviceLoop:
             if not remaining:
                 raise InterruptedError("stop result flush deadline expired")
             request_options["timeout"] = min(remaining, _STOP_REQUEST_TIMEOUT)
+        elif endpoint == "/device/poll":
+            session_remaining = self._session_remaining()
+            if session_remaining is not None:
+                if not session_remaining:
+                    self._expire_session_if_due()
+                    raise InterruptedError("witness session expired")
+                request_options["timeout"] = session_remaining
         return self.client.post(self.gateway_url + endpoint, content=body, headers=headers, **request_options)
 
     def _verify_response(self, response: httpx.Response, endpoint: str) -> dict:
@@ -164,11 +176,18 @@ class DeviceLoop:
             setattr(self, counter, 1)
         delay = min(cap, getattr(self, counter))
         setattr(self, counter, min(cap, delay * 2))
+        session_remaining = self._session_remaining()
+        if session_remaining is not None:
+            delay = min(delay, session_remaining)
         self.stop_event.wait(delay)
 
     def _poll_body(self) -> dict:
+        wait = 25
+        remaining = self._session_remaining()
+        if remaining is not None:
+            wait = min(wait, max(1, int(remaining)))
         return {
-            "wait": 25,
+            "wait": wait,
             "policy_hash": policy.digest(),
             "instance": self.instance,
             **self._session_status(),
@@ -206,6 +225,28 @@ class DeviceLoop:
     def _is_stopping(self) -> bool:
         return getattr(self, "session_state", "normal") == "stopping"
 
+    def _session_remaining(self) -> float | None:
+        deadline = getattr(self, "session_deadline", None)
+        if (
+            deadline is None
+            or not getattr(self, "witness", False)
+            or getattr(self, "session_state", "normal") != "active"
+        ):
+            return None
+        return max(0.0, deadline - time.monotonic())
+
+    def _expire_session_if_due(self) -> bool:
+        remaining = self._session_remaining()
+        if remaining is None or remaining > 0:
+            return False
+        self._begin_stopping(reason="session_timeout")
+        return True
+
+    def _stopped_result(self) -> tuple[int, str]:
+        if getattr(self, "stop_reason", None) == "session_timeout":
+            return 124, "session_timeout"
+        return 130, "stopped_by_person"
+
     def _stop_flush_remaining(self) -> float | None:
         with self._stop_lock:
             if not self._is_stopping():
@@ -215,7 +256,7 @@ class DeviceLoop:
                 return 0.0
             return max(0.0, deadline - time.monotonic())
 
-    def _begin_stopping(self) -> float:
+    def _begin_stopping(self, reason: str = "stopped_by_person") -> float:
         if not hasattr(self, "_stop_lock"):
             self._stop_lock = threading.Lock()
         with self._stop_lock:
@@ -223,6 +264,7 @@ class DeviceLoop:
                 return getattr(self, "stop_flush_deadline", None) or time.monotonic()
             if not self._is_stopping():
                 self.session_state = "stopping"
+                self.stop_reason = reason
                 self.stop_flush_deadline = time.monotonic() + _STOP_FLUSH_SECONDS
                 self.witness = False
             elif getattr(self, "stop_flush_deadline", None) is None:
@@ -336,14 +378,16 @@ class DeviceLoop:
             self.instance = secrets.token_hex(8)
         tail = b""
         try:
+            self._expire_session_if_due()
             if self._is_stopping():
                 start_event.set()
+                returncode, error = self._stopped_result()
                 self._result(
                     job_id,
                     seq,
                     done=True,
-                    returncode=130,
-                    error="stopped_by_person",
+                    returncode=returncode,
+                    error=error,
                 )
                 return
             if self.stop_event.is_set():
@@ -414,13 +458,14 @@ class DeviceLoop:
                     seq += 1
                 final = decoder.decode(tail, final=True)
                 if self._is_stopping():
+                    returncode, error = self._stopped_result()
                     self._result(
                         job_id,
                         seq,
                         chunk=final,
                         done=True,
-                        returncode=130,
-                        error="stopped_by_person",
+                        returncode=returncode,
+                        error=error,
                     )
                 elif capped.is_set():
                     self._result(job_id, seq, chunk=final, done=True, returncode=1, error="Output exceeded the 64 MiB device limit")
@@ -429,6 +474,43 @@ class DeviceLoop:
                 else:
                     self._result(job_id, seq, chunk=final, done=True, returncode=exit_code[0])
             elif job["type"] == "screenshot":
+                if getattr(self, "witness", False):
+                    if not self.allow_screen:
+                        self._result(
+                            job_id,
+                            seq,
+                            done=True,
+                            returncode=126,
+                            error="screenshot_declined",
+                        )
+                        return
+                    answer = self.console_owner.request(
+                        f"{self.instance}-screenshot-{job_id}",
+                        SCREENSHOT_REQUEST_PROMPT,
+                        timeout=_SCREENSHOT_REQUEST_TIMEOUT,
+                    )
+                    self._expire_session_if_due()
+                    if self._is_stopping():
+                        returncode, error = self._stopped_result()
+                        self._result(
+                            job_id,
+                            seq,
+                            done=True,
+                            returncode=returncode,
+                            error=error,
+                        )
+                        return
+                    if self.stop_event.is_set():
+                        return
+                    if answer is None or answer.strip() != "Y":
+                        self._result(
+                            job_id,
+                            seq,
+                            done=True,
+                            returncode=126,
+                            error="screenshot_declined",
+                        )
+                        return
                 image = screen.capture(allow_screen=self.allow_screen)
                 self._result(job_id, seq, done=True, returncode=0, png=image)
             elif job["type"] == "cancel":
@@ -448,13 +530,14 @@ class DeviceLoop:
                 return
             if self._is_stopping():
                 try:
+                    returncode, error = self._stopped_result()
                     self._result(
                         job_id,
                         seq,
                         chunk=tail.decode("utf-8", errors="replace"),
                         done=True,
-                        returncode=130,
-                        error="stopped_by_person",
+                        returncode=returncode,
+                        error=error,
                     )
                 except Exception:
                     logger.debug("Could not deliver stopped result for %s", job_id, exc_info=True)
@@ -477,13 +560,14 @@ class DeviceLoop:
         except Exception as exc:
             if self._is_stopping():
                 try:
+                    returncode, error = self._stopped_result()
                     self._result(
                         job_id,
                         seq,
                         chunk=tail.decode("utf-8", errors="replace"),
                         done=True,
-                        returncode=130,
-                        error="stopped_by_person",
+                        returncode=returncode,
+                        error=error,
                     )
                 except Exception:
                     logger.debug("Could not deliver stopped result for %s", job_id, exc_info=True)
@@ -532,6 +616,12 @@ class DeviceLoop:
     def run_forever(self) -> None:
         if not hasattr(self, "poll_retry_delay"):
             self.poll_retry_delay = 1
+        if (
+            getattr(self, "witness", False)
+            and getattr(self, "session_state", "normal") == "active"
+            and getattr(self, "session_deadline", None) is None
+        ):
+            self.session_deadline = time.monotonic() + _WITNESS_SESSION_SECONDS
         lock_path = Path.home() / ".hermes-hands" / "serve.lock"
         lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         lock_file = lock_path.open("a+b")
@@ -565,9 +655,13 @@ class DeviceLoop:
                 )
                 screenshot_consent_thread.start()
             while not self.stop_event.is_set():
+                if self._expire_session_if_due():
+                    break
                 try:
                     response = self._post("/device/poll", self._poll_body())
                     job = self._verify_response(response, "/device/poll")
+                    if self._expire_session_if_due():
+                        break
                     if self.fatal:
                         raise self.fatal[0]
                     if job:
@@ -585,6 +679,10 @@ class DeviceLoop:
                     self.poll_retry_delay = 1
                     if self.fatal:
                         raise self.fatal[0]
+                except InterruptedError:
+                    if self._is_stopping():
+                        break
+                    raise
                 except PermissionError as exc:
                     if str(exc) == "pairing_changed":
                         raise RuntimeError("Device pairing changed while serve was running") from exc
@@ -595,6 +693,8 @@ class DeviceLoop:
                         continue
                     self._retry("poll_retry_delay")
                 except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError) as exc:
+                    if self._expire_session_if_due():
+                        break
                     if not (isinstance(exc, ValueError) and str(exc).startswith("transient relay status ")):
                         logger.warning("Device poll failed; retrying")
                     self._retry("poll_retry_delay")

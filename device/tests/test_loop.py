@@ -214,13 +214,185 @@ def test_screenshot_final_result_has_success_code(monkeypatch):
     agent.job_start_events = {}
     agent.cancelled_jobs = set()
     agent.job_deadlines = {}
-    posted = []
+    bodies = []
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
     monkeypatch.setattr(loop.screen, "capture", lambda **kwargs: b"png")
+    monkeypatch.setattr(agent, "_post", lambda endpoint, body: bodies.append(body) or httpx.Response(204))
+    monkeypatch.setattr(agent, "_verify_response", lambda *args: {})
+
+    agent._run_job({"job_id": "screen", "type": "screenshot"})
+
+    assert bodies == [{
+        "job_id": "screen",
+        "seq": 0,
+        "chunk": "",
+        "done": True,
+        "policy_hash": "hash",
+        "returncode": 0,
+        "error": None,
+        "png_b64": "cG5n",
+    }]
+
+
+class PromptOwner:
+    def __init__(self, answers):
+        self.answers = iter(answers)
+        self.requests = []
+
+    def request(self, prompt_id, text, *, timeout=None):
+        self.requests.append((prompt_id, text, timeout))
+        return next(self.answers)
+
+
+def _screenshot_agent(owner):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.allow_screen = True
+    agent.console_owner = owner
+    agent.instance = "witness-instance"
+    agent.witness = True
+    agent.session_state = "active"
+    agent.session_deadline = None
+    agent.stop_event = threading.Event()
+    agent._stop_lock = threading.Lock()
+    agent.stop_reason = None
+    agent.stop_flush_deadline = None
+    agent.process_lock = threading.Lock()
+    agent.running = {}
+    agent.processes = {}
+    agent.job_start_events = {}
+    agent.cancelled_jobs = set()
+    agent.job_deadlines = {}
+    return agent
+
+
+def test_each_screenshot_request_requires_its_own_consent(monkeypatch):
+    owner = PromptOwner(["Y", "N"])
+    agent = _screenshot_agent(owner)
+    captures, posted = [], []
+    monkeypatch.setattr(loop.screen, "capture", lambda **kwargs: captures.append(kwargs) or b"png")
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((job_id, kwargs)))
+
+    agent._run_job({"job_id": "screen-one", "type": "screenshot"})
+    agent._run_job({"job_id": "screen-two", "type": "screenshot"})
+
+    assert owner.requests == [
+        ("witness-instance-screenshot-screen-one", "Allow this screenshot?", 30),
+        ("witness-instance-screenshot-screen-two", "Allow this screenshot?", 30),
+    ]
+    assert captures == [{"allow_screen": True}]
+    assert posted == [
+        ("screen-one", {"done": True, "returncode": 0, "png": b"png"}),
+        ("screen-two", {"done": True, "returncode": 126, "error": "screenshot_declined"}),
+    ]
+
+
+@pytest.mark.parametrize("answer", [None, "", "n"])
+def test_screenshot_timeout_eof_and_non_y_decline(monkeypatch, answer):
+    owner = PromptOwner([answer])
+    agent = _screenshot_agent(owner)
+    posted = []
+    monkeypatch.setattr(loop.screen, "capture", lambda **kwargs: pytest.fail("declined screenshot was captured"))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
 
     agent._run_job({"job_id": "screen", "type": "screenshot"})
 
-    assert posted == [{"done": True, "returncode": 0, "png": b"png"}]
+    assert owner.requests == [("witness-instance-screenshot-screen", "Allow this screenshot?", 30)]
+    assert posted == [{"done": True, "returncode": 126, "error": "screenshot_declined"}]
+
+
+def test_stop_during_screenshot_prompt_returns_stopped_result(monkeypatch):
+    owner = PromptOwner([None])
+    agent = _screenshot_agent(owner)
+    posted = []
+
+    def stop_prompt(*args, **kwargs):
+        agent._begin_stopping()
+        return None
+
+    owner.request = stop_prompt
+    monkeypatch.setattr(loop.screen, "capture", lambda **kwargs: pytest.fail("stopped screenshot was captured"))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+
+    agent._run_job({"job_id": "screen", "type": "screenshot"})
+
+    assert posted == [{"done": True, "returncode": 130, "error": "stopped_by_person"}]
+
+
+def test_expired_witness_deadline_refuses_a_new_job(monkeypatch):
+    agent = _screenshot_agent(PromptOwner([]))
+    agent.session_deadline = time.monotonic() - 1
+    posted = []
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: pytest.fail("expired session checked policy"))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: pytest.fail("expired session ran job"))
+
+    agent._run_job({"job_id": "late", "type": "exec", "script": "echo too late"})
+
+    assert agent.session_state == "stopping"
+    assert agent.stop_reason == "session_timeout"
+    assert posted == [{"done": True, "returncode": 124, "error": "session_timeout"}]
+
+
+def test_witness_deadline_wakes_after_poll_and_refuses_late_job(monkeypatch, tmp_path):
+    _, agent = _signed_poll(monkeypatch)
+    monkeypatch.setattr(loop.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(loop.executor, "reap_recorded_processes", lambda: None)
+    agent.witness = True
+    agent.session_state = "active"
+    clock = type("Clock", (), {"monotonic": lambda self: self.now})()
+    clock.now = 100.0
+    monkeypatch.setattr(loop, "time", clock)
+    monkeypatch.setattr(agent, "_heartbeat_loop", lambda: None)
+    monkeypatch.setattr(agent, "_request_session_screenshot_consent", lambda: None)
+    monkeypatch.setattr(agent, "_cancel_running_jobs", lambda: None)
+    launched = []
+    monkeypatch.setattr(agent, "_run_job", lambda job, start_event=None: launched.append(job))
+    poll_calls = []
+
+    def post(endpoint, body):
+        if endpoint == "/device/poll":
+            poll_calls.append(body)
+            if len(poll_calls) == 1:
+                clock.now += 1801
+            else:
+                agent.stop_event.set()
+        return httpx.Response(200, request=httpx.Request("POST", "https://example.test"))
+
+    monkeypatch.setattr(agent, "_post", post)
+    monkeypatch.setattr(agent, "_verify_response", lambda response, endpoint: {"job_id": "late", "type": "exec"})
+
+    agent.run_forever()
+
+    assert agent.session_deadline == 1900.0
+    assert poll_calls
+    assert launched == []
+    assert agent.stop_reason == "session_timeout"
+    assert agent.session_state == "stopped"
+
+
+def test_witness_poll_timeout_cannot_outlive_session_deadline(monkeypatch):
+    _, agent = _signed_poll(monkeypatch)
+    agent.witness = True
+    agent.session_state = "active"
+    agent.session_deadline = 11.25
+    clock = type("Clock", (), {"monotonic": lambda self: 10.0, "time": lambda self: 1000.0})()
+    monkeypatch.setattr(loop, "time", clock)
+    timeouts = []
+
+    def handler(request):
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(204, request=request)
+
+    agent.client.close()
+    agent.client = httpx.Client(transport=httpx.MockTransport(handler), timeout=35, trust_env=False)
+    try:
+        body = agent._poll_body()
+        agent._post("/device/poll", body)
+    finally:
+        agent.client.close()
+
+    assert body["wait"] == 1
+    assert [max(timeout.values()) for timeout in timeouts] == [1.25]
 
 
 @pytest.mark.parametrize(("answer", "expected"), [("Y", True), ("N", False), ("y", False), ("", False)])
