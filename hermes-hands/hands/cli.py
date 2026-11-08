@@ -2,10 +2,35 @@
 
 from __future__ import annotations
 
+import ipaddress
 import secrets
 import shlex
+from urllib.parse import urlparse
 
 from . import client, commands, messages, store
+
+DEFAULT_DASHBOARD_URL = "http://127.0.0.1:9119"
+
+
+def _loopback(host: str) -> bool:
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _loopback_url(url: str) -> bool:
+    return _loopback(urlparse(url).hostname or "")
+
+
+def _https_or_loopback(url: str) -> bool:
+    """The pairing URLs the device accepts (device hermeshands_device/cli.py:_pair)."""
+    parsed = urlparse(url)
+    return parsed.scheme == "https" or (parsed.scheme == "http" and _loopback(parsed.hostname or ""))
 
 
 def register_cli(ctx, *, has_seed: bool) -> None:
@@ -47,14 +72,23 @@ def register_cli(ctx, *, has_seed: bool) -> None:
             from hermes_cli.config import load_config_readonly
 
             name = args.name
-            code = store.mint_pairing_code(name)
             dashboard = (load_config_readonly() or {}).get("dashboard") or {}
-            gateway_url = (
-                dashboard.get("public_url")
-                or ctx.get_config("dashboard_url", default="http://127.0.0.1:9119")
-            )
+            public_url = str(dashboard.get("public_url") or "").strip()
+            gateway_url = public_url or str(
+                ctx.get_config("dashboard_url", default=DEFAULT_DASHBOARD_URL) or ""
+            ).strip()
+            if not _https_or_loopback(gateway_url):
+                print(
+                    f"dashboard.public_url is {gateway_url}, and the device refuses a non-loopback http "
+                    "pairing URL. Set dashboard.public_url to the https URL of the Hands host, then run "
+                    "this again."
+                )
+                return
+            code = store.mint_pairing_code(name)
             command = f"hermes-hands pair {gateway_url} --name {shlex.quote(name)} --code={shlex.quote(code)}"
             print(f"Pair code: {code}\nRun on the device: {command}")
+            if _loopback_url(gateway_url):
+                print("Note: a loopback URL pairs only a device on the gateway host itself.")
             return
         if action == "revoke":
             if not args.yes and input(f"Revoke {args.name}? [y/N] ").strip().lower() != "y":
@@ -84,16 +118,28 @@ def register_cli(ctx, *, has_seed: bool) -> None:
             return
         if action == "doctor":
             from hermes_cli.config import load_config_readonly
-            from hermes_cli.dashboard_auth import list_interactive_providers
 
             cfg = load_config_readonly() or {}
             backend = commands.terminal_backend()
             dashboard = cfg.get("dashboard") or {}
+            dashboard_url = str(
+                ctx.get_config("dashboard_url", default=DEFAULT_DASHBOARD_URL) or ""
+            ).strip()
             public_url = str(dashboard.get("public_url") or "").strip()
+            basic = dashboard.get("basic_auth") or {}
+            basic_ready = bool(str(basic.get("username") or "").strip()) and bool(
+                basic.get("password_hash") or basic.get("password")
+            )
             _check(
                 "terminal.backend is hands",
                 backend == "hands",
                 f"It is {backend or 'not set'}. Run hermes config set terminal.backend hands, then restart the gateway.",
+            )
+            _check(
+                "dashboard_url is loopback",
+                _loopback_url(dashboard_url),
+                f"It is {dashboard_url or 'not set'}. The gateway sends its local bearer and every job script "
+                f"there, so it must be a loopback address such as {DEFAULT_DASHBOARD_URL}.",
             )
             # /local/state proves the route is mounted, the seed matches and the relay answers; it
             # also starts the relay, which writes its first heartbeat row before it replies.
@@ -103,12 +149,25 @@ def register_cli(ctx, *, has_seed: bool) -> None:
             except client.HandsError as exc:
                 relay_error = str(exc)
             _check("Relay answers at dashboard_url", not relay_error, relay_error)
-            _check("dashboard.public_url", bool(public_url), "Set dashboard.public_url to the public HTTPS URL of the Hands host.")
-            _check("Interactive dashboard auth", bool(list_interactive_providers()), "Configure dashboard.basic_auth or another interactive auth provider.")
             _check(
-                "Shared plugin_data_dir",
+                "dashboard.public_url is https or unset",
+                not public_url or _https_or_loopback(public_url),
+                f"It is {public_url}. The device refuses a non-loopback http pairing URL, so set "
+                "dashboard.public_url to the https URL of the Hands host.",
+            )
+            _check(
+                "dashboard.basic_auth on the public host",
+                not public_url or basic_ready,
+                "Set dashboard.basic_auth.username and password_hash. A redirect sign-in provider cannot "
+                "finish on the Hands host, which serves only the device routes.",
+            )
+            _check(
+                "Relay heartbeat row is visible after /local/state",
                 store.relay_alive(),
-                "Fix the relay check first." if relay_error else "Run the gateway and dashboard with the same HERMES_HOME.",
+                "Fix the relay check first."
+                if relay_error
+                else "The relay answered but wrote no heartbeat row in this HERMES_HOME, so the gateway "
+                "and the dashboard use different plugin data directories.",
             )
 
     def _check(label: str, passed: bool, fix: str) -> None:

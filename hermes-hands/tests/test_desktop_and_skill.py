@@ -153,6 +153,24 @@ def test_the_pane_reads_the_hands_command_output(hands_db, monkeypatch):
     assert command.startswith("hermes-hands pair ") and command.endswith(f"--name 'new pc' --code={code}")
 
 
+def test_the_pane_reads_a_status_line_that_carries_cause_lines(hands_db, monkeypatch):
+    """A relay-down status puts its cause on the next line; the pane must still find the target."""
+    ctx = CommandCtx()
+    commands.register_commands(ctx, has_seed=True)
+
+    def refuse():
+        raise commands.client.HandsError("hands: the relay is not reachable.")
+
+    monkeypatch.setattr(commands.client, "state", refuse)
+    monkeypatch.setattr(commands.store, "relay_alive", lambda: False)
+    store.set_session_target("k", "my laptop")
+    status = ctx.handler("status", session_key="k", platform="desktop", source=None)
+    first, cause = status.splitlines()[:2]
+    assert first.startswith("Hands: relay down; target my laptop; ")
+    assert cause.startswith("hands: the relay is not reachable")
+    assert _pane_pattern("STATUS_TARGET").search(status).group(1) == "my laptop"
+
+
 def test_the_relay_seed_setting_names_the_variable_the_plugin_reads(hands_db, monkeypatch):
     """The Plugins settings form shows the seed as set, and writes it where ``register()`` reads it."""
     pytest.importorskip("hermes_cli.plugins_settings")

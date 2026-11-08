@@ -9,7 +9,9 @@ Hermes Hands pairs a laptop with a one-time code. The device connects out over H
 ## Quick start
 
 1. On the gateway host (Linux, or Windows inside WSL), install the plugin with `hermes plugins install Ridwannurudeen/hermes-hands/hermes-hands --enable`, then run `hermes hands setup` and follow its prompts. Once Hermes Hands is in the plugin catalog, `hermes plugins install hermes-hands` installs the reviewed version instead.
-2. Run the two lines setup prints, `hermes config set terminal.backend hands` and `hermes config set bot_desktop.placement gateway`. Restart the gateway, and start the dashboard on loopback with `hermes dashboard --host 127.0.0.1 --port 9119 --no-open`. A device on another network also needs the public route in [Setup](#gateway).
+
+   Neither route works outside this project yet: the repository is private until the `v0.1.0` tag, and `hermes-hands` is not on PyPI. Until then a collaborator installs the device half from the tag, with the git URL in [Device](#device).
+2. Run the two lines setup prints, `hermes config set terminal.backend hands` and `hermes config set bot_desktop.placement gateway`. Restart the gateway, and start the dashboard on loopback with `hermes dashboard --host 127.0.0.1 --port 9119 --no-open`. Any device that is not the gateway host needs the public HTTPS route in [Setup](#gateway); a loopback URL cannot pair a laptop on another machine.
 3. Pair a named device with `/hands pair laptop` in a direct Telegram chat with the bot or `hermes hands pair laptop` on the gateway. On the device, run the printed `hermes-hands pair` command, then `hermes-hands serve`.
 4. In a direct chat with the bot, run `/hands use laptop`.
 
@@ -68,7 +70,7 @@ server {
 
 `client_max_body_size 4m;` lets a screenshot of up to 2 MiB through; without it nginx refuses any request body over 1 MiB. `server_name` must be the host of `dashboard.public_url`, because the dashboard refuses any other host name. Do not add the `return 404` location to a host that serves anything else. Keep the dashboard bound to loopback. Do not expose `/local/*` or `/ui/*` through the public route.
 
-Then run `hermes hands doctor`. It checks the backend, that the relay answers at `dashboard_url`, `dashboard.public_url`, interactive dashboard authentication, and that the gateway and the dashboard use the same `HERMES_HOME`.
+Then run `hermes hands doctor`. It fails unless `terminal.backend` is `hands`, `dashboard_url` is a loopback address, the relay answers there, `dashboard.public_url` is https or unset, and `dashboard.basic_auth` is configured whenever `public_url` is set. Its last line reports whether the relay's heartbeat row is visible after `/local/state`, which is what shows that the gateway and the dashboard share a plugin data directory; it does not compare the two paths.
 
 ### Device
 
@@ -94,6 +96,8 @@ On Windows, in PowerShell:
    pipx install hermes-hands==0.1.0
    ```
 
+   Before 0.1.0 is on PyPI, install it from the tag instead, which needs access to the repository: `pipx install "git+https://github.com/Ridwannurudeen/hermes-hands@v0.1.0#subdirectory=device"`.
+
    To keep the device's private key in the OS keyring instead of a file, install it with `pipx install "hermes-hands[keyring]==0.1.0"`.
 
 4. Make `python3` work inside Git Bash. In Git Bash, `python3 -c "import sys; print(sys.version)"` must print a Python version. The python.org build from step 1 has no `python3.exe`, so Git Bash finds the Microsoft Store alias instead, which only prints "Python was not found". Installing the Python Install Manager gives Git Bash a working `python3`; on the laptop used for the live checks it runs the Python 3.12 from step 1. `hermes-hands doctor` runs the same check in Git Bash and names the Store alias if that is what it finds.
@@ -107,13 +111,13 @@ hermes-hands pair https://hands.example.com --name laptop --code=ONE_TIME_CODE
 hermes-hands serve
 ```
 
-Run exactly one `hermes-hands serve` per device. Two agents for the same device fail every command. Screen capture is off by default; to opt in, run the agent as `hermes-hands serve --allow-screen`. To start the agent at logon instead, run `hermes-hands install-service`, which registers a Windows scheduled task that runs `hermes-hands serve`; add `--allow-screen` (`hermes-hands install-service --allow-screen`) to let that agent take screenshots. To change the flag later, remove the task with `hermes-hands install-service --remove` and install it again. Do not start a second `serve` next to the task to get screenshots. `hermes-hands install-service --dry-run` prints the planned action.
+Run exactly one `hermes-hands serve` per device. A second agent for the same device keeps working, and the relay hands the device's jobs to whichever agent polls first, so a command or a screenshot can run in the process that was not started with `--allow-screen`. Screen capture is off by default; to opt in, run the agent as `hermes-hands serve --allow-screen`. To start the agent at logon instead, run `hermes-hands install-service`, which registers a Windows scheduled task that runs `hermes-hands serve`; add `--allow-screen` (`hermes-hands install-service --allow-screen`) to let that agent take screenshots. To change the flag later, remove the task with `hermes-hands install-service --remove` and install it again. Do not start a second `serve` next to the task to get screenshots. `hermes-hands install-service --dry-run` prints the planned action.
 
-Linux devices need Python 3.11 or later, pipx, and a Bash environment. Install `hermes-hands==0.1.0` (or `"hermes-hands[keyring]==0.1.0"`), pair using the command printed by `/hands pair <name>`, then run `hermes-hands serve`. The service installer is implemented for Windows Task Scheduler.
+Linux devices need Python 3.11 or later, pipx, and a Bash environment. Install `hermes-hands==0.1.0` (or `"hermes-hands[keyring]==0.1.0"`, or from the git URL above before the release), pair using the command printed by `/hands pair <name>`, then run `hermes-hands serve`. The service installer is implemented for Windows Task Scheduler.
 
 Optional on Windows: `winget install BurntSushi.ripgrep.MSVC` enables ripgrep features in search. `hermes-hands doctor` reports whether Git Bash and Python are available inside it. The device needs Python on Git Bash's PATH for `execute_code` and some file operations.
 
-In Git Bash, native Windows commands that take `/switches` need the slash doubled, as in `cmd //c dir` or `tasklist //FO CSV`, because Git Bash turns `/c` into a path. The bundled `hands` skill tells the model this.
+In Git Bash, a native Windows program turns a `/switch` argument into a path, so `cmd /c ...` runs nothing and still exits 0. Run such a program with `MSYS_NO_PATHCONV=1` in front and its switches written normally, with one slash: `MSYS_NO_PATHCONV=1 cmd /c dir`, `MSYS_NO_PATHCONV=1 tasklist /FO CSV`. Never double the slash (`//c`, `//F`): that spelling hides the command from Hermes's approval check, which matches only the single slash form. Under `MSYS_NO_PATHCONV=1`, write that program's path arguments in Windows form. The bundled `hands` skill tells the model the same.
 
 ## What runs on the device
 
@@ -167,7 +171,9 @@ A skill can explain how to use a feature, but cannot register a terminal backend
 
 ## Tests and validation
 
-180 tests run against Hermes 0.23.0: 126 plugin tests, 6 of them end to end with the real device agent and the real relay in one process, and 54 device tests. On Windows 178 pass and 2 are skipped by design (one needs a Linux gateway, one is POSIX only). CI workflows for Ubuntu and Windows (plugin) and Ubuntu, Windows, and macOS (device) are in the repository but have not run yet, because the repository is not public yet.
+[COUNT_AT_PIN] tests run against Hermes 0.23.0: [COUNT_AT_PIN] plugin tests, [COUNT_AT_PIN] of them end to end with the real device agent and the real relay in one process, and [COUNT_AT_PIN] device tests. On Windows [COUNT_AT_PIN] pass and [COUNT_AT_PIN] are skipped by design (one needs a Linux gateway, one is POSIX only).
+
+The workflows in `.github/workflows/` cover the plugin on Ubuntu and Windows and the device on Ubuntu, Windows and macOS. No run has reached its first step yet: GitHub stops every job with a billing message for the repository owner's account, so the numbers above were produced by a local run against Hermes 0.23.0 on Linux and have not been reproduced on Windows.
 
 The device CI tests on Python 3.11 and 3.12. Plugin CI validates the plugin and doctor, runs the plugin suite against Hermes 0.23.0, validates catalog shape, scans plugin payloads, and checks Python changes for Windows footguns.
 

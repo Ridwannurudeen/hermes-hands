@@ -93,37 +93,51 @@ def install_doctor_modules(monkeypatch, config):
     hermes_cli.__path__ = []
     config_module = types.ModuleType("hermes_cli.config")
     config_module.load_config_readonly = lambda: config
-    auth = types.ModuleType("hermes_cli.dashboard_auth")
-    auth.list_interactive_providers = lambda: [object()]
     monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
     monkeypatch.setitem(sys.modules, "hermes_cli.config", config_module)
-    monkeypatch.setitem(sys.modules, "hermes_cli.dashboard_auth", auth)
     backend = (config.get("terminal") or {}).get("backend") or ""
     monkeypatch.setattr(cli.commands, "terminal_backend", lambda: backend)
 
 
-def run_doctor(capsys):
+def run_doctor(capsys, dashboard_url="http://127.0.0.1:9119"):
     ctx = Context()
+    ctx.config["dashboard_url"] = dashboard_url
     cli.register_cli(ctx, has_seed=True)
     ctx.handler(types.SimpleNamespace(hands_action="doctor"))
     return capsys.readouterr().out.splitlines()
 
 
+def healthy_config():
+    return {
+        "terminal": {"backend": "hands"},
+        "dashboard": {
+            "public_url": "https://hands.example",
+            "basic_auth": {"username": "owner", "password_hash": "scrypt$n=1,r=1,p=1$c2FsdA$aGFzaA"},
+        },
+    }
+
+
 def test_doctor_reports_each_deployment_check(monkeypatch, capsys):
-    install_doctor_modules(
-        monkeypatch, {"terminal": {"backend": "hands"}, "dashboard": {"public_url": "https://hands.example"}}
-    )
+    install_doctor_modules(monkeypatch, healthy_config())
     monkeypatch.setattr(cli.client, "state", lambda: {"relay": True, "devices": [], "alerts": []})
     monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
     lines = run_doctor(capsys)
-    assert len(lines) == 5
+    assert len(lines) == 6
     assert all(line.startswith("PASS ") for line in lines)
+    assert [line.split(":")[0] for line in lines] == [
+        "PASS terminal.backend is hands",
+        "PASS dashboard_url is loopback",
+        "PASS Relay answers at dashboard_url",
+        "PASS dashboard.public_url is https or unset",
+        "PASS dashboard.basic_auth on the public host",
+        "PASS Relay heartbeat row is visible after /local/state",
+    ]
 
 
 def test_doctor_names_the_backend_and_the_relay_refusal(monkeypatch, capsys):
-    install_doctor_modules(
-        monkeypatch, {"terminal": {"backend": "local"}, "dashboard": {"public_url": "https://hands.example"}}
-    )
+    config = healthy_config()
+    config["terminal"]["backend"] = "local"
+    install_doctor_modules(monkeypatch, config)
 
     def refuse():
         raise cli.client.HandsError("hands: the relay is not reachable.")
@@ -135,31 +149,81 @@ def test_doctor_names_the_backend_and_the_relay_refusal(monkeypatch, capsys):
         "FAIL terminal.backend is hands: It is local. Run hermes config set terminal.backend hands, "
         "then restart the gateway."
     )
-    assert lines[1] == "FAIL Relay answers at dashboard_url: hands: the relay is not reachable."
-    assert lines[4] == "FAIL Shared plugin_data_dir: Fix the relay check first."
+    assert lines[2] == "FAIL Relay answers at dashboard_url: hands: the relay is not reachable."
+    assert lines[5] == "FAIL Relay heartbeat row is visible after /local/state: Fix the relay check first."
 
 
 def test_doctor_reads_the_heartbeat_only_after_the_relay_answered(monkeypatch, capsys):
     """/local/state starts the relay, which writes its first heartbeat row before replying."""
-    install_doctor_modules(
-        monkeypatch, {"terminal": {"backend": "hands"}, "dashboard": {"public_url": "https://hands.example"}}
-    )
+    install_doctor_modules(monkeypatch, healthy_config())
     calls = []
     monkeypatch.setattr(cli.client, "state", lambda: calls.append("state") or {"relay": True})
     monkeypatch.setattr(cli.store, "relay_alive", lambda: calls.append("heartbeat") or "state" in calls)
-    assert run_doctor(capsys)[4] == "PASS Shared plugin_data_dir"
+    assert run_doctor(capsys)[5] == "PASS Relay heartbeat row is visible after /local/state"
     assert calls == ["state", "heartbeat"]
 
 
-def test_doctor_blames_hermes_home_only_when_the_relay_answers(monkeypatch, capsys):
-    install_doctor_modules(
-        monkeypatch, {"terminal": {"backend": "hands"}, "dashboard": {"public_url": "https://hands.example"}}
-    )
+def test_doctor_blames_the_plugin_data_dir_only_when_the_relay_answers(monkeypatch, capsys):
+    install_doctor_modules(monkeypatch, healthy_config())
     monkeypatch.setattr(cli.client, "state", lambda: {"relay": True, "devices": [], "alerts": []})
     monkeypatch.setattr(cli.store, "relay_alive", lambda: False)
-    assert run_doctor(capsys)[4] == (
-        "FAIL Shared plugin_data_dir: Run the gateway and dashboard with the same HERMES_HOME."
+    assert run_doctor(capsys)[5] == (
+        "FAIL Relay heartbeat row is visible after /local/state: The relay answered but wrote no "
+        "heartbeat row in this HERMES_HOME, so the gateway and the dashboard use different plugin "
+        "data directories."
     )
+
+
+def test_doctor_fails_an_http_public_url(monkeypatch, capsys):
+    """The device refuses a non-loopback http pairing URL, so doctor must not pass one."""
+    config = healthy_config()
+    config["dashboard"]["public_url"] = "http://hands.example"
+    install_doctor_modules(monkeypatch, config)
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True})
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
+    lines = run_doctor(capsys)
+    assert lines[3] == (
+        "FAIL dashboard.public_url is https or unset: It is http://hands.example. The device refuses a "
+        "non-loopback http pairing URL, so set dashboard.public_url to the https URL of the Hands host."
+    )
+
+
+def test_doctor_fails_a_non_loopback_dashboard_url(monkeypatch, capsys):
+    """The local bearer and the job scripts travel to dashboard_url, so it must stay on loopback."""
+    install_doctor_modules(monkeypatch, healthy_config())
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True})
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
+    lines = run_doctor(capsys, dashboard_url="http://192.168.1.20:9119")
+    assert lines[1] == (
+        "FAIL dashboard_url is loopback: It is http://192.168.1.20:9119. The gateway sends its local "
+        "bearer and every job script there, so it must be a loopback address such as "
+        "http://127.0.0.1:9119."
+    )
+
+
+def test_doctor_fails_a_public_host_without_basic_auth(monkeypatch, capsys):
+    """A redirect sign-in provider cannot finish on the Hands host, which serves only device routes."""
+    config = healthy_config()
+    config["dashboard"].pop("basic_auth")
+    install_doctor_modules(monkeypatch, config)
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True})
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
+    assert run_doctor(capsys)[4] == (
+        "FAIL dashboard.basic_auth on the public host: Set dashboard.basic_auth.username and "
+        "password_hash. A redirect sign-in provider cannot finish on the Hands host, which serves "
+        "only the device routes."
+    )
+
+
+def test_doctor_passes_a_loopback_deployment_without_basic_auth(monkeypatch, capsys):
+    config = healthy_config()
+    config["dashboard"] = {}
+    install_doctor_modules(monkeypatch, config)
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True})
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: True)
+    lines = run_doctor(capsys)
+    assert lines[3].startswith("PASS dashboard.public_url")
+    assert lines[4].startswith("PASS dashboard.basic_auth")
 
 
 def test_status_asks_a_relay_that_has_no_fresh_heartbeat(monkeypatch, capsys):
@@ -238,4 +302,54 @@ def test_pair_cli_falls_back_to_dashboard_url(monkeypatch, capsys):
 
     ctx.handler(parser.parse_args(["pair", "laptop"]))
 
-    assert "hermes-hands pair http://127.0.0.1:9119 --name laptop --code=pair-code" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "hermes-hands pair http://127.0.0.1:9119 --name laptop --code=pair-code" in out
+    assert "a loopback URL pairs only a device on the gateway host itself" in out
+
+
+def test_pair_cli_refuses_an_http_public_url(monkeypatch, capsys):
+    """The device refuses a non-loopback http pairing URL, so this printer must not mint one."""
+    hermes_cli = types.ModuleType("hermes_cli")
+    hermes_cli.__path__ = []
+    config = types.ModuleType("hermes_cli.config")
+    config.load_config_readonly = lambda: {"dashboard": {"public_url": "http://hands.example.com"}}
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    minted = []
+    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name: minted.append(name) or "pair-code")
+    ctx = Context()
+    cli.register_cli(ctx, has_seed=True)
+    parser = argparse.ArgumentParser()
+    ctx.setup_fn(parser)
+
+    ctx.handler(parser.parse_args(["pair", "laptop"]))
+
+    out = capsys.readouterr().out
+    assert out.startswith(
+        "dashboard.public_url is http://hands.example.com, and the device refuses a non-loopback http "
+        "pairing URL."
+    )
+    assert minted == []
+
+
+def test_pair_cli_ignores_an_undeclared_public_url_setting(monkeypatch, capsys):
+    """plugin.yaml declares no public_url, so only dashboard.public_url and dashboard_url count here."""
+    hermes_cli = types.ModuleType("hermes_cli")
+    hermes_cli.__path__ = []
+    config = types.ModuleType("hermes_cli.config")
+    config.load_config_readonly = lambda: {"dashboard": {"public_url": "https://hands.example.com"}}
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name: "pair-code")
+    ctx = Context()
+    ctx.config["public_url"] = "http://10.0.0.5:1234"
+    cli.register_cli(ctx, has_seed=True)
+    parser = argparse.ArgumentParser()
+    ctx.setup_fn(parser)
+
+    ctx.handler(parser.parse_args(["pair", "laptop"]))
+
+    assert (
+        "hermes-hands pair https://hands.example.com --name laptop --code=pair-code"
+        in capsys.readouterr().out
+    )
