@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import os
 import platform
 import re
 import shutil
@@ -23,6 +24,9 @@ API = "/api/plugins/hermes-hands"
 
 
 def _pair(url: str, name: str, code: str, *, force: bool = False) -> int:
+    if "HERMES_HANDS_JOB" in os.environ:
+        print("pair is unavailable from a Hermes Hands device job", file=sys.stderr)
+        return 1
     base_url = url.rstrip("/")
     if base_url.endswith(API):
         base_url = base_url[: -len(API)].rstrip("/")
@@ -169,9 +173,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "show":
             policy.show()
         else:
+            if "HERMES_HANDS_JOB" in os.environ:
+                print("policy reset is unavailable from a Hermes Hands device job", file=sys.stderr)
+                return 1
             print(policy.reset())
         return 0
     if args.command == "unpair":
+        if "HERMES_HANDS_JOB" in os.environ:
+            print("unpair is unavailable from a Hermes Hands device job", file=sys.stderr)
+            return 1
         config.save({})
         remove_key()
         print("Device unpaired")

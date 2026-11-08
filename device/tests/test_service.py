@@ -130,3 +130,13 @@ def test_install_service_refuses_non_windows(monkeypatch, capsys):
     monkeypatch.setattr(service.sys, "platform", "linux")
     assert service.install() == 1
     assert "not supported in v0.1" in capsys.readouterr().err
+
+
+def test_install_service_refuses_from_device_job(monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HANDS_JOB", "1")
+    monkeypatch.setattr(service.sys, "platform", "win32")
+    monkeypatch.setattr(service.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("scheduler must not run")))
+
+    assert service.install() == 1
+
+    assert "device job" in capsys.readouterr().err

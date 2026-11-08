@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -14,6 +15,17 @@ from .protocol import b64u, generate_keypair, unb64u
 
 SERVICE = "hermes-hands"
 logger = logging.getLogger(__name__)
+
+
+def _log_key_load_failure(error: Exception) -> None:
+    if sys.stderr is not None:
+        return
+    path = config.ROOT / "out" / "device.log"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as log:
+        log.write(f"Device key loading failed: {type(error).__name__}: {error}\n")
+    if os.name != "nt":
+        path.chmod(0o600)
 
 
 def _keyring():
@@ -27,21 +39,31 @@ def _keyring():
 
 def get_or_create() -> tuple[bytes, bytes]:
     if config.KEY_PATH.exists():
-        value = json.loads(config.KEY_PATH.read_text(encoding="utf-8-sig"))
-        return unb64u(value["private_key"]), unb64u(value["public_key"])
+        try:
+            value = json.loads(config.KEY_PATH.read_text(encoding="utf-8-sig"))
+            return unb64u(value["private_key"]), unb64u(value["public_key"])
+        except Exception as exc:
+            _log_key_load_failure(exc)
+            raise
     keyring = _keyring()
     if keyring:
         try:
             value = keyring.get_password(SERVICE, "device-private")
         except Exception as exc:
-            raise RuntimeError("Could not read the device key from the keyring; refusing to create a new device identity") from exc
+            error = RuntimeError("Could not read the device key from the keyring; refusing to create a new device identity")
+            _log_key_load_failure(error)
+            raise error from exc
         if value:
-            private = unb64u(value)
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-            from cryptography.hazmat.primitives import serialization
+            try:
+                private = unb64u(value)
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+                from cryptography.hazmat.primitives import serialization
 
-            public = Ed25519PrivateKey.from_private_bytes(private).public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-            return private, public
+                public = Ed25519PrivateKey.from_private_bytes(private).public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+                return private, public
+            except Exception as exc:
+                _log_key_load_failure(exc)
+                raise
     private, public = generate_keypair()
     if keyring:
         try:

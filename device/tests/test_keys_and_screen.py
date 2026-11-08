@@ -1,4 +1,5 @@
 import os
+import sys
 import types
 from pathlib import Path
 
@@ -21,6 +22,7 @@ def test_file_key_fallback_is_private_on_posix(monkeypatch, tmp_path):
 def test_keyring_backend_error_refuses_to_mint_a_new_key(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ROOT", tmp_path)
     monkeypatch.setattr(config, "KEY_PATH", tmp_path / "device.json")
+    monkeypatch.setattr(sys, "stderr", None)
 
     class KeyringError(Exception):
         pass
@@ -40,6 +42,10 @@ def test_keyring_backend_error_refuses_to_mint_a_new_key(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="refusing to create a new device identity"):
         keys.get_or_create()
     assert not config.KEY_PATH.exists()
+    log = tmp_path / "out" / "device.log"
+    contents = log.read_text(encoding="utf-8-sig")
+    assert "device key" in contents
+    assert "RuntimeError" in contents
 
 
 def test_non_keyring_error_while_loading_key_refuses_to_mint_a_new_key(monkeypatch, tmp_path):

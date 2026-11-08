@@ -104,6 +104,18 @@ def test_real_bash_execution(monkeypatch, tmp_path):
     assert chunks.strip() == b"hi"
 
 
+def test_executor_marks_job_environment(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    output = b"".join(executor.run('printf "%s" "$HERMES_HANDS_JOB"', timeout=5))
+
+    assert output == b"1"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="MSYS switch conversion is Windows-only")
 def test_cmd_slash_switch_can_be_passed_without_msys_path_conversion(monkeypatch, tmp_path):
     bash = executor.resolve_bash()

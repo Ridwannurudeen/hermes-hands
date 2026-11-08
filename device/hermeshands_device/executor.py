@@ -428,9 +428,9 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
             script_path = Path(script_file.name)
         args = [bash, *(["-l"] if login else []), str(script_path)]
         kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0) | _CREATE_SUSPENDED} if os.name == "nt" else {"start_new_session": True}
-        env = None
+        env = os.environ.copy()
+        env["HERMES_HANDS_JOB"] = "1"
         if os.name == "nt":
-            env = dict(os.environ)
             env.setdefault("PYTHONUTF8", "1")
             env.setdefault("PYTHONIOENCODING", "utf-8")
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=stdin_handle, env=env, **kwargs)

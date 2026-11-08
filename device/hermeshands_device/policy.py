@@ -9,7 +9,9 @@ from . import config
 from .protocol import canonical_json, policy_hash
 
 DEFAULTS = [
-    r"(?:^|[\s;&|(`'\"])(?:(?:\"[^\"]*[\\/]|'[^']*[\\/]|[^\s;&|()'\"`]+[\\/])*)hermes-?hands(?:\.exe)?[\"']?\s+(?:pair|unpair|serve|install-service|policy)\b|\b(?:pipx|pip|runpip|uv\s+(?:tool|pip))\s+uninstall\s+hermes-?hands\b|\bpython\s+-m\s+pip\s+uninstall\s+hermes-?hands\b|\bpython(?:w|[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?\s+-m\s+hermeshands_device(?:\.cli)?\s+(?:pair|unpair|serve|install-service|policy)\b|^\s*hermeshands\s*$",
+    r"(?:^|[\s;&|(`'\"])(?:(?:\"[^\"]*[\\/]|'[^']*[\\/]|[^\s;&|()'\"`]+[\\/])*)hermes-?hands(?:\.exe)?[\"']?\s+(?:pair|unpair|serve|install-service|policy)\b|"
+    r"(?:^|[\s;&|(`'\"])(?:(?:\"[^\"]*[\\/]|'[^']*[\\/]|[^\s;&|()'\"`]+[\\/])*)(?:python(?:w|[0-9]+(?:\.[0-9]+)*)?|py)(?:\.exe)?[\"']?(?:\s+-(?!m(?:\s|hermeshands_device))[^\s]+(?:\s+(?!-)[^\s]+)?)*\s+-m\s*hermeshands_device(?:\.cli)?\s+(?:pair|unpair|serve|install-service|policy)\b|"
+    r"\b(?:pipx|pip|runpip|uv\s+(?:tool|pip))\s+uninstall\s+hermes-?hands\b|\bpython\s+-m\s+pip\s+uninstall\s+hermes-?hands\b|^\s*hermeshands\s*$",
     r"\.hermes-hands(?:[/\\]|\b)",
     r"\b(?:taskkill|Stop-Process|kill)\b.*(?:\$PPID|<agent-pid>)",
     r"\b(?:schtasks\s+/{1,2}(?:End|Delete)|Stop-ScheduledTask|Unregister-ScheduledTask)\b.*HermesHands|\btaskkill\b.*(?:/|//|-)(?:F|IM)\b.*hermes-?hands(?:\.exe)?\b|\bkillall\s+hermes-?hands(?:\.exe)?\b",
@@ -28,6 +30,8 @@ def patterns() -> list[str]:
 
 
 def reset() -> str:
+    if "HERMES_HANDS_JOB" in os.environ:
+        raise PermissionError("policy reset is unavailable from a Hermes Hands device job")
     config.ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     raw = canonical_json({"deny": DEFAULTS})
     config.POLICY_PATH.write_bytes(raw)

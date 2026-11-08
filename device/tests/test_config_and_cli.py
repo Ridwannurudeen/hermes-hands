@@ -111,6 +111,40 @@ def test_pair_force_flag_is_parsed_and_forwarded(monkeypatch):
     assert calls == [("https://hands.example.com", "laptop", "code", True)]
 
 
+def test_pair_refuses_from_device_job(monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HANDS_JOB", "1")
+    monkeypatch.setattr(cli.config, "load", lambda: (_ for _ in ()).throw(AssertionError("pairing must not be read")))
+
+    assert cli.main(["pair", "https://hands.example.com", "--name", "laptop", "--code", "code", "--force"]) == 1
+
+    assert "device job" in capsys.readouterr().err
+
+
+def test_unpair_refuses_from_device_job(monkeypatch, capsys):
+    saved = []
+    removed = []
+    monkeypatch.setenv("HERMES_HANDS_JOB", "1")
+    monkeypatch.setattr(cli.config, "save", lambda data: saved.append(data))
+    monkeypatch.setattr(cli, "remove_key", lambda: removed.append(True))
+
+    assert cli.main(["unpair"]) == 1
+
+    assert saved == []
+    assert removed == []
+    assert "device job" in capsys.readouterr().err
+
+
+def test_policy_reset_cli_refuses_from_device_job(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("HERMES_HANDS_JOB", "1")
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "POLICY_PATH", tmp_path / "policy.json")
+
+    assert cli.main(["policy", "reset"]) == 1
+
+    assert not (tmp_path / "policy.json").exists()
+    assert "device job" in capsys.readouterr().err
+
+
 def test_doctor_executes_python_probe_and_names_windowsapps(monkeypatch, capsys):
     monkeypatch.setattr(cli.executor, "resolve_bash", lambda: "bash.exe")
     monkeypatch.setattr(cli.shutil, "which", lambda name: "git.exe")

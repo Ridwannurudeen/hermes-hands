@@ -52,6 +52,9 @@ def task_xml(*, executable: str, username: str, allow_screen: bool = False) -> b
 
 
 def install(*, dry_run: bool = False, remove: bool = False, allow_screen: bool = False) -> int:
+    if "HERMES_HANDS_JOB" in os.environ:
+        print("install-service is unavailable from a Hermes Hands device job", file=sys.stderr)
+        return 1
     if sys.platform != "win32":
         print("install-service is not supported in v0.1 on this platform", file=sys.stderr)
         return 1
