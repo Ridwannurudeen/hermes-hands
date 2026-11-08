@@ -1959,13 +1959,147 @@ def test_stopping_result_request_timeout_uses_remaining_global_budget(monkeypatc
         agent._post("/device/result", {})
         agent.stop_flush_deadline = 12.5
         agent._post("/device/result", {})
+        agent.stop_flush_deadline = 11.25
+        agent._post("/device/heartbeat", {})
         agent.stop_flush_deadline = 9.0
         with pytest.raises(InterruptedError, match="flush"):
             agent._post("/device/result", {})
     finally:
         agent.client.close()
 
-    assert [max(timeout.values()) for timeout in timeouts] == [1.25, 2.0]
+    assert [max(timeout.values()) for timeout in timeouts] == [1.25, 2.0, 1.25]
+
+
+def test_final_heartbeat_follows_an_in_flight_active_heartbeat():
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent._stop_lock = threading.Lock()
+    agent.heartbeat_lock = threading.Lock()
+    agent.session_state = "active"
+    agent.witness = True
+    agent.capabilities = ["witness-v1", "checkup-v1", "help-v1", "receipt-v1"]
+    agent.instance = "witness-instance"
+    entered, release = threading.Event(), threading.Event()
+    posted = []
+
+    def post(endpoint, body):
+        posted.append(body)
+        if body["session_state"] == "active":
+            entered.set()
+            assert release.wait(1)
+        return httpx.Response(204)
+
+    agent._post = post
+    agent._verify_response = lambda *args: {}
+    heartbeat = threading.Thread(target=agent._heartbeat_loop)
+    heartbeat.start()
+
+    assert entered.wait(1)
+    agent._begin_stopping()
+    final = threading.Thread(target=agent._send_final_heartbeat)
+    final.start()
+    time.sleep(0.02)
+    assert len(posted) == 1
+
+    release.set()
+    final.join(1)
+    heartbeat.join(1)
+
+    assert not final.is_alive()
+    assert not heartbeat.is_alive()
+    assert [body["session_state"] for body in posted] == ["active", "stopped"]
+    assert posted[-1]["witness"] is False
+
+
+@pytest.mark.parametrize(("relay_available", "expected_delivery"), [(True, "confirmed"), (False, "unconfirmed")])
+@pytest.mark.parametrize("stop_reason", ["stopped_by_person", "session_timeout"])
+def test_stop_flush_writes_local_receipt_and_sends_stopped_heartbeat(
+    monkeypatch, tmp_path, relay_available, expected_delivery, stop_reason
+):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop.config, "ROOT", tmp_path / ".hermes-hands")
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+
+    class Console:
+        def __init__(self):
+            self.outputs = []
+
+        def write(self, text):
+            self.outputs.append(text)
+
+    agent = object.__new__(loop.DeviceLoop)
+    agent.private = private
+    agent.public = public
+    agent.device_id = "device-1"
+    agent.instance = "0123456789abcdef"
+    agent.capabilities = ["witness-v1", "checkup-v1", "help-v1", "receipt-v1"]
+    agent.witness = True
+    agent.session_state = "active"
+    agent.session_started_at = "2026-11-08T10:00:00Z"
+    agent.session_deadline = None
+    agent.stop_reason = None
+    agent.stop_flush_deadline = None
+    agent.stop_event = threading.Event()
+    agent._stop_lock = threading.Lock()
+    agent.heartbeat_lock = threading.Lock()
+    agent.process_lock = threading.Lock()
+    agent.processes = {}
+    agent.running = {}
+    agent.job_start_events = {}
+    agent.receipt_events = [
+        {
+            "timestamp": "2026-11-08T10:01:00Z",
+            "label": "Running a command",
+            "outcome": "Completed with exit code 0",
+            "script": "echo private-command",
+            "output": "private-output",
+        },
+        {
+            "timestamp": "2026-11-08T10:02:00Z",
+            "label": "Help request",
+            "outcome": "Accepted by relay",
+            "delivery_status": "pending",
+            "request_id": "a" * 32,
+        },
+    ]
+    agent.console = Console()
+    monkeypatch.setattr(agent, "_cancel_running_jobs", lambda: None)
+    posted = []
+
+    def post(endpoint, body):
+        posted.append((endpoint, body))
+        receipt_file = next((tmp_path / ".hermes-hands" / "receipts").glob("*.json"))
+        saved = json.loads(receipt_file.read_text(encoding="utf-8"))["payload"]
+        assert saved["shutdown_delivery"] == "pending"
+        if not relay_available:
+            raise httpx.ConnectError("offline")
+        return httpx.Response(204)
+
+    monkeypatch.setattr(agent, "_post", post)
+    monkeypatch.setattr(agent, "_verify_response", lambda *args: {})
+
+    agent._begin_stopping(reason=stop_reason)
+    agent._stop_and_flush()
+
+    assert len(posted) == 1
+    endpoint, body = posted[0]
+    assert endpoint == "/device/heartbeat"
+    assert body["witness"] is False
+    assert body["session_state"] == "stopped"
+    assert agent.session_state == "stopped"
+    receipt_file = next((tmp_path / ".hermes-hands" / "receipts").glob("*.json"))
+    text_file = receipt_file.with_suffix(".txt")
+    saved = json.loads(receipt_file.read_text(encoding="utf-8"))["payload"]
+    assert saved["end_reason"] == stop_reason
+    assert saved["shutdown_delivery"] == expected_delivery
+    assert saved["events"][-1]["label"] == "Session stopped"
+    assert saved["events"][-1]["delivery_status"] == expected_delivery
+    assert saved["events"][1]["delivery_status"] == "pending"
+    assert "Running a command: Completed with exit code 0" in text_file.read_text(encoding="utf-8")
+    assert "Help request: Accepted by relay (delivery: pending)" in text_file.read_text(encoding="utf-8")
+    assert "private-command" not in receipt_file.read_text(encoding="utf-8")
+    assert "private-output" not in receipt_file.read_text(encoding="utf-8")
+    assert any(str(text_file) in output for output in agent.console.outputs)
 
 
 def test_stopping_job_reports_observed_output_and_stopped_result(monkeypatch):
@@ -2095,6 +2229,7 @@ def test_second_serve_refuses_before_reaping_live_jobs(monkeypatch, tmp_path):
         agent.poll_retry_delay = 1
         agent._poll_body = lambda: {}
         agent._heartbeat_loop = lambda: None
+        agent._send_final_heartbeat = lambda: False
 
         def wait_for_release(*args):
             entered.set()
@@ -2137,6 +2272,7 @@ def test_checkup_job_returns_only_the_compiled_checkup(monkeypatch):
     agent.cancelled_jobs = set()
     agent.job_deadlines = {}
     agent.receipt_events = []
+    agent.witness = True
     result = {"schema_version": 1, "observed_at": "2026-11-08T00:00:00Z", "platform": "test", "facts": [], "inferences": []}
     posted = []
     monkeypatch.setattr(loop.checkup, "collect", lambda: result)
@@ -2172,6 +2308,7 @@ def test_unknown_or_malformed_jobs_are_refused_and_recorded(monkeypatch, job):
     agent.cancelled_jobs = set()
     agent.job_deadlines = {}
     agent.receipt_events = []
+    agent.witness = True
     posted = []
     monkeypatch.setattr(loop.checkup, "collect", lambda: pytest.fail("malformed checkup ran"))
     monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: pytest.fail("unknown job ran"))

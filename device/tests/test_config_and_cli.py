@@ -4,8 +4,8 @@ import types
 
 import pytest
 
-from hermeshands_device import cli, config
-from hermeshands_device.protocol import b64u
+from hermeshands_device import cli, config, receipt
+from hermeshands_device.protocol import b64u, generate_keypair
 
 
 def test_config_round_trip_and_paths(tmp_path, monkeypatch):
@@ -360,3 +360,83 @@ def test_witness_stop_at_startup_consent_does_not_start_agent(monkeypatch, stop_
 
     assert FakeDeviceLoop.last.run is False
     assert FakeDeviceLoop.last.witness is False
+
+
+def test_receipt_files_are_signed_redacted_and_verifiable_from_cli(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    private, public = generate_keypair()
+    payload = {
+        "schema_version": 1,
+        "device_id": "device-1",
+        "instance": "0123456789abcdef",
+        "started_at": "2026-11-08T10:00:00Z",
+        "ended_at": "2026-11-08T10:05:00Z",
+        "end_reason": "stopped_by_person",
+        "shutdown_delivery": "pending",
+        "events": [
+            {
+                "timestamp": "2026-11-08T10:01:00Z",
+                "label": "Running a command",
+                "outcome": "Completed with exit code 0",
+                "script": "echo private-command",
+                "output": "private-output",
+            },
+            {
+                "timestamp": "2026-11-08T10:02:00Z",
+                "label": "Help request",
+                "outcome": "Accepted by relay",
+                "delivery_status": "pending",
+                "request_id": "a" * 32,
+            },
+            {
+                "timestamp": "2026-11-08T10:03:00Z",
+                "label": "System checkup",
+                "outcome": "Completed",
+                "checkup": {
+                    "facts": [
+                        {
+                            "id": "memory.available",
+                            "label": "Available memory",
+                            "value": 4096,
+                            "unit": "MiB",
+                            "status": "ok",
+                            "availability": "observed",
+                            "source": "psutil.virtual_memory",
+                        }
+                    ]
+                },
+            },
+        ],
+    }
+
+    json_path, text_path = receipt.write_receipt(payload, private, public)
+
+    assert json_path.suffix == ".json"
+    assert text_path.suffix == ".txt"
+    assert json_path.stem == text_path.stem
+    envelope = json.loads(json_path.read_text(encoding="utf-8"))
+    assert set(envelope) == {"payload", "signature"}
+    assert "signature" not in envelope["payload"]
+    assert receipt.verify_receipt(json_path) == envelope["payload"]
+    assert envelope["payload"]["events"][0] == {
+        "timestamp": "2026-11-08T10:01:00Z",
+        "label": "Running a command",
+        "outcome": "Completed with exit code 0",
+    }
+    text_receipt = text_path.read_text(encoding="utf-8")
+    assert "stopped_by_person" in text_receipt
+    assert "Running a command: Completed with exit code 0" in text_receipt
+    assert "Help request: Accepted by relay (delivery: pending)" in text_receipt
+    assert "Available memory" in text_receipt
+    assert "private-command" not in text_receipt
+    assert "private-output" not in text_receipt
+    assert "private-command" not in json_path.read_text(encoding="utf-8")
+    assert "private-output" not in json_path.read_text(encoding="utf-8")
+
+    assert cli.main(["receipt", "verify", str(json_path)]) == 0
+    assert "signature verified" in capsys.readouterr().out.lower()
+
+    envelope["payload"]["end_reason"] = "fabricated"
+    json_path.write_text(json.dumps(envelope), encoding="utf-8")
+    assert cli.main(["receipt", "verify", str(json_path)]) == 1
+    assert "verification failed" in capsys.readouterr().err.lower()

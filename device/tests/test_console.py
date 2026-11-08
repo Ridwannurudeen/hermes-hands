@@ -79,6 +79,18 @@ def test_console_owner_timestamps_interactive_prompts():
     assert re.match(r"^\[\d{4}-\d{2}-\d{2}T[^\]]+Z\] Press S to stop or H to ask for help: $", console.prompts[0])
 
 
+def test_console_eof_uses_the_stop_callback():
+    console = FakeConsole(None)
+    stopped = threading.Event()
+    owner = ConsoleOwner(console, on_stop=stopped.set, on_help=lambda text: None)
+
+    owner.start()
+
+    assert stopped.wait(1)
+    owner.join(1)
+    assert owner._closed is True
+
+
 def test_startup_questions_and_interactive_input_have_one_owner_thread():
     console = FakeConsole("Y", "Y", "S")
     stopped = threading.Event()

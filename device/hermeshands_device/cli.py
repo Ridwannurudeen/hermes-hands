@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import config, executor, policy
+from . import config, executor, policy, receipt
 from .console import (
     TerminalConsole,
     WITNESS_CAPABILITIES,
@@ -161,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
     pol = subs.add_parser("policy")
     pol.add_argument("action", choices=("show", "reset"))
     subs.add_parser("unpair")
+    receipt_command = subs.add_parser("receipt")
+    receipt_subs = receipt_command.add_subparsers(dest="receipt_action", required=True)
+    verify_receipt = receipt_subs.add_parser("verify")
+    verify_receipt.add_argument("file", type=Path)
     args = parser.parse_args(argv)
     if args.command == "pair":
         return _pair(args.gateway_url, args.name, args.code, force=args.force)
@@ -215,6 +219,14 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("pair this device first")
         start_janitor()
         DeviceLoop(allow_screen=args.allow_screen).run_forever()
+        return 0
+    if args.command == "receipt":
+        try:
+            receipt.verify_receipt(args.file)
+        except receipt.ReceiptError as exc:
+            print(f"Receipt verification failed: {exc}", file=sys.stderr)
+            return 1
+        print("Receipt signature verified")
         return 0
     if args.command == "status":
         print(json.dumps({"paired": bool(config.device_id()), "device_id": config.device_id(), "gateway_url": config.gateway_url()}, indent=2))

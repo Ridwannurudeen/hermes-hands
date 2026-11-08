@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from hermeshands_device import config, keys, screen
+from hermeshands_device import config, keys, receipt, screen
+from hermeshands_device.protocol import generate_keypair
 
 
 def test_file_key_fallback_is_private_on_posix(monkeypatch, tmp_path):
@@ -181,6 +182,31 @@ def test_screen_capture_uses_pillow_png_methods(monkeypatch):
     monkeypatch.setattr(screen.mss, "mss", Capture)
     result = screen.capture(allow_screen=True)
     assert result.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_receipt_files_are_private_under_the_device_home(monkeypatch, tmp_path):
+    device_home = tmp_path / ".hermes-hands"
+    monkeypatch.setattr(config, "ROOT", device_home)
+    private, public = generate_keypair()
+    payload = {
+        "schema_version": 1,
+        "device_id": "device-1",
+        "instance": "0123456789abcdef",
+        "started_at": "2026-11-08T10:00:00Z",
+        "ended_at": "2026-11-08T10:05:00Z",
+        "end_reason": "stopped_by_person",
+        "shutdown_delivery": "pending",
+        "events": [],
+    }
+
+    json_path, text_path = receipt.write_receipt(payload, private, public)
+
+    assert json_path.parent == text_path.parent == device_home / "receipts"
+    if os.name != "nt":
+        assert device_home.stat().st_mode & 0o777 == 0o700
+        assert json_path.parent.stat().st_mode & 0o777 == 0o700
+        assert json_path.stat().st_mode & 0o777 == 0o600
+        assert text_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_windows_keyfile_uses_sid_acl_and_atomic_replace(monkeypatch, tmp_path):

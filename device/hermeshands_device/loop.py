@@ -17,8 +17,9 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import __version__, checkup, config, executor, policy, screen
+from . import __version__, checkup, config, executor, policy, receipt, screen
 from .console import (
+    RECEIPT_SAVED,
     SCREENSHOT_REQUEST_PROMPT,
     SCREENSHOT_SESSION_PROMPT,
     SCREENSHOTS_DISABLED,
@@ -54,6 +55,10 @@ def _sanitize_help_text(text: str) -> str:
     return "".join(character for character in text.strip() if character.isprintable()).strip()[:200]
 
 
+def _utc_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 class DeviceLoop:
     def __init__(self, *, allow_screen: bool = False, transport: httpx.BaseTransport | None = None, console: ConsoleInput | None = None):
         self.allow_screen = allow_screen
@@ -73,10 +78,13 @@ class DeviceLoop:
         self.session_state = "normal"
         self.witness = False
         self.capabilities: list[str] = ["checkup-v1"]
+        self.session_started_at: str | None = None
         self.session_deadline: float | None = None
         self.stop_reason: str | None = None
         self.stop_flush_deadline: float | None = None
         self._stop_lock = threading.Lock()
+        self.heartbeat_lock = threading.Lock()
+        self.receipt_lock = threading.Lock()
         self.help_requests: queue.Queue[str] = queue.Queue()
         self.help_lock = threading.Lock()
         self.help_request_count = 0
@@ -223,6 +231,36 @@ class DeviceLoop:
                 "capabilities": self.capabilities.copy(),
             }
 
+    def _record_receipt_event(
+        self,
+        label: str,
+        outcome: str,
+        *,
+        timestamp: str | None = None,
+        checkup_result: dict | None = None,
+        delivery_status: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        if not getattr(self, "witness", False) and getattr(self, "session_started_at", None) is None:
+            return
+        if not hasattr(self, "receipt_events"):
+            self.receipt_events = []
+        if not hasattr(self, "receipt_lock"):
+            self.receipt_lock = threading.Lock()
+        event = {
+            "timestamp": timestamp or _utc_timestamp(),
+            "label": label,
+            "outcome": outcome,
+        }
+        if checkup_result is not None:
+            event["checkup"] = checkup_result
+        if delivery_status is not None:
+            event["delivery_status"] = delivery_status
+        if request_id is not None:
+            event["request_id"] = request_id
+        with self.receipt_lock:
+            self.receipt_events.append(event)
+
     def _request_session_screenshot_consent(self) -> None:
         answer = self.console_owner.request(
             f"{self.instance}-screenshot-session",
@@ -231,6 +269,10 @@ class DeviceLoop:
         if self.stop_event.is_set():
             return
         self.allow_screen = answer is not None and answer.strip() == "Y"
+        self._record_receipt_event(
+            "Screenshot session permission",
+            "Enabled" if self.allow_screen else "Disabled",
+        )
         if not self.allow_screen:
             self.console.write(SCREENSHOTS_DISABLED)
 
@@ -310,19 +352,95 @@ class DeviceLoop:
                     started.wait(timeout=remaining)
             executor._terminate_windows_jobs()
 
+    def _send_final_heartbeat(self) -> bool:
+        remaining = self._stop_flush_remaining()
+        if remaining is None or remaining <= 0:
+            return False
+        if not hasattr(self, "heartbeat_lock"):
+            self.heartbeat_lock = threading.Lock()
+        if not self.heartbeat_lock.acquire(timeout=remaining):
+            logger.warning("Final device heartbeat was not confirmed before the stop flush deadline")
+            return False
+        try:
+            if not self._stop_flush_remaining():
+                return False
+            body = self._heartbeat_body()
+            body["witness"] = False
+            body["session_state"] = "stopped"
+            response = self._post("/device/heartbeat", body)
+            if response.status_code >= 500:
+                response.raise_for_status()
+            self._verify_response(response, "/device/heartbeat")
+            return response.status_code in (200, 204)
+        except (httpx.HTTPError, InterruptedError, PermissionError, ValueError, KeyError) as exc:
+            logger.warning("Final device heartbeat was not confirmed (%s)", type(exc).__name__)
+            return False
+        finally:
+            self.heartbeat_lock.release()
+
     def _stop_and_flush(self) -> None:
         deadline = self._begin_stopping()
         if getattr(self, "session_state", "normal") == "stopped":
             return
+        payload = None
+        paths = None
+        confirmed = False
         try:
-            self._cancel_running_jobs()
-            if not hasattr(self, "process_lock"):
-                self.process_lock = threading.Lock()
-            with self.process_lock:
-                jobs = list(getattr(self, "running", {}).values())
-            for thread in jobs:
-                if thread is not threading.current_thread():
-                    thread.join(max(0.0, deadline - time.monotonic()))
+            try:
+                self._cancel_running_jobs()
+                if not hasattr(self, "process_lock"):
+                    self.process_lock = threading.Lock()
+                with self.process_lock:
+                    jobs = list(getattr(self, "running", {}).values())
+                for thread in jobs:
+                    if thread is not threading.current_thread():
+                        thread.join(max(0.0, deadline - time.monotonic()))
+                started_at = getattr(self, "session_started_at", None)
+                if started_at is not None:
+                    ended_at = _utc_timestamp()
+                    end_reason = getattr(self, "stop_reason", None) or "stopped_by_person"
+                    self._record_receipt_event(
+                        "Session stopped",
+                        f"Ended: {end_reason}",
+                        timestamp=ended_at,
+                        delivery_status="pending",
+                    )
+                    if not hasattr(self, "receipt_lock"):
+                        self.receipt_lock = threading.Lock()
+                    with self.receipt_lock:
+                        events = sorted(
+                            (dict(event) for event in self.receipt_events),
+                            key=lambda event: event["timestamp"],
+                        )
+                    payload = {
+                        "schema_version": 1,
+                        "device_id": self.device_id,
+                        "instance": self.instance,
+                        "started_at": started_at,
+                        "ended_at": ended_at,
+                        "end_reason": end_reason,
+                        "shutdown_delivery": "pending",
+                        "events": events,
+                    }
+                    try:
+                        paths = receipt.write_receipt(payload, self.private, self.public)
+                    except OSError as exc:
+                        logger.warning("Could not save local session receipt (%s)", type(exc).__name__)
+            finally:
+                confirmed = self._send_final_heartbeat()
+            if payload is not None:
+                delivery_status = "confirmed" if confirmed else "unconfirmed"
+                payload["shutdown_delivery"] = delivery_status
+                for event in payload["events"]:
+                    if event["label"] == "Session stopped" and event["timestamp"] == payload["ended_at"]:
+                        event["delivery_status"] = delivery_status
+                        break
+                if paths is not None:
+                    try:
+                        receipt.update_receipt(paths, payload, self.private, self.public)
+                    except OSError as exc:
+                        logger.warning("Could not update local session receipt (%s)", type(exc).__name__)
+                    self.console.write(RECEIPT_SAVED.format(path=paths[1]))
         finally:
             with self._stop_lock:
                 self.session_state = "stopped"
@@ -420,14 +538,11 @@ class DeviceLoop:
                 self.console.write("The relay did not accept the help request.\n")
                 return False
             self.help_accepted_count += 1
-            self.receipt_events.append(
-                {
-                    "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-                    "label": "Help request",
-                    "outcome": "Accepted by relay",
-                    "delivery_status": "pending",
-                    "request_id": request_id,
-                }
+            self._record_receipt_event(
+                "Help request",
+                "Accepted by relay",
+                delivery_status="pending",
+                request_id=request_id,
             )
             self.console.write("The relay accepted the help request; owner delivery is pending.\n")
             return True
@@ -441,17 +556,19 @@ class DeviceLoop:
             self._send_help_request(text)
 
     def _refuse_unknown_job(self, job_id: str, seq: int) -> None:
-        self.receipt_events.append(
-            {
-                "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-                "label": "Unknown job type",
-                "outcome": "Refused: unknown_job_type",
-            }
-        )
+        self._record_receipt_event("Unknown job type", "Refused: unknown_job_type")
         self._result(job_id, seq, done=True, returncode=126, error="unknown_job_type")
 
     def _run_job(self, job: dict, start_event: threading.Event | None = None) -> None:
         job_id, seq = job["job_id"], 0
+        job_type = job.get("type")
+        receipt_label = {
+            "exec": "Command request",
+            "checkup": "System checkup",
+            "screenshot": "Screenshot request",
+            "cancel": "Cancellation request",
+        }.get(job_type, "Unknown job type")
+        receipt_outcome = None
         if not hasattr(self, "cancelled_jobs"):
             self.cancelled_jobs = set()
         if not hasattr(self, "process_lock"):
@@ -472,6 +589,7 @@ class DeviceLoop:
             if self._is_stopping():
                 start_event.set()
                 returncode, error = self._stopped_result()
+                receipt_outcome = f"Refused: {error}"
                 self._result(
                     job_id,
                     seq,
@@ -482,8 +600,8 @@ class DeviceLoop:
                 return
             if self.stop_event.is_set():
                 start_event.set()
+                receipt_label = None
                 return
-            job_type = job.get("type")
             malformed = not isinstance(job_type, str) or job_type not in {
                 "exec",
                 "checkup",
@@ -496,6 +614,7 @@ class DeviceLoop:
             malformed = malformed or (job_type == "cancel" and not isinstance(job.get("target_job_id"), str))
             if malformed:
                 start_event.set()
+                receipt_label = None
                 self._refuse_unknown_job(job_id, seq)
                 return
             if job_type != "exec":
@@ -504,6 +623,7 @@ class DeviceLoop:
                 current_policy_hash, policy_patterns = policy.snapshot()
                 if current_policy_hash != getattr(self, "accepted_policy_hash", None):
                     start_event.set()
+                    receipt_outcome = "Refused: policy acceptance changed"
                     self._result(
                         job_id,
                         seq,
@@ -532,6 +652,7 @@ class DeviceLoop:
                     refused = policy.refusal(policy_script, policy_patterns)
                 if refused:
                     start_event.set()
+                    receipt_outcome = "Refused by device policy"
                     self._result(job_id, seq, chunk=f"Policy refused command matching: {refused}\n", done=True, returncode=126)
                     return
                 exit_code = [0]
@@ -541,6 +662,8 @@ class DeviceLoop:
                 self.job_deadlines[job_id] = time.monotonic() + timeout
                 decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                 def on_start(proc, started):
+                    nonlocal receipt_label
+                    receipt_label = "Running a command"
                     with self.process_lock:
                         self.processes[job_id] = (proc, started)
                         stopping = self.stop_event.is_set()
@@ -564,6 +687,7 @@ class DeviceLoop:
                 final = decoder.decode(tail, final=True)
                 if self._is_stopping():
                     returncode, error = self._stopped_result()
+                    receipt_outcome = f"Stopped: {error}"
                     self._result(
                         job_id,
                         seq,
@@ -573,25 +697,28 @@ class DeviceLoop:
                         error=error,
                     )
                 elif capped.is_set():
+                    receipt_outcome = "Failed: output limit reached"
                     self._result(job_id, seq, chunk=final, done=True, returncode=1, error="Output exceeded the 64 MiB device limit")
                 elif truncated.is_set():
+                    receipt_outcome = "Failed: output was truncated"
                     self._result(job_id, seq, chunk=final, done=True, returncode=1, error="Output was truncated after the post-exit pipe idle limit")
                 else:
+                    receipt_outcome = f"Completed with exit code {exit_code[0]}"
                     self._result(job_id, seq, chunk=final, done=True, returncode=exit_code[0])
             elif job_type == "checkup":
                 result = checkup.collect()
                 if self._is_stopping():
                     returncode, error = self._stopped_result()
+                    receipt_outcome = f"Stopped: {error}"
                     self._result(job_id, seq, done=True, returncode=returncode, error=error)
                     return
-                self.receipt_events.append(
-                    {
-                        "timestamp": result["observed_at"],
-                        "label": "System checkup",
-                        "outcome": "Completed",
-                        "checkup": result,
-                    }
+                self._record_receipt_event(
+                    "System checkup",
+                    "Completed",
+                    timestamp=result["observed_at"],
+                    checkup_result=result,
                 )
+                receipt_label = None
                 self._result(
                     job_id,
                     seq,
@@ -603,6 +730,7 @@ class DeviceLoop:
             elif job_type == "screenshot":
                 if getattr(self, "witness", False):
                     if not self.allow_screen:
+                        receipt_outcome = "Declined"
                         self._result(
                             job_id,
                             seq,
@@ -619,6 +747,7 @@ class DeviceLoop:
                     self._expire_session_if_due()
                     if self._is_stopping():
                         returncode, error = self._stopped_result()
+                        receipt_outcome = f"Stopped: {error}"
                         self._result(
                             job_id,
                             seq,
@@ -628,8 +757,10 @@ class DeviceLoop:
                         )
                         return
                     if self.stop_event.is_set():
+                        receipt_label = None
                         return
                     if answer is None or answer.strip() != "Y":
+                        receipt_outcome = "Declined"
                         self._result(
                             job_id,
                             seq,
@@ -639,6 +770,7 @@ class DeviceLoop:
                         )
                         return
                 image = screen.capture(allow_screen=self.allow_screen)
+                receipt_outcome = "Captured"
                 self._result(job_id, seq, done=True, returncode=0, png=image)
             elif job_type == "cancel":
                 with self.process_lock:
@@ -649,15 +781,21 @@ class DeviceLoop:
                             self.cancelled_jobs.pop()
                 if target and target[0].poll() is None:
                     executor._terminate(target[0], target[1])
+                receipt_outcome = "Cancellation request completed"
                 self._result(job_id, seq, done=True, returncode=0)
         except InterruptedError:
+            if receipt_outcome is None and receipt_label is not None:
+                receipt_outcome = "Stopped before completion" if self._is_stopping() else "Interrupted before completion"
             return
         except PermissionError as exc:
             if str(exc) == "pairing_changed":
+                receipt_label = None
                 return
             if self._is_stopping():
+                returncode, error = self._stopped_result()
+                if receipt_outcome is None:
+                    receipt_outcome = f"Stopped: {error}"
                 try:
-                    returncode, error = self._stopped_result()
                     self._result(
                         job_id,
                         seq,
@@ -671,13 +809,18 @@ class DeviceLoop:
                 return
             if self.stop_event.is_set():
                 logger.debug("Dropping result for %s because the device is stopping", job_id)
+                receipt_label = None
                 return
             if str(exc) == "unknown_device":
                 return
             if str(exc) == "policy_changed":
+                if receipt_outcome is None:
+                    receipt_outcome = "Result delivery stopped after policy change"
                 self._retry("poll_retry_delay", cap=5)
                 return
             try:
+                if receipt_outcome is None:
+                    receipt_outcome = "Failed before completion"
                 if tail:
                     self._result(job_id, seq, chunk=tail.decode("utf-8", errors="replace"))
                     seq += 1
@@ -686,6 +829,9 @@ class DeviceLoop:
                 logger.debug("Could not deliver job failure for %s", job_id, exc_info=True)
         except Exception as exc:
             if self._is_stopping():
+                if receipt_outcome is None:
+                    returncode, error = self._stopped_result()
+                    receipt_outcome = f"Stopped: {error}"
                 try:
                     returncode, error = self._stopped_result()
                     self._result(
@@ -701,8 +847,11 @@ class DeviceLoop:
                 return
             if self.stop_event.is_set():
                 logger.debug("Dropping result for %s because the device is stopping", job_id)
+                receipt_label = None
                 return
             try:
+                if receipt_outcome is None:
+                    receipt_outcome = "Failed before completion"
                 if tail:
                     self._result(job_id, seq, chunk=tail.decode("utf-8", errors="replace"))
                     seq += 1
@@ -710,6 +859,8 @@ class DeviceLoop:
             except Exception:
                 logger.debug("Could not deliver job failure for %s", job_id, exc_info=True)
         finally:
+            if receipt_label is not None and receipt_outcome is not None:
+                self._record_receipt_event(receipt_label, receipt_outcome)
             start_event.set()
             with self.process_lock:
                 self.processes.pop(job_id, None)
@@ -721,10 +872,15 @@ class DeviceLoop:
     def _heartbeat_loop(self) -> None:
         if not hasattr(self, "heartbeat_retry_delay"):
             self.heartbeat_retry_delay = 1
+        if not hasattr(self, "heartbeat_lock"):
+            self.heartbeat_lock = threading.Lock()
         while not self.stop_event.is_set():
             try:
-                response = self._post("/device/heartbeat", self._heartbeat_body())
-                self._verify_response(response, "/device/heartbeat")
+                with self.heartbeat_lock:
+                    if self.stop_event.is_set():
+                        return
+                    response = self._post("/device/heartbeat", self._heartbeat_body())
+                    self._verify_response(response, "/device/heartbeat")
                 self.heartbeat_retry_delay = 1
                 self.stop_event.wait(5)
             except PermissionError as exc:
@@ -743,12 +899,12 @@ class DeviceLoop:
     def run_forever(self) -> None:
         if not hasattr(self, "poll_retry_delay"):
             self.poll_retry_delay = 1
-        if (
-            getattr(self, "witness", False)
-            and getattr(self, "session_state", "normal") == "active"
-            and getattr(self, "session_deadline", None) is None
-        ):
-            self.session_deadline = time.monotonic() + _WITNESS_SESSION_SECONDS
+        if getattr(self, "witness", False) and getattr(self, "session_state", "normal") == "active":
+            if getattr(self, "session_started_at", None) is None:
+                self.session_started_at = _utc_timestamp()
+                self._record_receipt_event("Witness session", "Started after consent")
+            if getattr(self, "session_deadline", None) is None:
+                self.session_deadline = time.monotonic() + _WITNESS_SESSION_SECONDS
         lock_path = Path.home() / ".hermes-hands" / "serve.lock"
         lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         lock_file = lock_path.open("a+b")
