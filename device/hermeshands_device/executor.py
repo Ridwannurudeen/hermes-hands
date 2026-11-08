@@ -10,6 +10,7 @@ import subprocess
 import threading
 import tempfile
 import time
+import select
 from pathlib import Path
 from typing import Iterator
 
@@ -77,7 +78,7 @@ def _terminate(proc: subprocess.Popen, start_time: float) -> None:
             return
         taskkill = shutil.which("taskkill")
         if taskkill:
-            subprocess.run([taskkill, "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
+            subprocess.run([taskkill, "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=1, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
         else:
             proc.kill()
     else:
@@ -103,7 +104,7 @@ def terminate_recorded(pid: int, start_time: float) -> None:
             process.kill()
     else:
         try:
-            os.killpg(pid, signal.SIGKILL)
+            process.kill()
         except ProcessLookupError:
             pass
 
@@ -115,9 +116,17 @@ def record_path(job_id: str) -> Path:
 def record_process(job_id: str, pid: int, start_time: float) -> None:
     path = record_path(job_id)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.write_text(json.dumps({"pid": pid, "create_time": start_time}), encoding="utf-8")
-    if os.name != "nt":
-        path.chmod(0o600)
+    fd, temporary = tempfile.mkstemp(prefix=f"{job_id}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as record:
+            json.dump({"pid": pid, "create_time": start_time}, record)
+            record.flush()
+            os.fsync(record.fileno())
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def reap_recorded_processes() -> None:
@@ -125,12 +134,25 @@ def reap_recorded_processes() -> None:
     if not out_dir.exists():
         return
     for path in out_dir.glob("*.process.json"):
-        record = json.loads(path.read_text(encoding="utf-8"))
-        terminate_recorded(int(record["pid"]), float(record["create_time"]))
+        try:
+            record = json.loads(path.read_text(encoding="utf-8-sig"))
+            terminate_recorded(int(record["pid"]), float(record["create_time"]))
+        except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as exc:
+            import logging
+
+            logging.getLogger(__name__).warning("Could not reap process record %s: %s", path.name, exc)
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                import logging
+
+                logging.getLogger(__name__).warning("Could not remove process record %s: %s", path.name, exc)
+    for path in out_dir.glob("*.stdin"):
         path.unlink(missing_ok=True)
 
 
-def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "job", stdin: str | None = None, on_start=None, on_exit=None) -> Iterator[bytes]:
+def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "job", stdin: str | None = None, on_start=None, on_exit=None, on_capped=None) -> Iterator[bytes]:
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job_id):
         raise ValueError("invalid job id")
     bash = resolve_bash()
@@ -138,42 +160,66 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
         raise RuntimeError("Git Bash was not found or failed its probe")
     script_dir = Path.home() / ".hermes-hands" / "out"
     script_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", suffix=".sh", dir=script_dir, delete=False) as script_file:
-        script_file.write(script)
-        script_path = Path(script_file.name)
-    args = [bash, *( ["-l"] if login else []), str(script_path)]
-    kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {"start_new_session": True}
+    script_path = None
     stdin_path = None
-    if stdin is not None:
-        with tempfile.NamedTemporaryFile("wb", dir=script_dir, delete=False) as stdin_file:
-            stdin_file.write(stdin.encode("utf-8"))
-            stdin_path = Path(stdin_file.name)
-        stdin_handle = stdin_path.open("rb")
-    else:
-        stdin_handle = subprocess.DEVNULL
-    env = None
-    if os.name == "nt":
-        env = dict(os.environ)
-        env.setdefault("PYTHONUTF8", "1")
-        env.setdefault("PYTHONIOENCODING", "utf-8")
+    stdin_handle = subprocess.DEVNULL
+    proc = None
+    record_written = False
     try:
+        if stdin is not None:
+            with tempfile.NamedTemporaryFile("wb", prefix=f"{job_id}.", suffix=".stdin", dir=script_dir, delete=False) as stdin_file:
+                stdin_file.write(stdin.encode("utf-8", errors="surrogateescape"))
+                stdin_path = Path(stdin_file.name)
+            stdin_handle = stdin_path.open("rb")
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", suffix=".sh", dir=script_dir, delete=False) as script_file:
+            script_file.write(script)
+            script_path = Path(script_file.name)
+        args = [bash, *(["-l"] if login else []), str(script_path)]
+        kwargs = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {"start_new_session": True}
+        env = None
+        if os.name == "nt":
+            env = dict(os.environ)
+            env.setdefault("PYTHONUTF8", "1")
+            env.setdefault("PYTHONIOENCODING", "utf-8")
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=stdin_handle, env=env, **kwargs)
-    finally:
-        if stdin_path is not None:
+        if stdin is not None:
             stdin_handle.close()
-    created = psutil.Process(proc.pid).create_time()
-    if on_start:
-        record_process(job_id, proc.pid, created)
-        on_start(proc, created)
+        created = psutil.Process(proc.pid).create_time()
+        if on_start:
+            record_process(job_id, proc.pid, created)
+            record_written = True
+            on_start(proc, created)
+    except BaseException:
+        if stdin is not None:
+            stdin_handle.close()
+        if proc is not None and proc.poll() is None:
+            _terminate(proc, psutil.Process(proc.pid).create_time())
+            proc.wait()
+        if script_path is not None:
+            script_path.unlink(missing_ok=True)
+        if stdin_path is not None:
+            stdin_path.unlink(missing_ok=True)
+        if record_written:
+            record_path(job_id).unlink(missing_ok=True)
+        raise
     chunks: queue.Queue[bytes | None] = queue.Queue(maxsize=OUTPUT_QUEUE_SIZE)
     deadline = time.monotonic() + timeout
     total = 0
     capped = threading.Event()
     exited = threading.Event()
+    timed_out = threading.Event()
+    drain_deadline = [None]
+    termination_started = threading.Event()
+
+    def terminate_once() -> None:
+        if not termination_started.is_set():
+            termination_started.set()
+            _terminate(proc, created)
 
     def kill_at_deadline() -> None:
-        if proc.poll() is None:
-            _terminate(proc, created)
+        timed_out.set()
+        drain_deadline[0] = time.monotonic() + 2
+        terminate_once()
 
     timer = threading.Timer(max(0, deadline - time.monotonic()), kill_at_deadline)
     timer.daemon = True
@@ -182,7 +228,31 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
     def read_output() -> None:
         nonlocal total
         while True:
-            chunk = proc.stdout.read1(CHUNK_SIZE)
+            if timed_out.is_set():
+                return
+            if drain_deadline[0] is not None and time.monotonic() >= drain_deadline[0]:
+                return
+            if os.name == "nt":
+                import ctypes
+                import msvcrt
+
+                available_bytes = ctypes.c_ulong()
+                ready = ctypes.windll.kernel32.PeekNamedPipe(
+                    msvcrt.get_osfhandle(proc.stdout.fileno()), None, 0, None, ctypes.byref(available_bytes), None
+                )
+                if not ready or available_bytes.value == 0:
+                    if proc.poll() is not None and not ready:
+                        chunk = b""
+                    else:
+                        time.sleep(0.05)
+                        continue
+                else:
+                    chunk = os.read(proc.stdout.fileno(), min(CHUNK_SIZE, available_bytes.value))
+            else:
+                ready, _, _ = select.select([proc.stdout], [], [], 0.05)
+                chunk = os.read(proc.stdout.fileno(), CHUNK_SIZE) if ready else None
+                if chunk is None:
+                    continue
             if not chunk:
                 while True:
                     try:
@@ -197,6 +267,8 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                 capped.set()
             total += len(chunk)
             while True:
+                if drain_deadline[0] is not None and time.monotonic() >= drain_deadline[0]:
+                    return
                 try:
                     chunks.put(chunk, timeout=0.05)
                     break
@@ -215,14 +287,18 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
         with output_path.open("wb") as log:
             while True:
                 now = time.monotonic()
-                if now >= deadline and proc.poll() is None:
-                    _terminate(proc, created)
+                if timed_out.is_set() or now >= deadline:
+                    terminate_once()
                     if on_exit:
                         on_exit(124)
                     yield b"[device timeout]\n"
                     return
+                if proc.poll() is not None and drain_deadline[0] is None:
+                    drain_deadline[0] = min(deadline, now + 2)
+                if drain_deadline[0] is not None and now >= drain_deadline[0]:
+                    break
                 try:
-                    chunk = chunks.get(timeout=PIPE_DRAIN_GRACE if proc.poll() is not None else 0.1)
+                    chunk = chunks.get(timeout=min(PIPE_DRAIN_GRACE if proc.poll() is not None else 0.1, max(0.01, (drain_deadline[0] - now) if drain_deadline[0] else 0.1)))
                 except queue.Empty:
                     if proc.poll() is not None:
                         break
@@ -231,21 +307,38 @@ def run(script: str, *, login: bool = False, timeout: int = 120, job_id: str = "
                     break
                 log.write(chunk)
                 yield chunk
-            if capped.is_set():
+            if timed_out.is_set():
                 if on_exit:
-                    on_exit(125)
+                    on_exit(124)
+                yield b"[device timeout]\n"
+                return
+            if capped.is_set():
+                if on_capped:
+                    on_capped()
+                if on_exit:
+                    on_exit(proc.returncode)
                 yield b"[output truncated at 64 MiB]\n"
                 return
         proc.wait(timeout=max(0.1, deadline - time.monotonic()))
-        if on_exit:
+        if timed_out.is_set():
+            if on_exit:
+                on_exit(124)
+            yield b"[device timeout]\n"
+        elif on_exit:
             on_exit(proc.returncode)
     finally:
         exited.set()
         timer.cancel()
         if proc.poll() is None:
-            _terminate(proc, created)
-            proc.wait()
-        script_path.unlink(missing_ok=True)
+            terminate_once()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        reader.join(timeout=0.2)
+        if script_path is not None:
+            script_path.unlink(missing_ok=True)
         if stdin_path is not None:
             stdin_path.unlink(missing_ok=True)
         record_path(job_id).unlink(missing_ok=True)

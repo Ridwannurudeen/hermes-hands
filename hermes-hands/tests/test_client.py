@@ -47,6 +47,20 @@ def test_relay_down_is_reported(monkeypatch):
         client.configure("http://127.0.0.1:9119", None)
 
 
+def test_the_loopback_client_ignores_proxy_settings(monkeypatch):
+    """V48: with a proxy in the environment, the local bearer still goes straight to the relay."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    client.configure("http://127.0.0.1:9119", "bearer")  # the real transport, as in production
+    try:
+        assert client._http.trust_env is False
+        assert not client._http._mounts  # httpx mounts one proxy transport per env proxy
+    finally:
+        client.configure("http://127.0.0.1:9119", None)
+
+
 def test_state_gives_up_quickly_on_a_hung_dashboard(monkeypatch):
     timeouts = []
 

@@ -17,7 +17,7 @@ def command(*, xml_path: str = "", remove: bool = False) -> list[str]:
     return ["schtasks", "/Create", "/XML", xml_path, "/TN", TASK_NAME, "/F"]
 
 
-def task_xml(*, executable: str, username: str) -> bytes:
+def task_xml(*, executable: str, username: str, allow_screen: bool = False) -> bytes:
     task = ElementTree.Element("Task", {"version": "1.4", "xmlns": "http://schemas.microsoft.com/windows/2004/02/mit/task"})
     registration = ElementTree.SubElement(task, "RegistrationInfo")
     ElementTree.SubElement(registration, "URI").text = f"\\{TASK_NAME}"
@@ -44,12 +44,12 @@ def task_xml(*, executable: str, username: str) -> bytes:
     execute.text = executable
     ElementTree.SubElement(exec_action, "WorkingDirectory").text = str(Path.home())
     arguments = ElementTree.SubElement(exec_action, "Arguments")
-    arguments.text = "serve"
+    arguments.text = "serve --allow-screen" if allow_screen else "serve"
     declaration = '<?xml version="1.0" encoding="UTF-16"?>\n'
     return (declaration + ElementTree.tostring(task, encoding="unicode")).encode("utf-16")
 
 
-def install(*, dry_run: bool = False, remove: bool = False) -> int:
+def install(*, dry_run: bool = False, remove: bool = False, allow_screen: bool = False) -> int:
     if sys.platform != "win32":
         print("install-service is not supported in v0.1 on this platform", file=sys.stderr)
         return 1
@@ -63,7 +63,7 @@ def install(*, dry_run: bool = False, remove: bool = False) -> int:
         username = f"{os.environ['USERDOMAIN']}\\{os.environ['USERNAME']}"
         with tempfile.TemporaryDirectory(prefix="hermes-hands-") as temp_dir:
             xml_path = Path(temp_dir) / "task.xml"
-            xml_path.write_bytes(task_xml(executable=executable, username=username))
+            xml_path.write_bytes(task_xml(executable=executable, username=username, allow_screen=allow_screen))
             args = command(xml_path=str(xml_path))
             print(subprocess.list2cmdline(args))
             if dry_run:

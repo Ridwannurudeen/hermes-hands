@@ -21,6 +21,7 @@ OFFLINE_AFTER = (
     20  # seconds without a device request before it counts as offline; register() sets it
 )
 RELAY_STALE_AFTER = 15  # seconds; the relay writes its heartbeat row every 5
+TOMBSTONE_TTL = 7 * 24 * 3600  # seconds a revoked device's key can still be told to stop
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -38,7 +39,8 @@ CREATE TABLE IF NOT EXISTS devices (
 CREATE TABLE IF NOT EXISTS revoked_devices (
     device_id TEXT PRIMARY KEY,
     public_key TEXT NOT NULL,
-    revoked_at INTEGER NOT NULL
+    revoked_at INTEGER NOT NULL,
+    name TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS pairing_codes (
     code_hash TEXT PRIMARY KEY,
@@ -81,6 +83,10 @@ def _db() -> Iterator[sqlite3.Connection]:
     try:
         conn.row_factory = sqlite3.Row
         conn.executescript(_SCHEMA)
+        if "name" not in {
+            row["name"] for row in conn.execute("PRAGMA table_info(revoked_devices)")
+        }:
+            conn.execute("ALTER TABLE revoked_devices ADD COLUMN name TEXT NOT NULL DEFAULT ''")
         with conn:
             yield conn
     finally:
@@ -156,6 +162,7 @@ def complete_pairing(
             " policy_ok, paired_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
             (device_id, name, public_key, os, home, policy_hash, policy_hash, now, now),
         )
+        conn.execute("DELETE FROM revoked_devices WHERE name = ?", (name,))
     return device_id
 
 
@@ -209,22 +216,32 @@ def record_seen(
 
 
 def revoked_key(device_id: str) -> bytes | None:
-    """The public key a revoked device signs with (its tombstone), else None."""
+    """The public key a revoked device signs with (its tombstone), else None. A tombstone lasts
+    until the relay has told the device to stop, its name is paired again, or ``TOMBSTONE_TTL``."""
     with _db() as conn:
         row = conn.execute(
-            "SELECT public_key FROM revoked_devices WHERE device_id = ?", (device_id,)
+            "SELECT public_key FROM revoked_devices WHERE device_id = ? AND revoked_at > ?",
+            (device_id, int(time.time()) - TOMBSTONE_TTL),
         ).fetchone()
     return None if row is None else protocol.unb64u(row["public_key"])
+
+
+def forget_revoked(device_id: str) -> None:
+    """Drop the tombstone once the device has been sent its signed ``unknown_device``."""
+    with _db() as conn:
+        conn.execute("DELETE FROM revoked_devices WHERE device_id = ?", (device_id,))
 
 
 def revoke(name: str) -> bool:
     """Delete the device, keeping its id and public key as a tombstone so the relay can answer its
     next request with a signed ``unknown_device``; the name is free to pair again."""
+    now = int(time.time())
     with _db() as conn:
+        conn.execute("DELETE FROM revoked_devices WHERE revoked_at <= ?", (now - TOMBSTONE_TTL,))
         conn.execute(
-            "INSERT INTO revoked_devices (device_id, public_key, revoked_at)"
-            " SELECT device_id, public_key, ? FROM devices WHERE name = ?",
-            (int(time.time()), name),
+            "INSERT INTO revoked_devices (device_id, public_key, revoked_at, name)"
+            " SELECT device_id, public_key, ?, name FROM devices WHERE name = ?",
+            (now, name),
         )
         return conn.execute("DELETE FROM devices WHERE name = ?", (name,)).rowcount > 0
 

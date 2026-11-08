@@ -56,6 +56,10 @@ _MAX_PNG_B64 = 4 * -(-MAX_PNG_BYTES // 3)
 _LIVENESS_EVERY = 1.0
 _ABANDONED_AFTER = 60  # seconds without a gateway fetch: the caller is gone, cancel the job
 _HEARTBEAT_EVERY = 5
+_INSTANCE_QUIET = (
+    10  # seconds without contact before a job's agent counts as gone (it heartbeats every 5)
+)
+_INSTANCE_FORGOTTEN = 60  # seconds before a silent agent instance is no longer remembered
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +117,7 @@ class _Job:
     png_b64: str | None = None
     done: bool = False
     picked: bool = False
+    instance: str | None = None  # the agent process that picked it, when the poll named one
     last_fetch: float = field(default_factory=time.monotonic)
 
 
@@ -145,8 +150,10 @@ class Relay:
         self._queues: dict[str, deque] = {}
         self._nonces = protocol.NonceCache()
         self._refused: set[str] = set()  # devices currently refused for a changed deny-list
-        self._instances: dict[str, str] = {}  # device id -> the agent process it last reported
-        self._polls: dict[str, int] = {}  # device id -> generation of its newest poll
+        # device id -> {agent instance: last contact (monotonic)}
+        self._instances: dict[str, dict[str, float]] = {}
+        # (device id, agent instance or None) -> generation of that agent's newest poll
+        self._polls: dict[tuple[str, str | None], int] = {}
         # Long-polls waiting for a change, by device id (a queued job) or job id (output, the end).
         self._waiters: dict[str, set[tuple[asyncio.AbstractEventLoop, asyncio.Future]]] = {}
 
@@ -207,18 +214,23 @@ class Relay:
         if not job.done:
             self._finish_locked(job, CANCELLED, messages.cancelled(job.device_name))
 
-    def _fail_device(self, device_id: str, error: str) -> None:
-        """Fail every job of the device and end its parked polls: a poll that began before this
-        refusal must not hand out a job, which would tell the device its old hash is accepted. Its
-        queue stays: finished jobs are never handed out (``_pop_locked``), and the cancels for the
-        picked ones must still reach it."""
+    def _fail_device(self, device_id: str, name: str) -> None:
+        """Fail every job of a device refused for a changed deny-list and end its parked polls: a
+        poll that began before this refusal must not hand out a job, which would tell the device its
+        old hash is accepted. Its queue stays: finished jobs are never handed out (``_pop_locked``),
+        and the cancels for the picked ones must still reach it."""
         with self._lock:
-            self._supersede_polls_locked(device_id)
+            self._supersede_polls_locked(device_id, [i for d, i in self._polls if d == device_id])
             for job in self._jobs.values():
                 if job.device_id == device_id and not job.done:
-                    self._finish_locked(job, UNREACHABLE, error)
+                    error = (
+                        messages.policy_changed_while_running
+                        if job.picked
+                        else messages.policy_changed
+                    )
+                    self._finish_locked(job, UNREACHABLE, error(name))
 
-    def _pop_locked(self, device_id: str) -> dict | None:
+    def _pop_locked(self, device_id: str, instance: str | None) -> dict | None:
         queue = self._queues.get(device_id)
         while queue:
             payload = queue.popleft()
@@ -226,7 +238,7 @@ class Relay:
                 return payload
             job = self._jobs.get(payload["job_id"])
             if job is not None and not job.done:
-                job.picked = True
+                job.picked, job.instance = True, instance
                 return payload
         return None
 
@@ -277,19 +289,37 @@ class Relay:
         return out
 
     def _check_device(self, job: _Job) -> None:
-        """Fail a running job whose device was revoked, went offline or changed its deny-list."""
+        """Fail a job whose device was revoked, went offline or changed its deny-list, or whose agent
+        process is gone. The message says whether it may have run: only a picked job can have."""
         device = store.device_by_id(job.device_id)
-        if device is None:
-            error = messages.revoked(job.device_name)
-        elif not device["policy_ok"]:
-            error = messages.policy_changed(job.device_name)
-        elif not device["online"]:
-            error = messages.went_offline(job.device_name)
-        else:
-            return
         with self._lock:
-            if not job.done:
-                self._finish_locked(job, UNREACHABLE, error)
+            if job.done:
+                return
+            name, picked = job.device_name, job.picked
+            if device is None:
+                error = (messages.revoked if picked else messages.unknown_device)(name)
+            elif not device["policy_ok"]:
+                error = (
+                    messages.policy_changed_while_running if picked else messages.policy_changed
+                )(name)
+            elif not device["online"]:
+                error = (messages.went_offline if picked else messages.offline)(name)
+            elif self._agent_gone_locked(job):
+                error = messages.agent_restarted(name)
+            else:
+                return
+            self._finish_locked(job, UNREACHABLE, error)
+
+    def _agent_gone_locked(self, job: _Job) -> bool:
+        """The agent process that picked ``job`` fell quiet while another one for the device kept in
+        touch: it restarted or died, so the job will never report."""
+        if not job.picked or job.instance is None:
+            return False
+        seen = self._instances.get(job.device_id, {})
+        last = seen.get(job.instance, float("-inf"))
+        return time.monotonic() - last > _INSTANCE_QUIET and any(
+            contact >= last for instance, contact in seen.items() if instance != job.instance
+        )
 
     # --- device routes -------------------------------------------------------------------------
     def _device(self, principal, headers, path: str, body: bytes, peer: str):
@@ -332,6 +362,7 @@ class Relay:
         if not self._nonces.check_and_add(bearer.nonce, int(time.time())):
             return None, None, Reply.json(401, {"error": "replayed", "detail": messages.REPLAYED})
         if device is None:
+            store.forget_revoked(bearer.device_id)  # told once; after that core's seam refuses it
             return None, None, self._unknown(bearer.device_id, path, bearer.nonce, peer)
         return device, bearer.nonce, None
 
@@ -345,27 +376,32 @@ class Relay:
             401, {"error": "unknown_device", "detail": messages.UNKNOWN_DEVICE_WIRE}, path, nonce
         )
 
-    def _supersede_polls_locked(self, device_id: str) -> int:
-        """End every poll of the device parked here (each returns 204); the new poll generation."""
-        generation = self._polls[device_id] = self._polls.get(device_id, 0) + 1
+    def _supersede_polls_locked(self, device_id: str, instances) -> None:
+        """End the device's polls parked here for these agent instances (each returns 204)."""
+        for instance in instances:
+            key = (device_id, instance)
+            self._polls[key] = self._polls.get(key, 0) + 1
         self._wake_locked(device_id)
-        return generation
 
     def _note_instance(self, device: dict, instance: str | None) -> None:
-        """A new agent process on the device: the old one's parked polls are dead connections and
-        the jobs it picked up died with it or are out of reach, so those polls end and those jobs
-        fail now instead of at the gateway's timeout."""
+        """Record contact from an agent process. The first contact from a new one ends the other
+        processes' parked polls once: after a restart they are dead connections. Agents that are all
+        alive never end each other's polls again, so two agents for one device cannot set off a
+        poll storm, and their jobs are left alone. A job whose agent fell quiet is failed by
+        ``_check_device``."""
         if instance is None:
             return
+        device_id, now = device["device_id"], time.monotonic()
         with self._lock:
-            previous = self._instances.get(device["device_id"])
-            self._instances[device["device_id"]] = instance
-            if previous is None or previous == instance:
-                return
-            self._supersede_polls_locked(device["device_id"])
-            for job in self._jobs.values():
-                if job.device_id == device["device_id"] and job.picked and not job.done:
-                    self._finish_locked(job, UNREACHABLE, messages.agent_restarted(device["name"]))
+            seen = self._instances.setdefault(device_id, {})
+            new = instance not in seen
+            seen[instance] = now
+            for gone in [i for i, contact in seen.items() if now - contact > _INSTANCE_FORGOTTEN]:
+                del seen[gone]
+                self._polls.pop((device_id, gone), None)
+            if new and len(seen) > 1:
+                others = [i for d, i in self._polls if d == device_id and i != instance]
+                self._supersede_polls_locked(device_id, others)
 
     def _seen_refusal(
         self, ok: bool | None, device: dict, path: str, nonce: str, peer: str
@@ -374,7 +410,7 @@ class Relay:
         if ok is None:
             return self._unknown(device["device_id"], path, nonce, peer)
         if not ok:
-            self._fail_device(device["device_id"], messages.policy_changed(device["name"]))
+            self._fail_device(device["device_id"], device["name"])
             reply = self._signed(
                 409,
                 {"error": "policy_changed", "detail": messages.POLICY_CHANGED_WIRE},
@@ -441,9 +477,9 @@ class Relay:
         return reply
 
     async def device_poll(self, principal, headers, path: str, body: bytes, peer: str) -> Reply:
-        """Long-poll for the device's next job. Only a device's newest poll can take one: an older
-        poll still parked here belongs to a connection the device dropped (an agent restart, a
-        network change), so it returns 204 instead of handing a job to nobody."""
+        """Long-poll for the device's next job. Only an agent's newest poll can take one: an older
+        poll of the same agent still parked here belongs to a connection it dropped (a network
+        change), so it returns 204 instead of handing a job to nobody."""
         device, nonce, refusal = await asyncio.to_thread(
             self._device, principal, headers, path, body, peer
         )
@@ -470,11 +506,12 @@ class Relay:
         self._note_instance(device, instance)
         device_id, deadline = device["device_id"], time.monotonic() + wait
         with self._lock:
-            generation = self._supersede_polls_locked(device_id)
+            self._supersede_polls_locked(device_id, [instance])
+            generation = self._polls[(device_id, instance)]
         while True:
             with self._lock:
-                newest = self._polls[device_id] == generation
-                job = self._pop_locked(device_id) if newest else None
+                newest = self._polls.get((device_id, instance)) == generation
+                job = self._pop_locked(device_id, instance) if newest else None
                 remaining = deadline - time.monotonic()
                 waiter = (
                     None

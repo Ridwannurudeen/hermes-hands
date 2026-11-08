@@ -31,7 +31,7 @@ def test_cleanup_removes_only_old_regular_matching_files(monkeypatch, tmp_path, 
     for path in (old_snapshot, new_snapshot, old_cwd, unrelated, old_script, new_script, shared_tmp_script, old_log, new_log):
         path.write_text("content", encoding="utf-8")
     old_time = time.time() - janitor.MAX_AGE_SECONDS - 1
-    for path in (old_snapshot, old_cwd, old_script):
+    for path in (old_snapshot, old_cwd, old_script, shared_tmp_script):
         os.utime(path, (old_time, old_time))
     old_log_time = time.time() - janitor.OUT_LOG_MAX_AGE_SECONDS - 1
     os.utime(old_log, (old_log_time, old_log_time))

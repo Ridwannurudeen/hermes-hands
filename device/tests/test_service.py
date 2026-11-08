@@ -35,6 +35,15 @@ def test_install_service_dry_run_prints_command_without_running(monkeypatch, cap
     assert "serve" in output
 
 
+def test_install_service_passes_allow_screen_to_task(monkeypatch, capsys):
+    monkeypatch.setattr(service.sys, "platform", "win32")
+    monkeypatch.setattr(service.shutil, "which", lambda name: r"C:\pipx\hermes-hands.exe")
+    monkeypatch.setattr(service.os, "environ", {"USERDOMAIN": "LAPTOP", "USERNAME": "user"})
+    monkeypatch.setattr(service.Path, "home", lambda: service.Path(r"C:\Users\user"))
+    assert service.install(dry_run=True, allow_screen=True) == 0
+    assert "serve --allow-screen" in capsys.readouterr().out
+
+
 def test_remove_service_command(monkeypatch):
     monkeypatch.setattr(service.sys, "platform", "win32")
     calls = []

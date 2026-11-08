@@ -80,11 +80,11 @@ def get_or_create() -> tuple[bytes, bytes]:
 
 
 def remove() -> None:
+    config.KEY_PATH.unlink(missing_ok=True)
     keyring = _keyring()
     if keyring:
         try:
             if keyring.get_password(SERVICE, "device-private") is not None:
                 keyring.delete_password(SERVICE, "device-private")
-        except keyring.errors.KeyringError:
+        except Exception:
             logger.warning("Keyring unavailable while removing device key")
-    config.KEY_PATH.unlink(missing_ok=True)

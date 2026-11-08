@@ -4,6 +4,8 @@ import types
 from enum import Enum
 from pathlib import Path
 
+import pytest
+
 from hands import commands
 
 
@@ -140,7 +142,7 @@ def test_setup_names_the_backend_and_placement_steps(monkeypatch):
 
 def test_use_refuses_a_device_unless_the_backend_is_hands(monkeypatch):
     ctx = setup(monkeypatch, ["telegram:42"])
-    install_config(monkeypatch, {"terminal": {"backend": "local"}})
+    monkeypatch.setattr(commands, "terminal_backend", lambda: "local")
     monkeypatch.setattr(commands.store, "get_device", lambda name: {"name": name})
     targets = []
     monkeypatch.setattr(commands.store, "set_session_target", lambda key, name: targets.append(name))
@@ -151,7 +153,7 @@ def test_use_refuses_a_device_unless_the_backend_is_hands(monkeypatch):
         "Target set to server"
     )
     assert targets == ["server"]
-    install_config(monkeypatch, {"terminal": {"backend": "hands"}})
+    monkeypatch.setattr(commands, "terminal_backend", lambda: "hands")
     assert ctx.handler("use laptop", session_key="s", platform="telegram", source=Source()).startswith(
         "Target set to laptop"
     )
@@ -160,7 +162,7 @@ def test_use_refuses_a_device_unless_the_backend_is_hands(monkeypatch):
 
 def test_use_refuses_unknown_device(monkeypatch):
     ctx = setup(monkeypatch, ["telegram:42"])
-    install_config(monkeypatch, {"terminal": {"backend": "hands"}})
+    monkeypatch.setattr(commands, "terminal_backend", lambda: "hands")
     monkeypatch.setattr(commands.store, "get_device", lambda name: None)
     assert "No paired device" in ctx.handler("use missing", session_key="s", platform="telegram", source=Source())
 
@@ -177,17 +179,69 @@ def test_status_appends_device_policy_alerts(monkeypatch):
 def test_status_asks_a_relay_that_has_no_fresh_heartbeat(monkeypatch):
     ctx = setup(monkeypatch)
     monkeypatch.setattr(commands.store, "list_devices", lambda: [])
-    monkeypatch.setattr(commands.store, "relay_alive", lambda: False)
-    asked = []
+    asked = []  # the relay writes its heartbeat before it answers /local/state
+    monkeypatch.setattr(commands.store, "relay_alive", lambda: bool(asked))
     monkeypatch.setattr(commands.client, "state", lambda: asked.append(True) or {"relay": True})
     assert ctx.handler("status") == "Hands: relay up; target server; 0 device(s)."
     assert asked == [True]
+    monkeypatch.setattr(commands.store, "relay_alive", lambda: False)
+    assert ctx.handler("status") == (  # V50: it answers, but its heartbeat is in another store
+        "Hands: relay down; target server; 0 device(s).\n"
+        + commands.messages.STORE_SPLIT
+    )
 
     def refuse():
         raise commands.client.HandsError("hands: the relay is not reachable.")
 
     monkeypatch.setattr(commands.client, "state", refuse)
     assert ctx.handler("status") == "Hands: relay down; target server; 0 device(s).\nhands: the relay is not reachable."
+
+
+def test_use_sets_a_device_only_in_a_direct_chat(monkeypatch):
+    """V15: a group, channel or thread shares one session, so a device target set there would let
+    every participant run commands on the owner's device."""
+    ctx = setup(monkeypatch, ["telegram:42"])
+    monkeypatch.setattr(commands, "terminal_backend", lambda: "hands")
+    monkeypatch.setattr(commands.store, "get_device", lambda name: {"name": name})
+    targets = []
+    monkeypatch.setattr(commands.store, "set_session_target", lambda key, name: targets.append(name))
+    for chat_type in ("group", "channel", "thread"):
+        source = Source(chat_type=chat_type)
+        reply = ctx.handler("use laptop", session_key="g", platform="telegram", source=source)
+        assert reply == commands.messages.USE_DIRECT_ONLY
+    group = Source(chat_type="group")
+    assert ctx.handler("use server", session_key="g", platform="telegram", source=group).startswith(
+        "Target set to server"
+    )
+    assert ctx.handler("use laptop", session_key="d", platform="telegram", source=Source()).startswith(
+        "Target set to laptop"
+    )
+    assert targets == ["server", "laptop"]
+
+
+def test_pair_codes_are_given_only_in_a_direct_chat(monkeypatch):
+    """V51: a code posted to a group lets any member pair their own machine under that name."""
+    ctx = setup(monkeypatch, ["telegram:42"])
+    minted = []
+    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name: minted.append(name) or "c")
+    reply = ctx.handler("pair desk", session_key="g", platform="telegram", source=Source(chat_type="group"))
+    assert reply == commands.messages.PAIR_DIRECT_ONLY and minted == []
+
+
+def test_the_backend_is_read_the_way_hermes_resolves_it(monkeypatch, tmp_path):
+    """V49: config.yaml terminal.backend wins; without it TERMINAL_ENV (the .env or the launch
+    environment) selects the backend, as core's terminal_scope does."""
+    pytest.importorskip("tools.terminal_scope")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("model: x\n", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_ENV", "hands")
+    assert commands.terminal_backend() == "hands"
+    monkeypatch.delenv("TERMINAL_ENV")
+    (tmp_path / ".env").write_text("TERMINAL_ENV=hands\n", encoding="utf-8")
+    assert commands.terminal_backend() == "hands"
+    (tmp_path / "config.yaml").write_text("terminal:\n  backend: local\n", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_ENV", "hands")
+    assert commands.terminal_backend() == "local"
 
 
 def test_revoke_requires_exact_yes(monkeypatch):

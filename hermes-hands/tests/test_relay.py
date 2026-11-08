@@ -216,28 +216,35 @@ def bearer_nonce(headers) -> str:
     return protocol.parse_bearer(headers["authorization"].split(" ", 1)[1]).nonce
 
 
-def test_revoked_device_gets_a_signed_unknown_device_every_time(hub, caplog):
-    """W4 and C47: the stop signal is relay-signed over the request's nonce, so the device can
-    trust it, and no per-address budget can turn it into a 429."""
+def test_revoked_device_gets_one_signed_unknown_device_then_its_key_is_forgotten(hub, caplog):
+    """W4 and V14: the stop signal is relay-signed over the request's nonce, so the device can
+    trust it; once it is sent the tombstone goes, so the old key stops being a token principal."""
     device = Device()
     store.revoke("laptop")
     revoked = Principal(device.device_id, scopes=(relay.SCOPE_REVOKED,))
     caplog.set_level("WARNING", logger=relay.logger.name)
     beat = {"policy_hash": "p0", "os": "x", "home": "y"}
-    for _ in range(15):
-        _, headers, path, raw = device.request("/device/heartbeat", beat)
-        reply = run(hub.device_heartbeat(revoked, headers, path, raw, PEER))
-        assert reply.status == 401
-        assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "unknown_device"
-    assert f"revoked device {device.device_id} called from {PEER}" in caplog.text
-    # Revoked after the token seam vouched for the device: the same signed reply.
-    reply, path, headers = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
+    # The request itself must be signed by the tombstoned key; a forgery gets nothing signed and
+    # leaves the tombstone in place.
+    _, headers, path, raw = device.request("/device/heartbeat", beat, tamper=True)
+    forged = run(hub.device_heartbeat(revoked, headers, path, raw, PEER))
+    assert body(forged)["error"] == "bad_signature" and "X-Hands-Signature" not in forged.headers
+    assert store.revoked_key(device.device_id) == device.public
+    _, headers, path, raw = device.request("/device/heartbeat", beat)
+    reply = run(hub.device_heartbeat(revoked, headers, path, raw, PEER))
     assert reply.status == 401
     assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "unknown_device"
-    # The request itself must still be signed by the tombstoned key; a forgery gets nothing signed.
-    _, headers, path, raw = device.request("/device/poll", {"wait": 0}, tamper=True)
-    forged = run(hub.device_poll(revoked, headers, path, raw, PEER))
-    assert body(forged)["error"] == "bad_signature" and "X-Hands-Signature" not in forged.headers
+    assert f"revoked device {device.device_id} called from {PEER}" in caplog.text
+    assert store.revoked_key(device.device_id) is None
+    _, headers, path, raw = device.request("/device/heartbeat", beat)
+    again = run(hub.device_heartbeat(revoked, headers, path, raw, PEER))
+    assert again.status == 401 and "X-Hands-Signature" not in again.headers
+    # Revoked after the token seam vouched for the device: the same signed reply.
+    other = Device("desk")
+    store.revoke("desk")
+    reply, path, headers = device_call(hub, other, "device_poll", "/device/poll", {"wait": 0})
+    assert reply.status == 401
+    assert verified(hub, reply, path, nonce=bearer_nonce(headers))["error"] == "unknown_device"
 
 
 def test_revoked_between_the_checks_still_gets_the_signed_stop(hub, monkeypatch):
@@ -288,7 +295,7 @@ def test_policy_change_fails_running_job_and_refuses_device(hub):
     assert (out["done"], out["returncode"], out["error"]) == (
         True,
         255,
-        messages.policy_changed("laptop"),
+        messages.policy_changed_while_running("laptop"),  # V57: it was picked, so it may have run
     )
     reply, path, _ = device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
     assert reply.status == 409
@@ -378,6 +385,17 @@ def test_revoke_mid_command_fails_the_wait(hub):
     assert (cancel["type"], cancel["target_job_id"]) == ("cancel", job_id)
 
 
+def test_a_job_queued_for_a_device_that_then_went_offline_says_nothing_ran(hub, monkeypatch):
+    """V59: the device never picked it, so the relay knows it did not run."""
+    Device()
+    job_id = body(local(hub, "local_exec", {"device": "laptop", "script": "true", "timeout": 5}))[
+        "job_id"
+    ]
+    monkeypatch.setattr(store, "OFFLINE_AFTER", -1)
+    out = body(local(hub, "local_output", {"job_id": job_id, "after": 0, "wait": 2}))
+    assert (out["done"], out["error"]) == (True, messages.offline("laptop"))
+
+
 def test_device_going_offline_fails_the_wait(hub, monkeypatch):
     device = Device()
     job_id = body(
@@ -459,25 +477,24 @@ def test_exec_job_carries_stdin_and_both_texts_are_bounded(hub, monkeypatch):
     assert local(hub, "local_exec", fits).status == 200
 
 
-def test_agent_restart_fails_its_picked_jobs_at_once(hub):
-    """W3: a new agent instance means the old process's picked jobs are lost; they fail with an
-    honest message and a cancel, while a job it never picked goes to the new agent."""
+def test_agent_restart_fails_its_picked_jobs_once_the_old_agent_is_quiet(hub, monkeypatch):
+    """W3: once the agent that picked a job has fallen quiet while a new one keeps in touch, the
+    job fails with an honest message and a cancel; a job it never picked goes to the new agent."""
     device = Device()
     beat = {"policy_hash": "p0", "os": "x", "home": "y", "agent_version": "0.1.0"}
     device_call(hub, device, "device_heartbeat", "/device/heartbeat", {**beat, "instance": "a1"})
     exec_request = {"device": "laptop", "script": "sleep 9", "timeout": 30}
     picked = body(local(hub, "local_exec", exec_request))["job_id"]
     device_call(hub, device, "device_poll", "/device/poll", {"wait": 0, "instance": "a1"})
-    device_call(hub, device, "device_heartbeat", "/device/heartbeat", {**beat, "instance": "a1"})
-    device_call(hub, device, "device_poll", "/device/poll", {"wait": 0})
-    assert not hub._jobs[picked].done  # same instance, or none sent: nothing changes
     waiting = body(local(hub, "local_exec", exec_request))["job_id"]
-    # The new agent's poll gets the job the old one never picked, then the cancel for the other.
     reply, path, _ = device_call(
         hub, device, "device_poll", "/device/poll", {"wait": 0, "instance": "b2"}
     )
     assert verified(hub, reply, path)["job_id"] == waiting
-    out = body(local(hub, "local_output", {"job_id": picked, "after": 0, "wait": 0}))
+    out = body(local(hub, "local_output", {"job_id": picked, "after": 0, "wait": 1.5}))
+    assert out["done"] is False  # a1 was heard a moment ago: it may simply be a second agent
+    monkeypatch.setattr(relay, "_INSTANCE_QUIET", 0)
+    out = body(local(hub, "local_output", {"job_id": picked, "after": 0, "wait": 2}))
     assert (out["done"], out["returncode"], out["error"]) == (
         True,
         relay.UNREACHABLE,
@@ -488,6 +505,28 @@ def test_agent_restart_fails_its_picked_jobs_at_once(hub):
     )
     assert verified(hub, reply, path)["target_job_id"] == picked
     assert not hub._jobs[waiting].done
+
+
+def test_two_live_agents_for_one_device_never_end_each_others_polls_again(hub):
+    """V21 and V22: two agents that both keep in touch take turns at jobs; neither ends the other's
+    parked poll after their first meeting, so there is no poll storm and no job fails."""
+    device = Device()
+    device_call(hub, device, "device_poll", "/device/poll", {"wait": 0, "instance": "a1"})
+    device_call(hub, device, "device_poll", "/device/poll", {"wait": 0, "instance": "b2"})
+    parked = started(
+        lambda: device_call(
+            hub, device, "device_poll", "/device/poll", {"wait": 3, "instance": "a1"}
+        )
+    )
+    until_waiting(hub, device.device_id)
+    begun = time.monotonic()
+    for _ in range(3):
+        quick, _, _ = device_call(
+            hub, device, "device_poll", "/device/poll", {"wait": 0, "instance": "b2"}
+        )
+        assert quick.status == 204
+    reply, _, _ = parked()
+    assert reply.status == 204 and time.monotonic() - begun > 2.5  # it ran to its own deadline
 
 
 def test_restart_seen_in_a_heartbeat_ends_the_old_agents_parked_poll(hub):

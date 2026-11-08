@@ -82,17 +82,22 @@ def _doctor() -> int:
             executable = probe.stdout.strip()
             if not executable:
                 continue
-            version = subprocess.run([bash, "-c", f'{command} -c "import sys; print(sys.version)"'], capture_output=True, text=True, encoding="utf-8", timeout=5)
+            try:
+                version = subprocess.run([bash, "-c", f'{command} -c "import sys; print(sys.version)"'], capture_output=True, text=True, encoding="utf-8", timeout=20)
+            except subprocess.TimeoutExpired:
+                print(f"python in bash: {command} timed out while starting")
+                continue
             if version.returncode == 0 and version.stdout.strip():
                 print(f"python in bash: {executable} ({version.stdout.strip().splitlines()[0]})")
-                python_found = True
+                if command == "python3":
+                    python_found = True
                 continue
             if "windowsapps" in executable.lower():
                 print(f"python in bash: {executable} is the WindowsApps alias and did not run")
             else:
                 print(f"python in bash: {executable} did not run ({version.stdout.strip() or version.stderr.strip()})")
         if not python_found:
-            failures.append("working Python in Git Bash")
+            failures.append("working python3 in Git Bash")
     git_bash = shutil.which("git")
     print(f"git: {git_bash or 'missing'}")
     if sys.platform == "win32" and not git_bash:
@@ -129,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     install_service = subs.add_parser("install-service")
     install_service.add_argument("--dry-run", action="store_true")
     install_service.add_argument("--remove", action="store_true")
+    install_service.add_argument("--allow-screen", action="store_true")
     pol = subs.add_parser("policy")
     pol.add_argument("action", choices=("show", "reset"))
     subs.add_parser("unpair")
@@ -150,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return _doctor()
     if args.command == "install-service":
-        return service.install(dry_run=args.dry_run, remove=args.remove)
+        return service.install(dry_run=args.dry_run, remove=args.remove, allow_screen=args.allow_screen)
     if args.command == "policy":
         if args.action == "show":
             policy.show()

@@ -82,7 +82,25 @@ def test_device_listing_and_revoke_frees_the_name(hands_db):
     assert store.revoked_key(device_id) == b"k" * 32  # the tombstone keeps the key
     again = _pair("laptop")
     assert [d["device_id"] for d in store.list_devices()] == [again]
-    assert store.revoked_key(again) is None and store.revoked_key(device_id) == b"k" * 32
+    # V14: pairing the name again ends the old key's tombstone.
+    assert store.revoked_key(again) is None and store.revoked_key(device_id) is None
+
+
+def test_tombstones_end_once_told_or_after_their_ttl(hands_db, monkeypatch):
+    first, second = _pair("laptop"), _pair("desk")
+    store.revoke("laptop")
+    store.revoke("desk")
+    store.forget_revoked(first)
+    assert store.revoked_key(first) is None and store.revoked_key(second) == b"k" * 32
+    later = time.time() + store.TOMBSTONE_TTL + 1
+    monkeypatch.setattr(time, "time", lambda: later)
+    assert store.revoked_key(second) is None
+    _pair("other")
+    store.revoke("other")  # a revoke also clears expired tombstones from the table
+    conn = sqlite3.connect(hands_db / "hands.db")
+    rows = conn.execute("SELECT device_id FROM revoked_devices").fetchall()
+    conn.close()
+    assert second not in {row[0] for row in rows} and len(rows) == 1
 
 
 def test_revoke_keeps_a_tombstone_in_a_hands_db_from_before_tombstones(hands_db):
@@ -104,6 +122,25 @@ def test_revoke_keeps_a_tombstone_in_a_hands_db_from_before_tombstones(hands_db)
     assert store.get_device("laptop")["device_id"] == "d1"
     assert store.revoke("laptop") is True
     assert store.revoked_key("d1") == b"k" * 32 and store.get_device("laptop") is None
+
+
+def test_a_round_two_tombstone_table_gains_its_name_column_in_place(hands_db):
+    conn = sqlite3.connect(hands_db / "hands.db")
+    conn.execute(
+        "CREATE TABLE revoked_devices (device_id TEXT PRIMARY KEY, public_key TEXT NOT NULL,"
+        " revoked_at INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO revoked_devices VALUES ('old', ?, ?)",
+        (protocol.b64u(b"k" * 32), int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+    assert store.revoked_key("old") == b"k" * 32
+    _pair("laptop")
+    assert store.revoke("laptop") is True
+    _pair("laptop")  # clears only the laptop's own tombstone
+    assert store.revoked_key("old") == b"k" * 32
 
 
 def test_offline_after_last_seen(hands_db, monkeypatch):

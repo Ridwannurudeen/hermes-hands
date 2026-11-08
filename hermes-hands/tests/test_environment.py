@@ -5,6 +5,7 @@ Relay and the loopback client. Skipped when Hermes is not importable."""
 import base64
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -126,7 +127,7 @@ class FakeHandle:
         FakeHandle.jobs.append({"script": script, "stdin": stdin, "login": login})
         read_fd, write_fd = os.pipe()
         os.close(write_fd)
-        self.stdout = os.fdopen(read_fd, "r")
+        self.stdout = os.fdopen(read_fd, "r", encoding="utf-8-sig")
         self.returncode = 0
 
     def poll(self):
@@ -180,9 +181,12 @@ def test_terminal_and_cd_on_the_device(laptop):
         assert note.startswith("hands: now on laptop (") and output.strip() == "device"
         assert agent.jobs[0]["login"] is True  # init_session's bootstrap ran on first use
         assert env._subs["laptop"]._snapshot_ready  # the login snapshot works under this bash
-        assert env.execute("mkdir -p sub && cd sub")["returncode"] == 0
-        assert env.execute("pwd")["output"].strip().endswith("/sub")
-        assert "hands:" not in env.execute("echo again", bounded_capture=True)["output"]
+        assert run_terminal(env, "mkdir -p sub && cd sub")["returncode"] == 0
+        again = run_terminal(env, "pwd")
+        assert again["output"].strip().endswith("/sub") and "hands:" not in again["output"]
+        # Only a terminal command moves the cwd (core records only those): not a file tool's own cd.
+        assert env.execute("cd ..")["returncode"] == 0
+        assert run_terminal(env, "pwd")["output"].strip().endswith("/sub")
 
 
 def test_stdin_travels_beside_the_script_byte_exact(laptop):
@@ -242,13 +246,13 @@ def test_offline_after_success_keeps_cwd(laptop, monkeypatch):
     hub, device, home = laptop
     env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
     with Agent(hub, device, bash_job):
-        env.execute("mkdir -p kept && cd kept")
+        run_terminal(env, "mkdir -p kept && cd kept")
     monkeypatch.setattr(store, "OFFLINE_AFTER", -1)
-    offline = env.execute("pwd")
+    offline = run_terminal(env, "pwd")
     assert offline["returncode"] == relay.UNREACHABLE and "offline" in offline["output"]
     monkeypatch.setattr(store, "OFFLINE_AFTER", 20)
     with Agent(hub, device, bash_job):
-        assert env.execute("pwd")["output"].strip().endswith("/kept")
+        assert run_terminal(env, "pwd")["output"].strip().endswith("/kept")
 
 
 def test_timeout_is_cores_124_and_cancels_the_job(laptop):
@@ -334,12 +338,13 @@ def test_a_workdir_runs_where_it_says_after_a_switch(laptop):
         assert there["cwd"] == f"{device_path(str(home))}/proj"
 
 
-def test_a_device_starts_in_its_home_whatever_the_gateway_cwd(laptop, tmp_path):
+def test_a_device_starts_in_its_home_whatever_the_gateway_cwd(laptop, tmp_path, monkeypatch):
     """The fake device is this machine, so the gateway directory exists there: only the target
     decides where the command starts."""
     hub, device, home = laptop
     configured = tmp_path / "gateway project"  # terminal.cwd on the gateway
     configured.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(configured))
     with Agent(hub, device, bash_job):
         env = HandsEnvironment(Ctx(), cwd=str(configured), timeout=30)
         assert env.cwd == device_path(str(home))
@@ -367,6 +372,124 @@ def test_the_server_keeps_the_session_cwd_after_a_workdir_command(laptop):
     assert elsewhere["output"].strip().rstrip("/").endswith("other")
     after = env.execute("pwd", cwd="~", bounded_capture=True)
     assert after["output"].strip().rstrip("/").endswith("proj"), after
+
+
+def last_line(result):
+    return result["output"].strip().splitlines()[-1]
+
+
+def test_a_first_command_that_prints_no_cwd_keeps_the_other_targets_cwd_away(laptop, monkeypatch):
+    """Core records the cwd only from a command that printed where it ended: offline, refused or
+    exited early, the first command on the new target leaves the old target's record in place."""
+    from tools import terminal_tool
+
+    hub, device, home = laptop
+    store.set_session_target("s1", "server")
+    env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+    run_terminal(env, "true")
+    terminal_tool.record_session_cwd("s1", "/opt/srvapp")
+    store.set_session_target("s1", "laptop")
+    monkeypatch.setattr(store, "OFFLINE_AFTER", -1)
+    assert run_terminal(env, "pwd")["returncode"] == relay.UNREACHABLE
+    monkeypatch.setattr(store, "OFFLINE_AFTER", 20)
+    with Agent(hub, device, bash_job):
+        assert run_terminal(env, "exit 3")["returncode"] == 3
+        assert run_terminal(env, "pwd", workdir=device_path(str(home)))["returncode"] == 0
+        first = run_terminal(env, "pwd")
+        assert first["returncode"] == 0 and first["cwd"] == device_path(str(home)), first
+        run_terminal(env, "mkdir -p proj && cd proj")
+        store.set_session_target("s1", "server")
+        assert run_terminal(env, "exit 3")["returncode"] == 3
+        assert last_line(run_terminal(env, "pwd")).rstrip("/").endswith("srv")
+
+
+def test_a_workspace_override_never_becomes_the_device_cwd(laptop):
+    """A TUI, ACP or Desktop workspace is recorded as the session's cwd (terminal_tool.py:350-362)."""
+    from tools import terminal_tool
+
+    hub, device, home = laptop
+    with Agent(hub, device, bash_job):
+        env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        terminal_tool._active_environments["s1"] = env
+        try:
+            run_terminal(env, "true")
+            terminal_tool.register_task_env_overrides("s1", {"cwd": "/srv/workspace"})
+            first = run_terminal(env, "pwd")
+            assert first["returncode"] == 0 and first["cwd"] == device_path(str(home)), first
+            terminal_tool.register_task_env_overrides("s1", {"cwd": "/srv/workspace"})
+            fresh = HandsEnvironment(Ctx(), cwd="/srv/workspace", timeout=30)  # after a restart
+            again = run_terminal(fresh, "pwd")
+            assert again["returncode"] == 0 and again["cwd"] == device_path(str(home)), again
+        finally:
+            terminal_tool._active_environments.pop("s1", None)
+            terminal_tool.clear_task_env_overrides("s1")
+
+
+def test_a_workdir_never_moves_where_the_next_command_starts(laptop, monkeypatch):
+    """Without a session key core keys the record by task id (terminal_tool.py:1530); a workdir
+    command, which core never records, is the session's first or a later one."""
+    from tools import terminal_tool
+
+    hub, device, home = laptop
+    store.set_session_target("s1", "server")
+    srv = Path(os.environ["MESSAGING_CWD"])
+    (srv / "other").mkdir()
+    env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+    env.execute("pwd", cwd=str(srv / "other"), bounded_capture=True)  # workdir= first
+    assert last_line(env.execute("pwd", cwd="~", bounded_capture=True)).rstrip("/").endswith("srv")
+    monkeypatch.delenv("HERMES_SESSION_KEY")
+    cli = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+
+    def run(command, workdir=None):
+        cwd = terminal_tool._resolve_command_cwd(
+            workdir=workdir, default_cwd="~", session_key="default", env_type="hands", env=cli
+        )
+        result = cli.execute(command, cwd=cwd, bounded_capture=True)
+        if not workdir and result.get("cwd_observed"):
+            terminal_tool.record_session_cwd("default", result["cwd"])
+        return result
+
+    try:
+        run("mkdir -p proj && cd proj")
+        run("pwd", workdir=str(srv / "other"))
+        assert last_line(run("pwd")).rstrip("/").endswith("proj")
+    finally:
+        terminal_tool.clear_session_cwd("default")
+
+
+def test_execute_code_never_moves_the_terminal_cwd(laptop):
+    """execute_code runs on the same environment from "/" (code_kernel_remote.py:98-101)."""
+    from tools import code_kernel_remote
+
+    hub, device, home = laptop
+    with Agent(hub, device, bash_job):
+        env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        assert run_terminal(env, "pwd")["cwd"] == device_path(str(home))
+        assert code_kernel_remote._sh(env, "pwd").strip().endswith("/")
+        assert run_terminal(env, "pwd")["cwd"] == device_path(str(home))
+        assert env.cwd == device_path(str(home))
+
+
+def test_a_workdir_equal_to_the_creation_cwd_is_honoured_on_a_device(laptop):
+    hub, device, home = laptop
+    proj = f"{device_path(str(home))}/proj"
+    (home / "proj" / "sub").mkdir(parents=True)
+    with Agent(hub, device, bash_job):
+        env = HandsEnvironment(Ctx(), cwd=proj, timeout=30)  # the record core recreated it with
+        run_terminal(env, "cd proj/sub")
+        assert run_terminal(env, "pwd", workdir=proj)["cwd"] == proj
+
+
+def test_a_new_conversation_in_the_same_chat_gets_the_note(laptop, monkeypatch):
+    """/new keeps the session key, so core hands the fresh conversation the same object."""
+    hub, device, home = laptop
+    with Agent(hub, device, bash_job):
+        env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        monkeypatch.setenv("HERMES_SESSION_ID", "first")
+        assert run_terminal(env, "true")["output"].startswith("hands: now on laptop")
+        assert "hands:" not in run_terminal(env, "true")["output"]
+        monkeypatch.setenv("HERMES_SESSION_ID", "second")
+        assert run_terminal(env, "true")["output"].startswith("hands: now on laptop")
 
 
 def test_backend_survives_core_per_turn_teardown(laptop):
@@ -420,7 +543,7 @@ def test_store_failure_never_raises_into_core_and_runs_nothing(laptop, monkeypat
     assert result == {"output": messages.STORE_DOWN, "returncode": relay.UNREACHABLE}
     assert not marker.exists()
     secret = Path(server_cwd) / "gateway.txt"
-    secret.write_text("gateway-only\n")
+    secret.write_text("gateway-only\n", encoding="utf-8")
     read = ShellFileOperations(env).read_file(str(secret))
     assert "gateway-only" not in json.dumps(read.to_dict()) and read.error
     with pytest.raises(sqlite3.Error):
@@ -473,13 +596,13 @@ def test_inline_output_limit_applies_to_terminal_calls_only(laptop):
         assert x_runs(env.execute(command)["output"]) == 40000  # file reads keep every byte
 
 
-def test_gateway_home_maps_only_inside_a_file_tools_quoted_path(wired, monkeypatch):
+def test_gateway_home_maps_only_a_file_tools_path_words(wired, monkeypatch):
     monkeypatch.setattr(environment, "_gateway_home", lambda: "/home/gw")
     env = device_env()
     assert env._file_command("cat '/home/gw/a b.txt'") == "cat '/c/Users/r b/a b.txt'"
     assert env._file_command("cat '/home/gw'") == "cat '/c/Users/r b'"
+    assert env._file_command("cd /home/gw && ls") == "cd '/c/Users/r b' && ls"
     for untouched in (
-        "cd /home/gw && ls",
         "cat '/home/gwx/a'",
         "cat '/srv/home/gw/a'",
         "cat 'x/home/gw/a'",
@@ -525,7 +648,9 @@ class Capture:
 
     def execute(self, command, cwd="", **kwargs):
         self.commands.append(command)
-        return {"output": "", "returncode": 0}
+        answers = {"test -e ": "exists", "command -v grep ": "yes"}  # rg missing: core's grep lane
+        output = next((out for start, out in answers.items() if command.startswith(start)), "")
+        return {"output": output, "returncode": 0}
 
 
 def snippet_program(command: str) -> str:
@@ -557,6 +682,68 @@ def test_a_windows_path_core_joined_onto_the_base_becomes_the_drive_path(wired):
         assert windows._file_path(joined) == "/c/Users/me/n.txt"
         assert device_env("/c/Users/dev")._file_path(joined) == joined  # only Windows devices
     assert windows._file_path("/c/Users/dev/a:b.txt") == "/c/Users/dev/a:b.txt"
+    assert windows._file_path("file:///C:/Users") == "file:///C:/Users"  # not joined onto a base
+
+
+def test_search_patterns_reach_the_device_as_given(wired, monkeypatch):
+    """Core quotes a pattern like a path (file_operations_search.py:1360, 1379); the search path is
+    the model's own, never expanded on the gateway (file_tools.py:1102)."""
+    from tools.file_operations import ShellFileOperations
+
+    monkeypatch.setattr(environment, "_gateway_home", lambda: "/home/gw")
+    capture = Capture()
+    for pattern in ("/home/gw/.cache", "file:///C:/Users"):
+        ShellFileOperations(capture).search(pattern=pattern, path="/c/Users/dev", target="content")
+    searches = [c for c in capture.commands if "/home/gw/.cache" in c or "file:///C:/" in c]
+    assert any("/home/gw/.cache" in c for c in searches) and any("file:///" in c for c in searches)
+    for device in (device_env("/c/Users/dev", windows=True), device_env("/home/alice")):
+        for command in searches:
+            assert device._file_command(command) == command
+
+
+def test_an_unquoted_gateway_home_path_maps_too(wired, monkeypatch):
+    """shlex.quote leaves a safe path bare, as image_source.py:279 sends it."""
+    monkeypatch.setattr(environment, "_gateway_home", lambda: "/home/gw")
+    command = "head -c 52428801 < /home/gw/shot.png | base64 | tr -d '\\n'"
+    mapped = device_env("/c/Users/r b")._file_command(command)
+    assert mapped == "head -c 52428801 < '/c/Users/r b/shot.png' | base64 | tr -d '\\n'"
+    assert device_env()._file_command("cat /home/gwx/a /srv/home/gw/a") == (
+        "cat /home/gwx/a /srv/home/gw/a"
+    )
+
+
+def linux_atomic_write(home: str, windows_path: str) -> str:
+    """Core's atomic write of ``windows_path`` as a Linux gateway builds it: joined onto the base,
+    backslashes kept (local.py:186) and the parent taken with posixpath (file_operations.py:587)."""
+    from tools.file_operations import ShellFileOperations
+
+    capture = Capture()
+    ShellFileOperations(capture)._atomic_write("/placeholder/n.txt", "x")
+    joined = f"{home}/{windows_path}"
+    return (
+        capture.commands[-1]
+        .replace("d='/placeholder'", f"d={shlex.quote(posixpath.dirname(joined))}")
+        .replace("t='/placeholder/n.txt'", f"t={shlex.quote(joined)}")
+    )
+
+
+def test_a_windows_path_write_from_a_linux_gateway_gets_its_real_parent(wired):
+    script = linux_atomic_write("/c/Users/dev", "C:\\Users\\me\\new\\n.txt")
+    assert "d=/c/Users/dev; t='/c/Users/dev/C:\\Users\\me\\new\\n.txt'; " in script
+    mapped = device_env("/c/Users/dev", windows=True)._file_command(script)
+    assert "d=/c/Users/me/new; t=/c/Users/me/new/n.txt; " in mapped
+
+
+@windows_device
+def test_a_windows_path_write_into_a_new_folder_lands(laptop, tmp_path):
+    hub, device, home = laptop
+    target = tmp_path / "elsewhere" / "new folder" / "n.txt"
+    with Agent(hub, device, bash_job):
+        env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+        script = linux_atomic_write(device_path(str(home)), str(target))
+        result = env.execute(script, stdin_data="landed\n")
+        assert result["returncode"] == 0, result
+    assert target.read_bytes() == b"landed\n" and list(home.iterdir()) == []
 
 
 @windows_device
@@ -565,11 +752,11 @@ def test_delete_on_a_windows_device_deletes_the_file(file_tools_on_laptop):
 
     file_tools, home = file_tools_on_laptop
     for name in ("victim.txt", "naïve.txt", "O'Brien.txt"):
-        (home / name).write_text("x\n")
+        (home / name).write_text("x\n", encoding="utf-8")
         env = file_tools._get_file_ops("t1").env
         result = ShellFileOperations(env).delete_file(f"{device_path(str(home))}/{name}")
         assert result.error is None and not (home / name).exists(), (name, result.to_dict())
-    (home / "gone.txt").write_text("x\n")
+    (home / "gone.txt").write_text("x\n", encoding="utf-8")
     patch = f"*** Begin Patch\n*** Delete File: {device_path(str(home))}/gone.txt\n*** End Patch\n"
     deleted = json.loads(file_tools.patch_tool(mode="patch", patch=patch, task_id="t1"))
     assert not deleted.get("error") and not (home / "gone.txt").exists(), deleted
@@ -742,6 +929,7 @@ class FakeSub:
         self.alive = True
         self.commands = []
         self.cwd = "/"
+        self.answer = None  # what the probe and the kill get instead, when set
 
     def get_temp_dir(self):
         return "/tmp"
@@ -750,6 +938,8 @@ class FakeSub:
         self.commands.append(command)
         if "nohup bash -lc" in command:
             return {"output": f"{self.pids.pop(0)}\n", "returncode": 0}
+        if self.answer is not None and command.startswith("kill "):
+            return dict(self.answer)
         if command.startswith("kill -0 "):
             return {"output": "0" if self.alive else "1", "returncode": 0}
         if ".exit" in command:
@@ -801,3 +991,61 @@ def test_background_kill_routing_is_keyed_by_pid_and_target(laptop):
             session._reader_thread.join(10)
             assert process_registry.get(session.id).exited
             assert not session._reader_thread.is_alive()
+
+
+def end_jobs(sessions, *subs):
+    """Let every poller finish, so none outlives the test (process_registry.py:1460-1470)."""
+    from tools.process_registry import process_registry
+
+    for sub in subs:
+        sub.alive, sub.answer = False, None
+    for session in sessions:
+        process_registry.kill_process(session.id)
+    for session in sessions:
+        session._reader_thread.join(10)
+        assert not session._reader_thread.is_alive()
+
+
+def test_a_pid_counts_on_a_target_only_while_its_job_runs(laptop):
+    from tools.process_registry import process_registry
+
+    env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+    server, device = FakeSub([4242]), FakeSub([4242])
+    env._subs = {"server": server, "laptop": device}
+    sessions = []
+    try:
+        sessions.append(process_registry.spawn_via_env(env, "sleep 30", task_id="on-device"))
+        store.set_session_target("s1", "server")
+        sessions.append(process_registry.spawn_via_env(env, "sleep 30", task_id="on-server"))
+        server.alive = False  # the server's job ends; the poller reads its exit file
+        sessions[1]._reader_thread.join(10)
+        assert env._background_pids == {4242: {"laptop"}}
+        assert process_registry.kill_process(sessions[0].id)["status"] == "killed"
+        assert "kill 4242 2>/dev/null" in device.commands
+    finally:
+        end_jobs(sessions, server, device)
+
+
+def test_a_device_that_cannot_answer_keeps_its_job_tracked_and_unkilled(laptop):
+    from tools.process_registry import process_registry
+
+    env = HandsEnvironment(Ctx(), cwd="~", timeout=30)
+    device = FakeSub([31])
+    env._subs = {"laptop": device}
+    sessions = []
+    try:
+        sessions.append(process_registry.spawn_via_env(env, "sleep 30", task_id="quiet"))
+        # A sleeping laptop is still online for 20 s, so the probe meets core's own 5 s timeout.
+        device.answer = {"output": "[Command timed out after 5s]", "returncode": 124}
+        time.sleep(4.5)
+        assert not process_registry.get(sessions[0].id).exited
+        device.answer = {"output": messages.offline("laptop"), "returncode": relay.UNREACHABLE}
+        refused = process_registry.kill_process(sessions[0].id)
+        assert refused["status"] == "error" and "offline" in refused["error"]
+        assert not process_registry.get(sessions[0].id).exited
+        device.answer = {"output": messages.unknown_device("laptop"), "returncode": 255}
+        sessions[0]._reader_thread.join(10)
+        gone = process_registry.get(sessions[0].id)
+        assert gone.exited and gone.completion_reason == "lost"
+    finally:
+        end_jobs(sessions, device)

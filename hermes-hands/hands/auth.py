@@ -8,7 +8,11 @@ fresh bearer signed by a revoked device's key (its tombstone) gets a ``hands:rev
 the relay can answer a signed ``401 unknown_device``, which tells the device to stop. Any other
 bearer, an unknown device_id included, gets None: core's token seam asks every provider about every
 token route and lets any principal through (``token_auth.py:57-86``), so a principal minted for a
-token Hands cannot verify would open other plugins' token routes, such as core's drain route.
+token Hands cannot verify would open other plugins' token routes, such as core's drain route. The
+same seam means every genuine Hands credential still opens those routes: a paired device's bearer,
+a revoked key until the relay has told it to stop (at most ``store.TOMBSTONE_TTL``), a live pairing
+code and the gateway's local bearer. Core gives ``verify_token`` no path, so the plugin cannot
+narrow that.
 """
 
 from __future__ import annotations

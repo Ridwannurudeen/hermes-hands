@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 
 from . import client, messages, store
@@ -17,6 +18,21 @@ def _ids(value: object) -> set[str]:
     else:
         items = [value]
     return {str(item).strip() for item in items if str(item).strip()}
+
+
+def _in_shared_chat(source) -> bool:
+    """A group, channel or thread: core gives its participants one session (session.py:690-725)."""
+    return str(getattr(source, "chat_type", "dm") or "dm").strip().lower() not in {"", "dm", "direct", "private"}
+
+
+def terminal_backend() -> str:
+    """The terminal backend Hermes resolves for this profile: config.yaml terminal.backend, else
+    TERMINAL_ENV from the profile .env or this process's environment (terminal_scope.py:114)."""
+    from hermes_constants import get_hermes_home
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    launch = {key: value for key, value in os.environ.items() if key.startswith("TERMINAL_")}
+    return build_profile_terminal_scope(get_hermes_home(), env_overlay=launch).get("TERMINAL_ENV", "")
 
 
 def _is_owner(ctx, platform: str, source) -> bool:
@@ -40,10 +56,7 @@ def _is_owner(ctx, platform: str, source) -> bool:
             None,
         )
         extra = getattr(platform_config, "extra", {}) if platform_config else {}
-        is_group = str(getattr(source, "chat_type", "dm") or "dm").strip().lower() not in {
-            "", "dm", "direct", "private"
-        }
-        allowed = _ids(extra.get("group_allow_admin_from" if is_group else "allow_admin_from"))
+        allowed = _ids(extra.get("group_allow_admin_from" if _in_shared_chat(source) else "allow_admin_from"))
         return str(user_id) in allowed
     except Exception:
         return False
@@ -64,6 +77,9 @@ def register_commands(ctx, *, has_seed: bool) -> None:
                     client.state()
                 except client.HandsError as exc:
                     relay, cause = "down", [str(exc)]
+                else:
+                    if not store.relay_alive():  # the relay started, so it wrote its heartbeat
+                        relay, cause = "down", [messages.STORE_SPLIT]
             target = store.get_session_target(session_key) if session_key else None
             status = f"Hands: relay {relay}; target {target or ctx.get_config('default_target', default='server')}; {len(devices)} device(s)."
             alerts = messages.alerts(devices)
@@ -90,6 +106,8 @@ def register_commands(ctx, *, has_seed: bool) -> None:
             return f"Usage: /hands {action} <name>"
         name = args[1]
         if action == "pair":
+            if _in_shared_chat(source):
+                return messages.PAIR_DIRECT_ONLY
             if not has_seed:
                 return messages.NOT_SET_UP
             code = store.mint_pairing_code(name)
@@ -104,9 +122,9 @@ def register_commands(ctx, *, has_seed: bool) -> None:
             command = f"hermes-hands pair {gateway_url} --name {shlex.quote(name)} --code={shlex.quote(code)}"
             return f"Pair code: {code}\nRun on the device: {command}"
         if action == "use":
-            from hermes_cli.config import load_config_readonly
-
-            backend = ((load_config_readonly() or {}).get("terminal") or {}).get("backend")
+            if name != "server" and _in_shared_chat(source):
+                return messages.USE_DIRECT_ONLY
+            backend = terminal_backend()
             if name != "server" and backend != "hands":
                 return (
                     f"Hands: terminal.backend is {backend or 'not set'}, not hands, so commands would still run on "

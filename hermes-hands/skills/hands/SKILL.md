@@ -8,7 +8,7 @@ description: "Work on a paired Hermes Hands device: Git Bash paths on Windows, w
 When the user points this conversation at a device with `/hands use <device>`, your `terminal`,
 `read_file`, `write_file`, `patch` and `search_files` calls run on that device as its user, not on
 the Hermes server. `/hands use server` points them back at the server. Only the user switches the
-target, and a switch applies from the next command. The target belongs to the chat, so `/new` and
+target, from a direct chat with the bot, and a switch applies from the next command. The target belongs to the chat, so `/new` and
 `/reset` keep it: a fresh conversation in a chat that was on a device still runs there.
 
 ## Know where you are
@@ -23,13 +23,12 @@ Take paths from the note's home. Do not reuse paths from the server (or from ano
 a switch; they do not exist there. `hands_devices` lists the paired devices and whether each is
 online.
 
-Terminal commands on a device start in its home folder. File tools learn the device's working folder
-only from a terminal command, so right after a switch to a device run one first (`pwd` or `cd ~`),
-or give file tools absolute paths (`/c/...` on Windows) or `~/...` paths. Until then a relative path
-in a file tool can still resolve against the server's working folder.
+Terminal commands on a device start in its home folder. File tools do not follow the device's
+working folder, not even after a `cd`, so on a device always give `read_file`, `write_file`, `patch`
+and `search_files` absolute device paths built from the note's home (`/c/Users/ridwan/...` on
+Windows, `/home/ridwan/...` on Linux). A relative path can land in a different folder.
 
-Hermes passes no sudo password to a device, so `sudo` there works only if that device allows it
-without one.
+Do not use `sudo` on a device: its default deny list refuses it with exit 126.
 
 ## Windows devices (Git Bash)
 
@@ -38,12 +37,14 @@ without one.
   is `/c/Users/ridwan/notes.txt`, `D:\work` is `/d/work`. Forward slashes, lowercase drive letter.
 - Quote paths with spaces: `"/c/Users/ridwan/My Projects/app"`.
 - Prefer absolute paths built from the note's home over `~`.
-- Native Windows programs that take `/switch` arguments (`cmd`, `tasklist`, `taskkill`, `ipconfig`,
-  `schtasks`) need the slash doubled, because Git Bash turns `/c` or `/FO` into a path:
-  `cmd //c dir`, `tasklist //FO CSV`, `ipconfig //all`. With a single slash, `cmd /c ...` runs
-  nothing and still exits 0. You can instead start the command with `MSYS_NO_PATHCONV=1`, as in
-  `MSYS_NO_PATHCONV=1 tasklist /FO CSV`, but only when it has no `/c/...` path arguments: those
-  stop working then. Leave path conversion on for everything else.
+- Git Bash turns a `/switch` argument of a native Windows program (`cmd`, `tasklist`, `ipconfig`,
+  `taskkill`, `schtasks`) into a path, so `cmd /c ...` runs nothing and still exits 0. Run such a
+  program with `MSYS_NO_PATHCONV=1` in front and its switches written normally, with one slash:
+  `MSYS_NO_PATHCONV=1 tasklist /FO CSV`, `MSYS_NO_PATHCONV=1 ipconfig /all`. Never double the slash
+  (`//c`, `//F`): that spelling hides the command from Hermes's approval check, which only knows the
+  single slash form. Under `MSYS_NO_PATHCONV=1`, write that program's path arguments in Windows form,
+  quoted, such as `'C:\Users\ridwan\notes.txt'`, because `/c/...` paths stop working there. Leave
+  path conversion on for everything else.
 - Root `search_files` at the narrowest folder you can (`/c/Users/ridwan/projects`), not the home
   folder or a drive root: there it walks every file under that root, AppData included, which is slow.
 
@@ -78,6 +79,8 @@ it, so it may have partly run or may still be running there, and any output you 
 - `contact with the relay was lost after the command started on ..., so it may still be running there`
 - `the device agent on ... restarted while the command ran, so it may have partly run there`
 - `... went offline before the command finished; any output above is partial`
+- `the deny-list on ... changed since it was paired, so the relay stopped the command, which may have
+  partly run there` (tell the user; only they can accept the new policy with `/hands accept-policy`)
 
 Do not run it again until you have checked its effect on the device (with `ls`, `git status` or
 `ps`, say), and tell the user what you found.

@@ -112,6 +112,27 @@ def test_screen_requires_explicit_flag():
         screen.capture(allow_screen=False)
 
 
+def test_screen_capture_uses_pillow_png_methods(monkeypatch):
+    shot = types.SimpleNamespace(size=(2, 2), rgb=bytes(12))
+
+    class Capture:
+        monitors = [None, object()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def grab(self, monitor):
+            assert monitor is self.monitors[1]
+            return shot
+
+    monkeypatch.setattr(screen.mss, "mss", Capture)
+    result = screen.capture(allow_screen=True)
+    assert result.startswith(b"\x89PNG\r\n\x1a\n")
+
+
 def test_windows_keyfile_uses_sid_acl_and_atomic_replace(monkeypatch, tmp_path):
     monkeypatch.setattr(keys, "_keyring", lambda: None)
     monkeypatch.setattr(config, "ROOT", tmp_path)

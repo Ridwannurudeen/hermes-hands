@@ -43,6 +43,7 @@ def configure(dashboard_url: str, local_bearer: str | None) -> None:
             base_url=dashboard_url.rstrip("/") + API,
             headers={"Authorization": f"Bearer {local_bearer}"},
             timeout=_OUTPUT_TIMEOUT,
+            trust_env=False,  # loopback only: a proxy must never see the bearer or the job bodies
         )
     )
 

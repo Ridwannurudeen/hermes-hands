@@ -131,8 +131,11 @@ def rig(hands_db, tmp_path, monkeypatch):
     api = make_app(load_plugin_api(), base_url=GATEWAY)
     forgeries: list = []  # each answers one device poll instead of the dashboard
     delivered: list = []  # every job the relay handed the device
+    polls: list = []  # every poll the device sent
 
     def dashboard(request: httpx.Request) -> httpx.Response:
+        if request.url.path == API + "/device/poll":
+            polls.append(time.monotonic())
         if request.url.path == API + "/device/poll" and forgeries:
             return forgeries.pop(0)(request)
         headers = {
@@ -178,6 +181,7 @@ def rig(hands_db, tmp_path, monkeypatch):
         keys=provider.keys,
         forgeries=forgeries,
         delivered=delivered,
+        polls=polls,
         environment=environment,
     )
     agent.stop()
@@ -299,12 +303,13 @@ def test_policy_change_is_refused_until_accepted(rig):
     device_config.POLICY_PATH.write_bytes(edited)
     refused = env.execute("echo after the edit", timeout=15)
     assert refused["returncode"] == 255
-    assert rig.hands.messages.policy_changed("laptop") in refused["output"]
+    changed = "hands: the deny-list on laptop changed since it was paired"
+    assert changed in refused["output"]
     assert rig.hands.store.get_device("laptop")["policy_ok"] is False
     again = env.execute("echo still refused", timeout=15)
     assert (
         again["returncode"] == 255
-        and rig.hands.messages.policy_changed("laptop") in again["output"]
+        and rig.hands.messages.policy_changed("laptop") in again["output"]  # refused at the start
     )
     # The agent must keep polling while refused, or accept-policy cannot bring it back.
     assert not rig.agent.loop.stop_event.is_set(), (
@@ -417,9 +422,11 @@ def test_going_offline_mid_command_cancels_the_job_on_the_device(rig, monkeypatc
     until(lambda: not alive(tree), what="the relay's cancel to stop the job on the device")
 
 
-def test_agent_restart_fails_the_running_job_at_once(rig):
-    """W3 (C48): a new serve process reports a new instance, so the job the old one picked fails at
-    once with a message that it may have partly run, instead of at the gateway's timeout."""
+def test_agent_restart_fails_the_running_job_soon(rig, monkeypatch):
+    """W3 (C48): a new serve process reports a new instance; once the old one has been quiet for
+    ``_INSTANCE_QUIET`` the job it picked fails with a message that it may have partly run, instead
+    of at the gateway's timeout."""
+    monkeypatch.setattr(rig.hands.relay, "_INSTANCE_QUIET", 3)
     env = rig.environment()
     assert env.execute("true")["returncode"] == 0
     outcome = {}
@@ -440,6 +447,24 @@ def test_agent_restart_fails_the_running_job_at_once(rig):
         restarted.stop()
         for process in alive(tree):
             process.kill()
+
+
+def test_two_agents_for_one_device_neither_storm_nor_fail_commands(rig):
+    """V21 and V22: the README says to run one serve per device, but a second one must not turn
+    every command into "agent restarted" or make the two agents poll the relay without pause."""
+    env = rig.environment()
+    assert env.execute("true")["returncode"] == 0
+    second = Agent(rig.transport)
+    try:
+        until(lambda: len(rig.polls) >= 4, what="both agents to poll")
+        before = len(rig.polls)
+        time.sleep(3)
+        assert len(rig.polls) - before < 30, "the two agents end each other's polls"
+        for _ in range(3):
+            result = env.execute("echo both", timeout=15)
+            assert result["returncode"] == 0 and result["output"].strip() == "both", result
+    finally:
+        second.stop()
 
 
 def test_background_job_follows_the_device_across_a_switch(rig):

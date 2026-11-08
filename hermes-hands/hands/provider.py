@@ -61,4 +61,4 @@ class HandsProvider(TerminalEnvironmentProvider):
         # The id core's prompt builder creates its backend probe with (agent/prompt_builder.py:851).
         if task_id == "prompt-backend-probe":
             return ProbeEnvironment(cwd=cwd, timeout=timeout)
-        return HandsEnvironment(self._ctx, cwd=cwd, timeout=timeout)
+        return HandsEnvironment(self._ctx, cwd=cwd, timeout=timeout, task_id=task_id)

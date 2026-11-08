@@ -5,7 +5,7 @@ from __future__ import annotations
 import secrets
 import shlex
 
-from . import client, messages, store
+from . import client, commands, messages, store
 
 
 def register_cli(ctx, *, has_seed: bool) -> None:
@@ -29,9 +29,10 @@ def register_cli(ctx, *, has_seed: bool) -> None:
             else:
                 try:
                     client.state()
-                    print("Relay: up")
                 except client.HandsError as exc:
                     print(f"Relay: down\n{exc}")
+                else:  # the relay started, so it wrote its heartbeat
+                    print("Relay: up" if store.relay_alive() else f"Relay: down\n{messages.STORE_SPLIT}")
             for device in store.list_devices():
                 print(f"{device['name']}: {'online' if device['online'] else 'offline'}")
             return
@@ -70,22 +71,23 @@ def register_cli(ctx, *, has_seed: bool) -> None:
                 print("Relay seed saved. Restart the gateway and dashboard.")
             else:
                 print("Relay seed is already set.")
+            # Before the prompt, so every run shows them, an aborted prompt included.
+            print("Select the Hands backend with: hermes config set terminal.backend hands")
+            print("Set desktop placement with: hermes config set bot_desktop.placement gateway")
+            print("Then restart the gateway and the dashboard.")
             owner_id = input("Owner Telegram user id: ").strip()
             if owner_id:
                 ctx.set_config("owner_ids", [f"telegram:{owner_id}"])
                 print(f"Owner saved: telegram:{owner_id}")
             else:
                 print("Owner id was not saved.")
-            print("Select the Hands backend with: hermes config set terminal.backend hands")
-            print("Set desktop placement with: hermes config set bot_desktop.placement gateway")
-            print("Then restart the gateway and the dashboard.")
             return
         if action == "doctor":
             from hermes_cli.config import load_config_readonly
             from hermes_cli.dashboard_auth import list_interactive_providers
 
             cfg = load_config_readonly() or {}
-            backend = (cfg.get("terminal") or {}).get("backend")
+            backend = commands.terminal_backend()
             dashboard = cfg.get("dashboard") or {}
             public_url = str(dashboard.get("public_url") or "").strip()
             _check(

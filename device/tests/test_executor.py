@@ -132,6 +132,33 @@ def test_background_process_survives_shell_exit(monkeypatch, tmp_path):
             psutil.Process(child_pid).kill()
 
 
+def test_chatty_background_writer_is_bounded_after_shell_exit(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    pid_file = tmp_path / "writer.pid"
+    script_file = tmp_path / "writer.py"
+    script_file.write_text(
+        f"import os, sys, time\nopen({str(pid_file)!r}, 'w').write(str(os.getpid()))\nwhile True:\n print('tick', flush=True)\n time.sleep(0.01)\n",
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    chunks = b"".join(executor.run(f'python "{script_file.as_posix()}" & echo parent-exit', timeout=0.4))
+    elapsed = time.monotonic() - started
+    deadline = time.monotonic() + 1
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if pid_file.exists():
+        child_pid = int(pid_file.read_text(encoding="utf-8-sig"))
+        if psutil.pid_exists(child_pid):
+            psutil.Process(child_pid).kill()
+    assert b"parent-exit" in chunks
+    assert b"tick" in chunks
+    assert elapsed < 3
+
+
 def test_large_script_runs_from_temp_file_and_is_removed(monkeypatch, tmp_path):
     bash = executor.resolve_bash()
     if not bash:
@@ -150,6 +177,20 @@ def test_timeout_kills_process(monkeypatch, tmp_path):
     chunks = b"".join(executor.run("sleep 10", timeout=0.1))
     assert b"timeout" in chunks
     assert time.monotonic() - started < 3
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX deadline timer race")
+def test_posix_timeout_always_reports_timeout_marker(monkeypatch, tmp_path):
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for _ in range(20):
+        exits = []
+        chunks = b"".join(executor.run("sleep 1", timeout=0.01, on_exit=exits.append))
+        assert b"[device timeout]" in chunks
+        assert exits == [124]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process group is covered by timeout test")
@@ -214,6 +255,39 @@ def test_stdin_is_staged_byte_exact_and_removed(monkeypatch, tmp_path):
     assert not list((tmp_path / ".hermes-hands/out").glob("tmp*"))
 
 
+def test_stdin_uses_surrogateescape_and_is_removed(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    raw = b"before\xffafter"
+    stdin = raw.decode("utf-8", errors="surrogateescape")
+    assert b"".join(executor.run("cat", stdin=stdin, timeout=5)) == raw
+    assert not list((tmp_path / ".hermes-hands/out").glob("*.stdin"))
+
+
+def test_orphaned_stdin_files_are_reaped_at_start(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    out = tmp_path / ".hermes-hands" / "out"
+    out.mkdir(parents=True)
+    staged = out / "abandoned.stdin"
+    staged.write_bytes(b"left over from an interrupted run")
+    executor.reap_recorded_processes()
+    assert not staged.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Python UTF-8 environment")
+def test_windows_python_utf8_environment_is_passed_to_child(monkeypatch, tmp_path):
+    bash = executor.resolve_bash()
+    if not bash:
+        pytest.skip("Git Bash is unavailable")
+    monkeypatch.setattr(executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    output = b"".join(executor.run("python -c 'import os; print(os.environ[\"PYTHONUTF8\"] + \" \" + os.environ[\"PYTHONIOENCODING\"])'", timeout=5))
+    assert output.strip() == b"1 utf-8"
+
+
 def test_output_cap_reports_nonzero_exit(monkeypatch, tmp_path):
     bash = executor.resolve_bash()
     if not bash:
@@ -222,8 +296,10 @@ def test_output_cap_reports_nonzero_exit(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(executor, "MAX_OUTPUT", 5)
     exits = []
-    list(executor.run("printf 123456789", timeout=5, on_exit=exits.append))
-    assert exits == [125]
+    capped = []
+    list(executor.run("printf 123456789", timeout=5, on_exit=exits.append, on_capped=lambda: capped.append(True)))
+    assert exits == [0]
+    assert capped == [True]
 
 
 def test_reader_queue_is_bounded():
@@ -239,6 +315,17 @@ def test_recorded_process_is_reaped_and_record_removed(monkeypatch, tmp_path):
     assert record.exists()
     executor.reap_recorded_processes()
     assert killed == [(1234, 5678.5)]
+    assert not record.exists()
+
+
+@pytest.mark.parametrize("contents", ["", '{"pid": 12'])
+def test_corrupt_process_record_does_not_stop_reaping(monkeypatch, tmp_path, contents):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    out = tmp_path / ".hermes-hands" / "out"
+    out.mkdir(parents=True)
+    record = out / "torn.process.json"
+    record.write_text(contents, encoding="utf-8")
+    executor.reap_recorded_processes()
     assert not record.exists()
 
 

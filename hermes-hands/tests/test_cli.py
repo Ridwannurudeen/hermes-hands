@@ -56,6 +56,38 @@ def test_setup_writes_seed_once_and_owner(monkeypatch, capsys):
     assert "restart the gateway" in out
 
 
+def test_setup_prints_the_backend_and_placement_steps_even_if_the_prompt_is_aborted(
+    monkeypatch, capsys
+):
+    secret_scope = types.ModuleType("agent.secret_scope")
+    secret_scope.get_secret = lambda key: "seed"
+    agent = types.ModuleType("agent")
+    agent.__path__ = []
+    hermes_cli = types.ModuleType("hermes_cli")
+    hermes_cli.__path__ = []
+    wizard = types.ModuleType("hermes_cli.gateway_setup_wizard")
+    wizard.save_env_values = lambda **values: None
+    monkeypatch.setitem(sys.modules, "agent", agent)
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", secret_scope)
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
+    monkeypatch.setitem(sys.modules, "hermes_cli.gateway_setup_wizard", wizard)
+
+    def aborted(prompt):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", aborted)
+    ctx = Context()
+    cli.register_cli(ctx, has_seed=True)
+    try:
+        ctx.handler(types.SimpleNamespace(hands_action="setup"))
+    except EOFError:
+        pass
+    out = capsys.readouterr().out
+    assert "Relay seed is already set." in out
+    assert "hermes config set terminal.backend hands" in out
+    assert "hermes config set bot_desktop.placement gateway" in out
+
+
 def install_doctor_modules(monkeypatch, config):
     hermes_cli = types.ModuleType("hermes_cli")
     hermes_cli.__path__ = []
@@ -66,6 +98,8 @@ def install_doctor_modules(monkeypatch, config):
     monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
     monkeypatch.setitem(sys.modules, "hermes_cli.config", config_module)
     monkeypatch.setitem(sys.modules, "hermes_cli.dashboard_auth", auth)
+    backend = (config.get("terminal") or {}).get("backend") or ""
+    monkeypatch.setattr(cli.commands, "terminal_backend", lambda: backend)
 
 
 def run_doctor(capsys):
@@ -129,13 +163,20 @@ def test_doctor_blames_hermes_home_only_when_the_relay_answers(monkeypatch, caps
 
 
 def test_status_asks_a_relay_that_has_no_fresh_heartbeat(monkeypatch, capsys):
-    monkeypatch.setattr(cli.store, "relay_alive", lambda: False)
+    alive = []  # the relay writes its heartbeat before it answers /local/state
+    monkeypatch.setattr(cli.store, "relay_alive", lambda: bool(alive))
     monkeypatch.setattr(cli.store, "list_devices", lambda: [])
-    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True, "devices": [], "alerts": []})
+    monkeypatch.setattr(
+        cli.client, "state", lambda: alive.append(True) or {"relay": True, "devices": [], "alerts": []}
+    )
     ctx = Context()
     cli.register_cli(ctx, has_seed=True)
     ctx.handler(types.SimpleNamespace(hands_action="status"))
     assert capsys.readouterr().out == "Relay: up\n"
+    alive.clear()
+    monkeypatch.setattr(cli.client, "state", lambda: {"relay": True, "devices": [], "alerts": []})
+    ctx.handler(types.SimpleNamespace(hands_action="status"))  # V50: it answers, its row is elsewhere
+    assert capsys.readouterr().out == f"Relay: down\n{cli.messages.STORE_SPLIT}\n"
 
     def refuse():
         raise cli.client.HandsError("hands: the relay is not reachable.")

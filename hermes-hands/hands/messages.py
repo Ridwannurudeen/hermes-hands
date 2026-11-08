@@ -41,6 +41,19 @@ REPLAYED = "hands: this request was already used once."
 JOB_TOO_LARGE = (
     "hands: the command or its input is longer than 16 million characters, so nothing ran."
 )
+STORE_SPLIT = (
+    "hands: the relay answers but uses a different store from this gateway, so pairing codes and "
+    "devices do not reach it. Run the gateway and the dashboard with the same HERMES_HOME."
+)
+USE_DIRECT_ONLY = (
+    "Hands: everyone in this chat shares one session, so a device target set here would let all of "
+    "them run commands on that device. Send /hands use <device> in a direct chat with the bot; "
+    "here only /hands use server is allowed."
+)
+PAIR_DIRECT_ONLY = (
+    "Hands: a pairing code is a secret that anyone who sees it can use to pair their own machine. "
+    "Send /hands pair in a direct chat with the bot."
+)
 RELAY_STORE_DOWN = (
     "hands: the relay cannot read the Hermes Hands store (plugin-data/hermes-hands/hands.db) "
     "and refused this request. See the dashboard log."
@@ -73,6 +86,14 @@ def policy_changed(name: str) -> str:
     return (
         f"hands: the deny-list on {name} changed since it was paired, so the relay refuses it and nothing ran. "
         f"If you changed it yourself, run /hands accept-policy {name}."
+    )
+
+
+def policy_changed_while_running(name: str) -> str:
+    return (
+        f"hands: the deny-list on {name} changed since it was paired, so the relay stopped the "
+        f"command, which may have partly run there; any output above is partial. If you changed "
+        f"it yourself, run /hands accept-policy {name}."
     )
 
 

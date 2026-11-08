@@ -63,8 +63,8 @@ def test_loop_accepts_correctly_signed_poll_reply(monkeypatch):
 def test_verified_poll_accepts_sent_policy_hash_before_job(monkeypatch):
     job, agent = _signed_poll(monkeypatch)
     posted = []
-    monkeypatch.setattr(loop.policy, "digest", lambda: "accepted-hash")
-    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("accepted-hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
     monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter(()))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
     try:
@@ -208,6 +208,72 @@ def test_auth_control_replies_require_valid_signature(monkeypatch, status, error
         agent.client.close()
 
 
+def test_result_retries_unverified_transient_status_without_ending_job(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.job_deadlines = {"job": time.monotonic() + 10}
+    agent.processes = {"job": (type("Proc", (), {"poll": lambda self: None})(), 0.0)}
+    replies = iter((httpx.Response(401), httpx.Response(409), httpx.Response(429), httpx.Response(200)))
+    calls = []
+    monkeypatch.setattr(agent, "_post", lambda *args: calls.append(args) or next(replies))
+    monkeypatch.setattr(agent, "_verify_response", lambda response, endpoint: {} if response.status_code == 200 else (_ for _ in ()).throw(ValueError("transient relay status")))
+    monkeypatch.setattr(agent.stop_event, "wait", lambda delay: False)
+    agent._result("job", 0, chunk="still running")
+    assert len(calls) == 4
+
+
+def test_signed_error_response_with_wrong_signature_is_transient(monkeypatch):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
+    monkeypatch.setattr(config, "device_id", lambda: "device-1")
+    monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(lambda request: httpx.Response(204, request=request)))
+    request = httpx.Request("POST", "https://example.test/device/poll", headers={"X-Hands-Nonce": "nonce"})
+    body = canonical_json({"error": "unknown_device"})
+    response = httpx.Response(401, content=body, request=request, headers={
+        "X-Hands-Ts": str(int(time.time())), "X-Hands-Nonce": "nonce", "X-Hands-Signature": "invalid",
+    })
+    try:
+        with pytest.raises(ValueError, match="transient relay status 401"):
+            agent._verify_response(response, "/device/poll")
+        assert not agent.stop_event.is_set()
+    finally:
+        agent.client.close()
+
+
+@pytest.mark.parametrize("capped,expected", [(False, {"returncode": 125}), (True, {"returncode": 1, "error": "Output exceeded the 64 MiB device limit"})])
+def test_loop_distinguishes_output_cap_from_exit_125(monkeypatch, capped, expected):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.accepted_policy_hash = "hash"
+    agent.processes = {}
+    agent.running = {}
+    agent.cancelled_jobs = set()
+    agent.job_deadlines = {}
+    agent.process_lock = threading.Lock()
+    posted = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+
+    class Process:
+        returncode = 125
+
+        def poll(self):
+            return self.returncode
+
+    def run(*args, on_start, on_exit, on_capped, **kwargs):
+        on_start(Process(), 0.0)
+        if capped:
+            on_capped()
+        on_exit(125)
+        yield b"output"
+
+    monkeypatch.setattr(loop.executor, "run", run)
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **values: posted.append(values))
+    agent._run_job({"job_id": "job", "type": "exec", "script": "exit 125"})
+    assert posted[-1] == {"chunk": "output", "done": True, **expected}
+
+
 def test_signed_unknown_device_stops_agent(monkeypatch):
     private, public = generate_keypair()
     monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
@@ -232,30 +298,42 @@ def test_signed_unknown_device_stops_agent(monkeypatch):
         agent.client.close()
 
 
-def test_retry_backoff_caps_at_30_seconds(monkeypatch):
+def test_retry_backoff_caps_at_3_seconds(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
-    agent.retry_delay = 1
+    agent.poll_retry_delay = 1
     delays = []
     agent.stop_event = type("Stop", (), {"wait": lambda self, delay: delays.append(delay)})()
     for _ in range(8):
-        agent._retry()
-    assert delays == [1, 2, 4, 8, 16, 30, 30, 30]
+        agent._retry("poll_retry_delay")
+    assert delays == [1, 2, 3, 3, 3, 3, 3, 3]
+
+
+def test_poll_and_heartbeat_backoff_counters_are_independent():
+    agent = object.__new__(loop.DeviceLoop)
+    agent.poll_retry_delay = 1
+    agent.heartbeat_retry_delay = 1
+    waits = []
+    agent.stop_event = type("Stop", (), {"wait": lambda self, delay: waits.append(delay)})()
+    agent._retry("poll_retry_delay")
+    agent._retry("poll_retry_delay")
+    agent._retry("heartbeat_retry_delay")
+    assert waits == [1, 2, 1]
 
 
 def test_policy_changed_retry_backoff_caps_at_5_seconds(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
-    agent.retry_delay = 16
+    agent.poll_retry_delay = 16
     delays = []
     agent.stop_event = type("Stop", (), {"wait": lambda self, delay: delays.append(delay)})()
-    agent._retry(cap=5)
+    agent._retry("poll_retry_delay", cap=5)
     assert delays[0] == 5
-    assert agent.retry_delay == 5
+    assert agent.poll_retry_delay == 5
 
 
 def test_heartbeat_retries_within_5_seconds_after_policy_changed(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.stop_event = threading.Event()
-    agent.retry_delay = 30
+    agent.heartbeat_retry_delay = 30
     agent.policy_change_logged = False
     agent.last_auth_warning = 0
     attempts, delays = [], []
@@ -278,7 +356,7 @@ def test_heartbeat_retries_within_5_seconds_after_policy_changed(monkeypatch):
 def test_poll_and_heartbeat_share_instance(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.instance = "1234567890abcdef"
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
     assert agent._poll_body()["instance"] == agent._heartbeat_body()["instance"] == agent.instance
 
@@ -300,8 +378,8 @@ def test_loop_posts_seq_ordered_chunks(monkeypatch):
     agent.processes = {}
     agent.running = {}
     agent.stop_event = threading.Event()
-    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
     monkeypatch.setattr(loop.executor, "run", lambda *a, **kw: iter((b"one", b"two")))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((seq, kwargs)))
@@ -314,7 +392,7 @@ def test_exec_refuses_changed_policy_and_posts_current_hash(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.processes, agent.running = {}, {}
     posted = []
-    monkeypatch.setattr(loop.policy, "digest", lambda: "new-hash")
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("new-hash", loop.policy.DEFAULTS.copy()))
     monkeypatch.setattr(loop.executor, "run", lambda *a, **kw: pytest.fail("job ran under unaccepted policy"))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
     agent.accepted_policy_hash = "old-hash"
@@ -326,8 +404,8 @@ def test_exec_runs_when_policy_matches_accepted_hash(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.processes, agent.running = {}, {}
     posted = []
-    monkeypatch.setattr(loop.policy, "digest", lambda: "same-hash")
-    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("same-hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
     monkeypatch.setattr(loop.executor, "run", lambda *a, **kw: iter(()))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
     agent.accepted_policy_hash = "same-hash"
@@ -341,8 +419,8 @@ def test_loop_incrementally_decodes_split_utf8(monkeypatch):
     agent.processes, agent.running = {}, {}
     agent.cancelled_jobs = set()
     agent.job_deadlines = {}
-    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
     monkeypatch.setattr(loop.executor, "run", lambda *a, **kw: iter((b"\xe4\xb8", b"\xad")))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
@@ -358,8 +436,8 @@ def test_loop_drains_all_output_when_result_posts_are_slow(monkeypatch, tmp_path
         pytest.skip("bash is unavailable")
     monkeypatch.setattr(loop.executor, "resolve_bash", lambda: bash)
     monkeypatch.setattr(loop.executor.Path, "home", lambda: tmp_path)
-    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent = object.__new__(loop.DeviceLoop)
     agent.accepted_policy_hash = "hash"
     agent.processes, agent.running = {}, {}
@@ -429,8 +507,8 @@ def test_loop_sends_output_read_after_exit_with_done(monkeypatch):
         yield b"exit"
         on_exit(3)
 
-    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
     monkeypatch.setattr(loop.executor, "run", run)
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((seq, kwargs)))
@@ -454,8 +532,8 @@ def test_loop_flushes_held_output_before_executor_error(monkeypatch):
         yield b"held output"
         raise RuntimeError("executor failed")
 
-    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
     monkeypatch.setattr(loop.executor, "run", run)
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((seq, kwargs)))
@@ -476,7 +554,7 @@ def test_loop_allows_core_background_pid_liveness_probe(monkeypatch):
     assert "eval 'kill -0" in script
     assert loop.policy.refusal(command) is None
     posted = []
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
     monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter((b"0\n",)))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
@@ -494,7 +572,7 @@ def test_loop_allows_core_background_pid_probe_with_quoted_space_path(monkeypatc
     script = _core_wrapped(command)
     assert loop.policy.refusal(command) is None
     posted = []
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
     monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter((b"0\n",)))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
@@ -520,7 +598,7 @@ def test_loop_allows_core_background_probe_with_old_policy(monkeypatch, tmp_path
     agent.processes = {}
     agent.running = {}
     posted = []
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
     monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter((b"0\n",)))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
@@ -537,7 +615,7 @@ def test_loop_does_not_strip_injected_shell_from_quoted_pid_path(monkeypatch):
     posted = []
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
     monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter(()))
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
     agent._run_job({"job_id": "injected-path", "type": "exec", "script": script})
     assert posted == [{"chunk": f"Policy refused command matching: {loop.policy.refusal(script)}\n", "done": True, "returncode": 126}]
@@ -560,10 +638,46 @@ def test_loop_refuses_denied_commands_even_when_preceded_by_background_probe(mon
         posted = []
         monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
         monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter(()))
-        monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+        monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
         agent.accepted_policy_hash = "hash"
         agent._run_job({"job_id": "denied", "type": "exec", "script": script})
         assert posted == [{"chunk": f"Policy refused command matching: {loop.policy.refusal(script)}\n", "done": True, "returncode": 126}]
+
+
+def test_loop_checks_hash_and_refusal_from_one_policy_snapshot(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.running = {}
+    snapshots = []
+    posted = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: snapshots.append(True) or ("hash", [r"\bsudo\b"]))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: pytest.fail("denied command ran"))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    agent.accepted_policy_hash = "hash"
+
+    agent._run_job({"job_id": "snapshot", "type": "exec", "script": _core_wrapped("sudo id")})
+
+    assert snapshots == [True]
+    assert posted == [{"chunk": "Policy refused command matching: \\bsudo\\b\n", "done": True, "returncode": 126}]
+
+
+def test_loop_ignores_deny_words_in_wrapper_cwd(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.processes = {}
+    agent.running = {}
+    posted = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter((b"ok\n",)))
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+    agent.accepted_policy_hash = "hash"
+
+    script = _core_wrapped("echo ok")
+    script = script.replace("/tmp", "/tmp/sudo/shutdown/.hermes-hands")
+    agent._run_job({"job_id": "cwd-words", "type": "exec", "script": script})
+
+    assert posted[0]["chunk"] == "ok\n"
 
 
 def test_probe_wrapper_matches_core_output_when_core_is_importable():
@@ -591,7 +705,7 @@ def test_loop_retries_result_after_network_error(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.stop_event = threading.Event()
     attempts = []
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
 
     def post(endpoint, body):
@@ -634,8 +748,8 @@ def test_policy_change_cancels_jobs_without_stopping_agent(monkeypatch):
     assert not agent.stop_event.is_set()
     posted = []
     agent.running = {}
-    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
     monkeypatch.setattr(loop.executor, "run", lambda *a, **kw: iter(()))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
@@ -648,8 +762,8 @@ def test_stopping_during_result_delivery_does_not_escape_job_thread(monkeypatch)
     agent.stop_event = threading.Event()
     agent.processes = {}
     agent.running = {}
-    monkeypatch.setattr(loop.policy, "refusal", lambda script: None)
-    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
 
     def post(*args, **kwargs):

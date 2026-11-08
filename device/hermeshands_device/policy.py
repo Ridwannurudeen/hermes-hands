@@ -9,12 +9,12 @@ from . import config
 from .protocol import canonical_json, policy_hash
 
 DEFAULTS = [
-    r"\bhermes-?hands\s+unpair\b|\bpipx\s+uninstall\s+hermes-?hands\b|^\s*hermeshands\s*$",
+    r"(?:^|[\s;&|(`])hermes-?hands(?:\.exe)?\s+(?:pair|unpair|serve|install-service|policy)\b|\b(?:pipx|pip|runpip|uv\s+(?:tool|pip))\s+uninstall\s+hermes-?hands\b|\bpython\s+-m\s+pip\s+uninstall\s+hermes-?hands\b|^\s*hermeshands\s*$",
     r"\.hermes-hands(?:[/\\]|\b)",
     r"\b(?:taskkill|Stop-Process|kill)\b.*(?:\$PPID|<agent-pid>)",
-    r"\b(?:schtasks\s+/(?:End|Delete)|Stop-ScheduledTask|Unregister-ScheduledTask)\b.*HermesHands",
+    r"\b(?:schtasks\s+/{1,2}(?:End|Delete)|Stop-ScheduledTask|Unregister-ScheduledTask)\b.*HermesHands|\btaskkill\b.*(?:/|//|-)(?:F|IM)\b.*hermes-?hands(?:\.exe)?\b|\bkillall\s+hermes-?hands(?:\.exe)?\b",
     r"\bsudo\b",
-    r"(?:rm\s+-rf\s+(?:/(?:\s|$)|~(?:[/\s]|$))|\bRemove-Item\b.*(?:[A-Za-z]:\\|[/\\])(?:\s|$).*?-Recurse)",
+    r"(?:rm\s+-rf\s+(?:/(?:\s|$)|['\"]?(?:~/?|\$HOME/?)['\"]?(?:\s|$))|\bRemove-Item\b.*(?:[A-Za-z]:\\|[/\\])(?:\s|$).*?-Recurse)",
     r"\bmkfs(?:\.[\w-]+)?\b|\bdd\b.*\bof=/dev/",
     r"\bdiskpart\b|\bformat\b.*(?:[A-Za-z]:|/FS:)",
     r"\b(?:shutdown|reboot|Stop-Computer)\b",
@@ -24,11 +24,7 @@ DEFAULTS = [
 
 
 def patterns() -> list[str]:
-    if config.POLICY_PATH.exists():
-        deny = json.loads(config.POLICY_PATH.read_text(encoding="utf-8-sig"))["deny"]
-    else:
-        deny = DEFAULTS.copy()
-    return deny
+    return snapshot()[1]
 
 
 def reset() -> str:
@@ -41,16 +37,25 @@ def reset() -> str:
 
 
 def digest() -> str:
+    return snapshot()[0]
+
+
+def snapshot() -> tuple[str, list[str]]:
     if config.POLICY_PATH.exists():
-        return policy_hash(config.POLICY_PATH.read_bytes())
-    return policy_hash(canonical_json({"deny": patterns()}))
+        raw = config.POLICY_PATH.read_bytes()
+        deny = json.loads(raw.decode("utf-8-sig"))["deny"]
+    else:
+        raw = canonical_json({"deny": DEFAULTS})
+        deny = DEFAULTS.copy()
+    return policy_hash(raw), deny
 
 
-def refusal(script: str) -> str | None:
-    normalized = re.sub(r"['\"\\]", "", script)
-    for pattern in patterns():
-        active_pattern = pattern.replace("<agent-pid>", str(os.getpid()))
-        if re.search(active_pattern, script, re.IGNORECASE) or re.search(active_pattern, normalized, re.IGNORECASE):
+def refusal(script: str, deny: list[str] | None = None) -> str | None:
+    normalized = re.sub(r"(?<=\w)['\"\\]+(?=\w)", "", script)
+    normalized_self = re.sub(r"['\"\\]", "", script)
+    for index, pattern in enumerate(patterns() if deny is None else deny):
+        active_pattern = pattern.replace("<agent-pid>", rf"(?<!\d){os.getpid()}(?!\d)")
+        if re.search(active_pattern, script, re.IGNORECASE) or re.search(active_pattern, normalized, re.IGNORECASE) or index < 4 and re.search(active_pattern, normalized_self, re.IGNORECASE):
             return pattern
     return None
 

@@ -37,8 +37,16 @@ _BACKGROUND_FILE = re.compile(r"hermes_bg_([\w-]+)\.(?:log|pid|exit)\b")
 _BACKGROUND_KILL = re.compile(r"kill (\d+) 2>/dev/null")
 # The end of the launcher itself, which prints the pid it wrote (process_registry.py:1282-1288).
 _BACKGROUND_LAUNCH = re.compile(r"\) & echo \$! > (.+) && cat \1\Z")
-# One single-quoted argument as core's file tools quote it (file_operations.py:535-557).
-_QUOTED = re.compile(r"'((?:[^']|'\"'\"')*)'")
+# One shell word of a file-tool command: single-quoted as core's file tools quote arguments
+# (file_operations.py:535-557), or a bare word ``shlex.quote`` left unquoted.
+_SHELL_WORD = r"'(?:[^']|'\"'\"')*'|[\w@%+=:,./-]+"
+_WORD = re.compile(r"'((?:[^']|'\"'\"')*)'|(?<![^\s<>|;&(])([\w@%+=:,./-]+)(?=[\s<>|;&)]|\Z)")
+# The start of core's atomic write (file_operations.py:586-606): its parent and target.
+_ATOMIC_WRITE = re.compile(rf"set -e; d=({_SHELL_WORD}); t=({_SHELL_WORD}); ")
+# A search_files command (file_operations_search.py:688-693, 1221, 1328): rg, grep or find first.
+_SEARCH = re.compile(
+    r"(?:set -o pipefail; )?(?:cd \S.*? && )?'?(?:[^'\s]*/)?(?:rg|rg\.exe|grep|find)'? "
+)
 # A Windows path core joined onto the base, which it does to anything not POSIX-absolute for a
 # container backend (file_tools_paths.py:157-163): ``<home>/C:\Users\x`` or ``<home>/C:/Users/x``.
 _JOINED_DRIVE = re.compile(r"/([A-Za-z]:(?:[\\/].*)?)\Z", re.S)
@@ -121,12 +129,16 @@ class DeviceEnvironment(BaseEnvironment):
             path = self.home + path[len(gateway) :]
         if self.windows:
             drive = _JOINED_DRIVE.search(path)
-            if drive is not None:
+            # only onto a base core joins on: the device home or its cwd (file_tools_paths.py:276-278)
+            if drive is not None and path[: drive.start()] in (self.home, self.cwd):
                 path = device_path(drive.group(1))
         return path
 
-    def _quoted_path(self, match: re.Match) -> str:
-        value = match.group(1).replace("'\"'\"'", "'")
+    def _word(self, match: re.Match) -> str:
+        """One shell word: single-quoted as core quotes paths, or bare where ``shlex.quote`` left a
+        safe path unquoted (image_source.py:279)."""
+        quoted, bare = match.groups()
+        value = bare if quoted is None else quoted.replace("'\"'\"'", "'")
         mapped = self._file_path(value)
         return match.group(0) if mapped == value else shlex.quote(mapped)
 
@@ -162,7 +174,19 @@ class DeviceEnvironment(BaseEnvironment):
         snippet = _PYTHON_SNIPPET.fullmatch(command)
         if snippet is not None:
             return self._python_snippet(snippet)
-        return _QUOTED.sub(self._quoted_path, command)
+        if _SEARCH.match(command):
+            # Its quoted words are patterns and globs, and its path is the model's own, unexpanded
+            # (file_tools.py:1102, file_operations_search.py:1360-1362, 1379).
+            return command
+        mapped = _WORD.sub(self._word, command)
+        write = _ATOMIC_WRITE.match(mapped)
+        if write is not None and mapped != command:
+            # Core took the parent from the path as it gave it (file_operations.py:587); a Windows
+            # path joined onto the base has its real parent only once mapped.
+            target = shlex.split(write.group(2))[0]
+            parent = shlex.quote(posixpath.dirname(target) or ".")
+            mapped = f"{mapped[: write.start(1)]}{parent}{mapped[write.end(1) :]}"
+        return mapped
 
     def _prepare_command(self, command: str) -> tuple[str, None]:
         """The command unchanged. Core's version (base.py:807-819) adds SUDO_PASSWORD or the cached
@@ -227,29 +251,31 @@ class HandsEnvironment(BaseEnvironment):
     # agent/chat_completion_helpers.py:2334-2353); the idle reaper and AIAgent.close still clean up.
     _persistent = True
 
-    def __init__(self, ctx, *, cwd: str, timeout: int):
+    def __init__(self, ctx, *, cwd: str, timeout: int, task_id: str = "default"):
         self._ctx = ctx
         self._requested_cwd = cwd
         self._timeout = timeout
+        self._task_id = task_id
         self._lock = threading.Lock()
         # Sub-environments are dropped only by cleanup(), so a background job's still exists after
         # any /hands use; core cleans up only an idle environment, and a running background job
         # keeps it active (terminal_tool_lifecycle.py:143-152).
         self._subs: dict[str, BaseEnvironment] = {}
-        self._background: dict[str, str] = {}  # registry session id -> target it runs on
-        # Its pid -> the targets a job with that pid was launched on: pids repeat across machines.
+        # registry session id -> the target it runs on and its pid there
+        self._background: dict[str, tuple[str, int | None]] = {}
+        # A live job's pid -> the targets it runs on: pids repeat across machines.
         self._background_pids: dict[int, set[str]] = {}
         self._store_failure_logged = False
-        # A new object notes the target of its first terminal command. Where the session's last
-        # terminal command ran comes from the store: this object may be new since then (idle reaper,
-        # gateway restart).
-        self._noted_target: str | None = None
+        # The target and conversation (session id: /new keeps the session key) last given the note.
+        self._noted: tuple[str, str] | None = None
+        # The target whose terminal command wrote core's cwd record for this session. It comes from
+        # the store: this object may be new since then (idle reaper, gateway restart).
         session_key = get_session_env("HERMES_SESSION_KEY", "")
         try:
-            self._last_target = store.get_last_run(session_key) if session_key else None
+            self._record_owner = store.get_last_run(session_key) if session_key else None
         except sqlite3.Error:
             self._store_failed()
-            self._last_target = None
+            self._record_owner = None
         self._files_target: str | None = None
         # Create the first target now so ``cwd`` is already absolute when core stamps the sandbox
         # home right after create_environment (terminal_tool_backends.py:213-233, 256).
@@ -346,7 +372,8 @@ class HandsEnvironment(BaseEnvironment):
         with self._lock:
             match = _BACKGROUND_FILE.search(command)
             if match is not None:
-                return self._background.get(match.group(1))
+                known = self._background.get(match.group(1))
+                return None if known is None else known[0]
             match = _BACKGROUND_KILL.fullmatch(command.strip())
             if match is None:
                 return None
@@ -362,9 +389,52 @@ class HandsEnvironment(BaseEnvironment):
         lines = map(str.strip, (result.get("output") or "").splitlines())
         pid = next((int(line) for line in lines if line.isdigit()), None)
         with self._lock:
-            self._background[session_id] = target
+            self._background[session_id] = (target, pid)
             if pid is not None:
                 self._background_pids.setdefault(pid, set()).add(target)
+
+    def _job_ended(self, target: str, pid: int) -> None:
+        """A job's pid stops counting once the job has ended, so a pid shared with it routes again."""
+        with self._lock:
+            owners = self._background_pids.get(pid)
+            if owners is not None:
+                owners.discard(target)
+                if not owners:
+                    del self._background_pids[pid]
+
+    def _routed(self, owner: str, command: str, cwd: str, kwargs: dict) -> dict:
+        """A registry poll or kill on the target that runs the job (process_registry.py:1418-1470,
+        2245-2246). A result the gateway half made up is never read as the job's state: core takes
+        anything but "0" from the liveness probe as an exit and writes "killed" whatever the kill
+        printed. A device that cannot answer for now reads as alive; one that is gone for good, or a
+        kill that never reached the device, raises, which core records as a lost job or a failed kill
+        (:1471-1475, 2219-2220)."""
+        result = self._sub(owner)[1].execute(command, cwd, **kwargs)
+        output = result.get("output") or ""
+        lines = output.strip().splitlines()
+        kill = _BACKGROUND_KILL.fullmatch(command.strip())
+        job = _BACKGROUND_FILE.search(command)
+        if kill is not None:
+            if _hands_failure(result):
+                raise RuntimeError(lines[-1])
+            self._job_ended(owner, int(kill.group(1)))
+            return result
+        if not command.startswith("kill -0 "):
+            if command.startswith("cat ") and ".exit" in command and job is not None:
+                pid = self._background.get(job.group(1), (owner, None))[1]
+                if pid is not None:
+                    self._job_ended(owner, pid)
+            return result
+        if result.get("returncode") == 0 and lines and lines[-1].strip().lstrip("-").isdigit():
+            return result
+        if any(text in output for text in self._gone(owner)):
+            raise RuntimeError(lines[-1])
+        return {"output": "0", "returncode": 0}
+
+    @staticmethod
+    def _gone(target: str) -> tuple[str, ...]:
+        """The refusals that do not pass: the device was revoked, or this gateway has no relay seed."""
+        return (messages.unknown_device(target), messages.revoked(target), messages.NOT_SET_UP)
 
     def _note(self, target: str) -> str:
         if target == targets.SERVER:
@@ -374,33 +444,40 @@ class HandsEnvironment(BaseEnvironment):
             return messages.target_note(target, None, None)
         return messages.target_note(target, device["os"], device_path(device["home"]))
 
-    def _command_cwd(self, target: str, cwd: str) -> str:
-        """Where a terminal command or a background launch runs; "" keeps the target's own cwd. Core
-        passes ``workdir=``, else the session's recorded cwd, else the configured default
-        (terminal_tool.py:1014-1061, terminal_tool_background.py:173-176), and records the cwd only
-        after a foreground terminal command (terminal_tool_result.py:222-225)."""
+    def _command_cwd(self, target: str, sub: BaseEnvironment, cwd: str) -> tuple[str, bool]:
+        """Where a terminal command or a background launch runs ("" keeps the target's own cwd), and
+        whether core records where it ends. Core passes ``workdir=``, which it never records, else the
+        session's recorded cwd, else the configured default or workspace (terminal_tool.py:1014-1061,
+        terminal_tool_background.py:173-176, terminal_tool_result.py:222-225)."""
         from tools.approval import get_current_session_key
-        from tools.terminal_tool import get_session_cwd
+        from tools.terminal_tool import _get_env_config, get_session_cwd, resolve_task_overrides
 
-        session_key = get_current_session_key(default="")  # core's key (terminal_tool.py:1528-1530)
-        recorded = get_session_cwd(session_key) if session_key else None
+        # core's key for the record and the override (terminal_tool.py:1528-1530, 615-630)
+        key = get_current_session_key(default="") or self._task_id
+        recorded = get_session_cwd(key)
+        defaults = {_get_env_config().get("cwd"), resolve_task_overrides(key).get("cwd")}
         if cwd == "~":
-            # On the server core drops a /home or /Users record outside the live cwd, which a
-            # workdir= command moves (terminal_tool.py:1041-1059); the record is still this host's.
+            # On the server core drops a /home or /Users record outside the live cwd
+            # (terminal_tool.py:1041-1059); the record is still this host's.
             if (
                 target == targets.SERVER
-                and self._last_target == targets.SERVER
+                and self._record_owner == targets.SERVER
                 and recorded
                 and os.path.isdir(recorded)
             ):
-                return recorded
-            return ""
+                return recorded, True
+            return "", True
+        if target != targets.SERVER and cwd in defaults and not self._in_home(sub, cwd):
+            return "", True  # a gateway directory: terminal.cwd or a Desktop, TUI or ACP workspace
         if cwd == recorded:
-            # It was recorded on the last terminal command's target; another target never saw it.
-            return "" if self._last_target is not None and target != self._last_target else cwd
-        if target != targets.SERVER and cwd == self._requested_cwd:
-            return ""  # the configured default, a gateway directory
-        return cwd
+            # Written after a terminal command that printed where it ended, on its owner's target.
+            return (cwd if self._record_owner in (None, target) else ""), True
+        return cwd, cwd in defaults
+
+    @staticmethod
+    def _in_home(sub: BaseEnvironment, cwd: str) -> bool:
+        home = getattr(sub, "home", None)
+        return bool(home) and (cwd == home or cwd.startswith(home.rstrip("/") + "/"))
 
     # --- delegated surface -----------------------------------------------------------------
     def execute(self, command: str, cwd: str = "", **kwargs) -> dict:
@@ -412,33 +489,35 @@ class HandsEnvironment(BaseEnvironment):
         if owner is not None:
             # The process registry polls and kills through this object (process_registry.py:1279,
             # 1418-1466, 2245-2246); its job lives on the sub-environment that launched it.
-            result = self._sub(owner)[1].execute(command, cwd, **kwargs)
-            if command.startswith("kill -0 ") and _hands_failure(result):
-                # The liveness probe (:1460-1470) reads anything but "0" as an exit: a device that
-                # is offline for a moment, or a relay restart, must not end the job's tracking.
-                return {"output": "0", "returncode": 0}
-            return result
+            return self._routed(owner, command, cwd, kwargs)
         note = None
         try:
-            # Every store read and write happens before the command runs: an error after it would
-            # make the terminal tool retry, i.e. run the command again (terminal_tool.py:1363-1390).
+            # Every store read happens before the command runs: an error after it would make the
+            # terminal tool retry, i.e. run the command again (terminal_tool.py:1363-1390).
             target, sub = self._resolve()
             # The file tools parse their raw output, so the note never goes there.
-            if terminal and target != self._noted_target:
+            noted = (target, get_session_env("HERMES_SESSION_ID", ""))
+            if terminal and noted != self._noted:
                 note = self._note(target)
-            session_key = get_session_env("HERMES_SESSION_KEY", "")
-            if terminal and session_key and target != self._last_target:
-                store.set_last_run(session_key, target)
         except sqlite3.Error:
             self._store_failed()
             return {"output": messages.STORE_DOWN, "returncode": UNREACHABLE}
+        records = terminal
         if terminal or launch is not None:
-            cwd = self._command_cwd(target, cwd)
-        if terminal:
-            self._last_target = target
+            cwd, records = self._command_cwd(target, sub, cwd)
+            records = records and terminal
         if note is not None:
-            self._noted_target = target
+            self._noted = noted
+        before = sub.cwd
         result = sub.execute(command, cwd, **kwargs)
+        if result.get("cwd_observed"):
+            if records:
+                self._recorded_on(target)
+            elif sub.cwd == result.get("cwd"):
+                # Core records the cwd only after a terminal command without workdir=; execute_code
+                # (cwd "/", code_execution_tool.py:674, code_execution_rpc.py:210-227), a file tool
+                # or a workdir must not move where this target's next terminal command starts.
+                sub.cwd = before
         if launch is not None:
             launched = _BACKGROUND_FILE.search(launch.group(1))
             if launched is not None:
@@ -446,6 +525,21 @@ class HandsEnvironment(BaseEnvironment):
         if note is not None:
             result["output"] = f"{note}\n{result.get('output', '')}"
         return result
+
+    def _recorded_on(self, target: str) -> None:
+        """Core is about to record this command's cwd for the session (terminal_tool_result.py:
+        222-225). The store keeps the owner for a later object; a store error here is logged rather
+        than raised, since the command has already run."""
+        if target == self._record_owner:
+            return
+        self._record_owner = target
+        session_key = get_session_env("HERMES_SESSION_KEY", "")
+        if not session_key:
+            return
+        try:
+            store.set_last_run(session_key, target)
+        except sqlite3.Error:
+            self._store_failed()
 
     def fetch_file(self, remote_path, local_dest, *, max_bytes: int) -> None:
         self._resolve()[1].fetch_file(remote_path, local_dest, max_bytes=max_bytes)
@@ -462,8 +556,10 @@ class HandsEnvironment(BaseEnvironment):
 
     @cwd.setter
     def cwd(self, value: str) -> None:
-        """A workspace override (terminal_tool.py:358-362) names a gateway directory: devices keep theirs."""
+        """A workspace override (terminal_tool.py:350-362), which core also records as the session's
+        cwd, names a gateway directory: devices keep theirs."""
         target, sub = self._current()
+        self._record_owner = targets.SERVER
         if target == targets.SERVER:
             sub.cwd = value
 

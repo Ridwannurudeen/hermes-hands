@@ -89,3 +89,41 @@ def test_doctor_executes_python_probe_and_names_windowsapps(monkeypatch, capsys)
     output = capsys.readouterr().out
     assert "WindowsApps alias" in output
     assert any('python3 -c "import sys; print(sys.version)"' in call[-1] for call in calls)
+
+
+def test_doctor_requires_working_python3_when_python_works(monkeypatch, capsys):
+    monkeypatch.setattr(cli.executor, "resolve_bash", lambda: "bash.exe")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "git.exe")
+    monkeypatch.setattr(cli.config, "gateway_url", lambda: "")
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+
+    def run(args, **kwargs):
+        command = args[-1]
+        if "command -v python3" in command:
+            return types.SimpleNamespace(returncode=0, stdout="/usr/bin/python3\n")
+        if "python3 -c" in command:
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="python3 stub")
+        if "command -v python" in command:
+            return types.SimpleNamespace(returncode=0, stdout="/usr/bin/python\n")
+        return types.SimpleNamespace(returncode=0, stdout="3.14\n")
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli._doctor() == 1
+    assert "/usr/bin/python" in capsys.readouterr().out
+
+
+def test_doctor_reports_python_probe_timeout(monkeypatch, capsys):
+    monkeypatch.setattr(cli.executor, "resolve_bash", lambda: "bash.exe")
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "git.exe")
+    monkeypatch.setattr(cli.config, "gateway_url", lambda: "")
+
+    def run(args, **kwargs):
+        if "python3 -c" in args[-1]:
+            raise cli.subprocess.TimeoutExpired(args, kwargs["timeout"])
+        if "command -v python3" in args[-1]:
+            return types.SimpleNamespace(returncode=0, stdout="/usr/bin/python3\n")
+        return types.SimpleNamespace(returncode=1, stdout="")
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli._doctor() == 1
+    assert "timed out while starting" in capsys.readouterr().out
