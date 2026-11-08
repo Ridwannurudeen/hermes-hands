@@ -1,4 +1,5 @@
 import json
+import re
 import types
 
 import pytest
@@ -222,3 +223,140 @@ def test_doctor_reports_command_probe_timeout_and_continues(monkeypatch, capsys,
     assert f"command -v {('python' if timed_out_command == 'python3' else 'python3')}" in calls
     assert "git: git.exe" in output
     assert "gateway: not paired" in output
+
+
+class FakeConsole:
+    def __init__(self, *lines):
+        self.lines = iter(lines)
+        self.outputs = []
+        self.prompts = []
+
+    def write(self, text):
+        self.outputs.append(text)
+
+    def read_line(self, prompt):
+        self.prompts.append(prompt)
+        return next(self.lines, None)
+
+
+class FakeDeviceLoop:
+    last = None
+
+    def __init__(self, *, allow_screen=False, transport=None, console=None):
+        self.allow_screen = allow_screen
+        self.console = console
+        self.run = False
+        self.witness = False
+        self.session_state = "normal"
+        self.capabilities = []
+        from hermeshands_device.console import ConsoleOwner
+
+        self.console_owner = ConsoleOwner(console, on_stop=lambda: None, on_help=lambda text: None)
+        type(self).last = self
+
+    def run_forever(self):
+        self.run = True
+        self.console_owner.close()
+        self.console_owner.join(1)
+
+
+def _prepare_witness_cli(monkeypatch, console, *, executable=r"C:\Python\python.exe", input_tty=True, output_tty=True):
+    from hermeshands_device import janitor, loop
+
+    monkeypatch.setattr(cli, "TerminalConsole", lambda: console, raising=False)
+    monkeypatch.setattr(cli.sys, "executable", executable)
+    monkeypatch.setattr(cli.sys, "stdin", types.SimpleNamespace(isatty=lambda: input_tty))
+    monkeypatch.setattr(cli.sys, "stdout", types.SimpleNamespace(isatty=lambda: output_tty))
+    monkeypatch.setattr(config, "device_id", lambda: "device-1")
+    monkeypatch.setattr(config, "gateway_url", lambda: "https://hands.example.test/api/plugins/hermes-hands")
+    monkeypatch.setattr(
+        config,
+        "load",
+        lambda: {
+            "device_id": "device-1",
+            "gateway_url": "https://hands.example.test/api/plugins/hermes-hands",
+        },
+    )
+    monkeypatch.setattr(janitor, "start", lambda: None)
+    monkeypatch.setattr(loop, "DeviceLoop", FakeDeviceLoop)
+    FakeDeviceLoop.last = None
+
+
+@pytest.mark.parametrize(("input_tty", "output_tty"), [(False, True), (True, False)])
+def test_witness_requires_stdin_and_stdout_ttys(monkeypatch, capsys, input_tty, output_tty):
+    console = FakeConsole("Y")
+    _prepare_witness_cli(monkeypatch, console, input_tty=input_tty, output_tty=output_tty)
+
+    assert cli.main(["serve", "--witness"]) == 1
+
+    assert console.prompts == []
+    assert "stdin and stdout TTYs" in capsys.readouterr().err
+
+
+def test_witness_refuses_pythonw(monkeypatch, capsys):
+    console = FakeConsole("Y")
+    _prepare_witness_cli(monkeypatch, console, executable=r"C:\Python\pythonw.exe")
+
+    assert cli.main(["serve", "--witness"]) == 1
+
+    assert console.prompts == []
+    assert "pythonw" in capsys.readouterr().err.lower()
+
+
+def test_witness_refuses_service_mode(monkeypatch, capsys):
+    console = FakeConsole("Y")
+    _prepare_witness_cli(monkeypatch, console)
+
+    assert cli.main(["serve", "--witness", "--service"]) == 1
+
+    assert console.prompts == []
+    assert "service" in capsys.readouterr().err.lower()
+
+
+def test_witness_y_starts_session_after_initial_consent(monkeypatch):
+    console = FakeConsole("Y")
+    _prepare_witness_cli(monkeypatch, console)
+
+    assert cli.main(["serve", "--witness"]) == 0
+
+    agent = FakeDeviceLoop.last
+    assert agent.run is True
+    assert agent.console is console
+    assert agent.allow_screen is False
+    assert agent.witness is True
+    assert agent.session_state == "active"
+    assert agent.capabilities == ["witness-v1", "checkup-v1", "help-v1", "receipt-v1"]
+    text = "".join(console.outputs)
+    assert "device-1" in text
+    assert "hands.example.test" in text
+    assert "30 minutes" in text
+    assert "No mouse or keyboard control" in text
+    assert "Commands and outcomes are recorded" in text
+    assert len(console.prompts) == 1
+    assert re.match(r"^\[\d{4}-\d{2}-\d{2}T[^\]]+Z\] Start witness mode\? \[Y/N\]: $", console.prompts[0])
+
+
+@pytest.mark.parametrize(("answer", "expected"), [("N", 0), (None, 1)])
+def test_witness_decline_or_eof_does_not_start_agent(monkeypatch, capsys, answer, expected):
+    console = FakeConsole(answer)
+    _prepare_witness_cli(monkeypatch, console)
+
+    assert cli.main(["serve", "--witness"]) == expected
+
+    assert FakeDeviceLoop.last is not None
+    assert FakeDeviceLoop.last.run is False
+    assert FakeDeviceLoop.last.witness is False
+    assert "declined" in "".join(console.outputs).lower()
+    assert len(console.prompts) == 1
+    assert re.match(r"^\[\d{4}-\d{2}-\d{2}T[^\]]+Z\] Start witness mode\? \[Y/N\]: $", console.prompts[0])
+
+
+@pytest.mark.parametrize("stop_answer", ["S", "s"])
+def test_witness_stop_at_startup_consent_does_not_start_agent(monkeypatch, stop_answer):
+    console = FakeConsole(stop_answer)
+    _prepare_witness_cli(monkeypatch, console)
+
+    assert cli.main(["serve", "--witness"]) == 0
+
+    assert FakeDeviceLoop.last.run is False
+    assert FakeDeviceLoop.last.witness is False

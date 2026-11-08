@@ -1,7 +1,10 @@
+import inspect
 import os
+import queue
 import shlex
 import threading
 import time
+from typing import get_type_hints
 
 import httpx
 import psutil
@@ -161,6 +164,202 @@ def test_device_loop_client_ignores_environment_proxies(monkeypatch):
         assert agent.client._trust_env is False
     finally:
         agent.client.close()
+
+
+def test_device_loop_constructor_keeps_frozen_console_seam(monkeypatch):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    console = object()
+
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(lambda request: httpx.Response(204, request=request)), console=console)
+    try:
+        signature = inspect.signature(loop.DeviceLoop)
+        assert tuple(signature.parameters) == ("allow_screen", "transport", "console")
+        assert all(parameter.kind is inspect.Parameter.KEYWORD_ONLY for parameter in signature.parameters.values())
+        assert get_type_hints(loop.DeviceLoop.__init__)["transport"] == httpx.BaseTransport | None
+        assert get_type_hints(loop.DeviceLoop.__init__)["console"] == loop.ConsoleInput | None
+        assert agent.console is console
+    finally:
+        agent.client.close()
+
+
+def test_final_device_result_always_sends_returncode_and_error(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    bodies = []
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(agent, "_post", lambda endpoint, body: bodies.append(body) or httpx.Response(204))
+    monkeypatch.setattr(agent, "_verify_response", lambda *args: {})
+
+    agent._result("final", 0, done=True, returncode=0)
+
+    assert bodies == [{
+        "job_id": "final",
+        "seq": 0,
+        "chunk": "",
+        "done": True,
+        "policy_hash": "hash",
+        "returncode": 0,
+        "error": None,
+    }]
+
+
+def test_screenshot_final_result_has_success_code(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.allow_screen = True
+    agent.stop_event = threading.Event()
+    agent.process_lock = threading.Lock()
+    agent.running = {}
+    agent.processes = {}
+    agent.job_start_events = {}
+    agent.cancelled_jobs = set()
+    agent.job_deadlines = {}
+    posted = []
+    monkeypatch.setattr(loop.screen, "capture", lambda **kwargs: b"png")
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
+
+    agent._run_job({"job_id": "screen", "type": "screenshot"})
+
+    assert posted == [{"done": True, "returncode": 0, "png": b"png"}]
+
+
+@pytest.mark.parametrize(("answer", "expected"), [("Y", True), ("N", False), ("y", False), ("", False)])
+def test_session_screenshot_consent_requires_explicit_y(monkeypatch, answer, expected):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+
+    class InputConsole:
+        def __init__(self):
+            self.lines = queue.Queue()
+            self.outputs = []
+            self.lines.put(answer)
+
+        def write(self, text):
+            self.outputs.append(text)
+
+        def read_line(self, prompt):
+            return self.lines.get()
+
+    console = InputConsole()
+    agent = loop.DeviceLoop(console=console)
+    agent.witness = True
+    agent.session_state = "active"
+    consent = threading.Thread(target=agent._request_session_screenshot_consent)
+    consent.start()
+    consent.join(1)
+    assert not consent.is_alive()
+
+    agent.console_owner.close()
+    console.lines.put(None)
+    agent.console_owner.join(1)
+    assert agent.allow_screen is expected
+
+
+@pytest.mark.parametrize("answer", ["S", "s", None])
+def test_stop_or_eof_during_session_screenshot_consent_stops_witness(monkeypatch, answer):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+
+    class InputConsole:
+        def __init__(self):
+            self.lines = queue.Queue()
+            self.lines.put(answer)
+
+        def write(self, text):
+            return None
+
+        def read_line(self, prompt):
+            return self.lines.get()
+
+    console = InputConsole()
+    agent = loop.DeviceLoop(console=console)
+    agent.witness = True
+    agent.session_state = "active"
+    consent = threading.Thread(target=agent._request_session_screenshot_consent)
+    consent.start()
+    consent.join(1)
+
+    agent.console_owner.close()
+    agent.console_owner.join(1)
+    assert not consent.is_alive()
+    assert agent.stop_event.is_set()
+    assert agent.witness is False
+
+
+def test_poll_and_heartbeat_continue_while_console_prompt_is_open(monkeypatch, tmp_path):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    monkeypatch.setattr(loop.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(loop.executor, "reap_recorded_processes", lambda: None)
+
+    class WaitingConsole:
+        def __init__(self):
+            self.read_started = threading.Event()
+            self.prompt_displayed = threading.Event()
+            self.lines = queue.Queue()
+            self.outputs = []
+            self.prompts = []
+
+        def write(self, text):
+            self.outputs.append(text)
+            if "Allow screenshot requests this session?" in text:
+                self.prompt_displayed.set()
+
+        def read_line(self, prompt):
+            self.prompts.append(prompt)
+            self.read_started.set()
+            if "Allow screenshot requests this session?" in prompt:
+                self.prompt_displayed.set()
+            return self.lines.get()
+
+        def feed(self, line):
+            self.lines.put(line)
+
+    console = WaitingConsole()
+    agent = loop.DeviceLoop(console=console, transport=httpx.MockTransport(lambda request: httpx.Response(204, request=request)))
+    agent.witness = True
+    agent.session_state = "active"
+    counts = {"poll": 0, "heartbeat": 0}
+    lock = threading.Lock()
+    progress = threading.Event()
+    prompt_open_at_progress = []
+
+    def post(endpoint, body):
+        assert console.prompt_displayed.wait(1)
+        key = "poll" if endpoint == "/device/poll" else "heartbeat"
+        with lock:
+            counts[key] += 1
+            if all(counts.values()):
+                with agent.console_owner._lock:
+                    prompt_open_at_progress.append(
+                        agent.console_owner._read_prompt.prompt_id
+                        if agent.console_owner._read_prompt is not None
+                        else None
+                    )
+                progress.set()
+                agent._begin_stopping()
+        return httpx.Response(204)
+
+    monkeypatch.setattr(agent, "_post", post)
+    monkeypatch.setattr(agent, "_verify_response", lambda *args: {})
+    monkeypatch.setattr(agent, "_cancel_running_jobs", lambda: None)
+    serve = threading.Thread(target=agent.run_forever)
+    serve.start()
+
+    try:
+        assert console.prompt_displayed.wait(1)
+        assert "Allow screenshot requests this session?" in console.prompts[0]
+        assert progress.wait(1)
+        serve.join(2)
+        assert not serve.is_alive()
+    finally:
+        console.feed(None)
+        agent.console_owner.join(1)
+
+    assert counts["poll"] >= 1
+    assert counts["heartbeat"] >= 1
+    assert prompt_open_at_progress
+    assert set(prompt_open_at_progress) == {f"{agent.instance}-screenshot-session"}
 
 
 def test_first_transient_auth_warning_is_not_suppressed(monkeypatch, caplog):

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import platform
+import queue
 import re
 import secrets
 import threading
@@ -16,6 +17,13 @@ from urllib.parse import urlparse
 import httpx
 
 from . import __version__, config, executor, policy, screen
+from .console import (
+    SCREENSHOT_SESSION_PROMPT,
+    SCREENSHOTS_DISABLED,
+    ConsoleInput,
+    ConsoleOwner,
+    TerminalConsole,
+)
 from .keys import get_or_create
 from .protocol import D2R, R2D, canonical_json, fresh, make_bearer, new_nonce, sign_request, verify_request
 
@@ -38,8 +46,9 @@ _CORE_CWD = re.compile(r"(?m)^builtin cd -- (.+?)(?: 2>/dev/null \|\| true| \|\|
 
 
 class DeviceLoop:
-    def __init__(self, *, allow_screen: bool = False, transport=None):
+    def __init__(self, *, allow_screen: bool = False, transport: httpx.BaseTransport | None = None, console: ConsoleInput | None = None):
         self.allow_screen = allow_screen
+        self.console = console if console is not None else TerminalConsole()
         self.private, self.public = get_or_create()
         pairing = config.load()
         self.gateway_url = pairing.get("gateway_url", "").rstrip("/")
@@ -57,6 +66,8 @@ class DeviceLoop:
         self.capabilities: list[str] = []
         self.stop_flush_deadline: float | None = None
         self._stop_lock = threading.Lock()
+        self.help_requests: queue.Queue[str] = queue.Queue()
+        self.console_owner = ConsoleOwner(self.console, on_stop=self._begin_stopping, on_help=self.help_requests.put)
         self.fatal: list[Exception] = []
         self.policy_change_logged = False
         self.instance = secrets.token_hex(8)
@@ -181,6 +192,17 @@ class DeviceLoop:
                 "capabilities": self.capabilities.copy(),
             }
 
+    def _request_session_screenshot_consent(self) -> None:
+        answer = self.console_owner.request(
+            f"{self.instance}-screenshot-session",
+            SCREENSHOT_SESSION_PROMPT,
+        )
+        if self.stop_event.is_set():
+            return
+        self.allow_screen = answer is not None and answer.strip() == "Y"
+        if not self.allow_screen:
+            self.console.write(SCREENSHOTS_DISABLED)
+
     def _is_stopping(self) -> bool:
         return getattr(self, "session_state", "normal") == "stopping"
 
@@ -251,13 +273,12 @@ class DeviceLoop:
             with self._stop_lock:
                 self.session_state = "stopped"
 
-    def _result(self, job_id: str, seq: int, *, chunk: str = "", done: bool = False, returncode: int | None = None, error: str | None = None, png: bytes | None = None, policy_hash: str | None = None) -> None:
+    def _result(self, job_id: str, seq: int, *, chunk: str = "", done: bool = False, returncode: int = 0, error: str | None = None, png: bytes | None = None, policy_hash: str | None = None) -> None:
         if not hasattr(self, "process_lock"):
             self.process_lock = threading.Lock()
         result = {"job_id": job_id, "seq": seq, "chunk": chunk, "done": done, "policy_hash": policy.digest() if policy_hash is None else policy_hash}
-        if returncode is not None:
+        if done:
             result["returncode"] = returncode
-        if error:
             result["error"] = error
         if png is not None:
             result["png_b64"] = base64.b64encode(png).decode("ascii")
@@ -409,7 +430,7 @@ class DeviceLoop:
                     self._result(job_id, seq, chunk=final, done=True, returncode=exit_code[0])
             elif job["type"] == "screenshot":
                 image = screen.capture(allow_screen=self.allow_screen)
-                self._result(job_id, seq, done=True, png=image)
+                self._result(job_id, seq, done=True, returncode=0, png=image)
             elif job["type"] == "cancel":
                 with self.process_lock:
                     target = self.processes.get(job["target_job_id"])
@@ -531,10 +552,18 @@ class DeviceLoop:
         except OSError as exc:
             lock_file.close()
             raise RuntimeError("Another hermes-hands serve process is already running for this device home") from exc
+        screenshot_consent_thread = None
         try:
             executor.reap_recorded_processes()
             heartbeat = threading.Thread(target=self._heartbeat_loop, daemon=True)
             heartbeat.start()
+            if getattr(self, "witness", False):
+                screenshot_consent_thread = threading.Thread(
+                    target=self._request_session_screenshot_consent,
+                    name="hermes-hands-screenshot-consent",
+                    daemon=True,
+                )
+                screenshot_consent_thread.start()
             while not self.stop_event.is_set():
                 try:
                     response = self._post("/device/poll", self._poll_body())
@@ -573,6 +602,12 @@ class DeviceLoop:
             self._begin_stopping()
             raise
         finally:
+            console_owner = getattr(self, "console_owner", None)
+            if console_owner is not None:
+                console_owner.close()
+                console_owner.join(0.1)
+            if screenshot_consent_thread is not None:
+                screenshot_consent_thread.join(0.1)
             if self._is_stopping():
                 self._stop_and_flush()
             else:

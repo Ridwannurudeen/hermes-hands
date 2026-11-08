@@ -144,6 +144,9 @@ class Agent:
 
     def _result(self, job_id, seq, chunk="", done=False, **extra):
         payload = {"job_id": job_id, "seq": seq, "chunk": chunk, "done": done}
+        if done:
+            payload["returncode"] = extra.pop("returncode", 0)
+            payload["error"] = extra.pop("error", None)
         self._call("device_result", "/device/result", {**payload, "policy_hash": "p0", **extra})
 
     def _loop(self):
@@ -155,7 +158,7 @@ class Agent:
             self.jobs.append(job)
             if job["type"] == "screenshot":
                 png = base64.b64encode(self.png).decode()
-                self._result(job["job_id"], 0, done=True, png_b64=png)
+                self._result(job["job_id"], 0, done=True, returncode=0, error=None, png_b64=png)
             elif job["type"] == "exec":
                 output, returncode = self.run(job)
                 self._result(job["job_id"], 0, output)

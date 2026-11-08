@@ -16,6 +16,15 @@ from urllib.parse import urlparse
 import httpx
 
 from . import config, executor, policy
+from .console import (
+    TerminalConsole,
+    WITNESS_CAPABILITIES,
+    WITNESS_CONSOLE_CLOSED,
+    WITNESS_DECLINED,
+    WITNESS_START_PROMPT,
+    WITNESS_STOPPED_BEFORE_START,
+    witness_consent_copy,
+)
 from .keys import get_or_create, remove as remove_key
 from .protocol import PROTOCOL_VERSION, R2D, b64u, canonical_json, fresh, sign, unb64u, verify_request
 from . import service
@@ -141,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     pair.add_argument("--force", action="store_true")
     serve = subs.add_parser("serve")
     serve.add_argument("--allow-screen", action="store_true")
+    serve.add_argument("--witness", action="store_true")
+    serve.add_argument("--service", action="store_true", help=argparse.SUPPRESS)
     subs.add_parser("status")
     subs.add_parser("doctor")
     install_service = subs.add_parser("install-service")
@@ -154,6 +165,49 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "pair":
         return _pair(args.gateway_url, args.name, args.code, force=args.force)
     if args.command == "serve":
+        if args.witness:
+            if args.service:
+                if sys.stderr is not None:
+                    print("Witness mode cannot run in service mode", file=sys.stderr)
+                return 1
+            if Path(sys.executable).stem.casefold() == "pythonw":
+                if sys.stderr is not None:
+                    print("Witness mode cannot run under pythonw", file=sys.stderr)
+                return 1
+            if sys.stdin is None or sys.stdout is None or not sys.stdin.isatty() or not sys.stdout.isatty():
+                if sys.stderr is not None:
+                    print("Witness mode requires stdin and stdout TTYs", file=sys.stderr)
+                return 1
+            if not config.device_id() or not config.gateway_url():
+                parser.error("pair this device first")
+            console = TerminalConsole()
+            pairing = config.load()
+            owner_label = pairing.get("owner_label") or pairing.get("device_id") or "paired owner"
+            gateway_host = urlparse(config.gateway_url()).netloc or "unknown gateway"
+            console.write(witness_consent_copy(owner_label, gateway_host))
+            from .loop import DeviceLoop
+            from .janitor import start as start_janitor
+
+            agent = DeviceLoop(allow_screen=False, console=console)
+            consent = agent.console_owner.startup_consent(WITNESS_START_PROMPT)
+            if consent is None:
+                agent.console_owner.close()
+                console.write(WITNESS_CONSOLE_CLOSED)
+                return 1
+            if consent.strip() in ("S", "s"):
+                agent.console_owner.close()
+                console.write(WITNESS_STOPPED_BEFORE_START)
+                return 0
+            if consent.strip() != "Y":
+                agent.console_owner.close()
+                console.write(WITNESS_DECLINED)
+                return 0
+            agent.witness = True
+            agent.session_state = "active"
+            agent.capabilities = list(WITNESS_CAPABILITIES)
+            start_janitor()
+            agent.run_forever()
+            return 0
         from .loop import DeviceLoop
         from .janitor import start as start_janitor
 

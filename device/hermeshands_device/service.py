@@ -44,9 +44,9 @@ def task_xml(*, executable: str, username: str, allow_screen: bool = False) -> b
     ElementTree.SubElement(exec_action, "WorkingDirectory").text = str(Path.home())
     arguments = ElementTree.SubElement(exec_action, "Arguments")
     if allow_screen:
-        arguments.text = "-I -m hermeshands_device.cli serve --allow-screen"
+        arguments.text = "-I -m hermeshands_device.cli serve --allow-screen --service"
     else:
-        arguments.text = "-I -m hermeshands_device.cli serve"
+        arguments.text = "-I -m hermeshands_device.cli serve --service"
     declaration = '<?xml version="1.0" encoding="UTF-16"?>\n'
     return (declaration + ElementTree.tostring(task, encoding="unicode")).encode("utf-16")
 
