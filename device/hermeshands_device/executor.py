@@ -76,45 +76,16 @@ def resolve_bash() -> str | None:
 
 def _terminate(proc: subprocess.Popen, start_time: float) -> None:
     if os.name == "nt":
-        if _terminate_windows_job(proc.pid, start_time):
-            return
-        try:
-            process = psutil.Process(proc.pid)
-            current = process.create_time()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return
-        if abs(current - start_time) > 0.01:
-            return
-        try:
-            descendants = [(child.pid, child.create_time()) for child in process.children(recursive=True)]
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            descendants = []
-        taskkill = shutil.which("taskkill")
-        if taskkill:
-            try:
-                subprocess.run([taskkill, "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=TASKKILL_TIMEOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
-            except (OSError, subprocess.SubprocessError) as exc:
-                logging.getLogger(__name__).warning("taskkill failed for job %s: %s", proc.pid, exc)
-        for child_pid, child_start in descendants:
-            try:
-                child = psutil.Process(child_pid)
-                if abs(child.create_time() - child_start) <= 0.01:
-                    child.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
-                logging.getLogger(__name__).warning("Could not kill job child %s: %s", child_pid, exc)
-    else:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok -- POSIX-only branch
-        except ProcessLookupError:
-            return
-        except OSError as exc:
-            logging.getLogger(__name__).warning("Could not kill process group %s: %s", proc.pid, exc)
-            return
+        terminate_recorded(proc.pid, start_time)
         return
     try:
-        proc.kill()
+        os.killpg(proc.pid, signal.SIGKILL)  # windows-footgun: ok -- POSIX-only branch
+    except ProcessLookupError:
+        return
     except OSError as exc:
-        logging.getLogger(__name__).warning("Could not kill job process %s: %s", proc.pid, exc)
+        logging.getLogger(__name__).warning(
+            "Could not kill process group %s: %s", proc.pid, exc
+        )
 
 
 def _windows_job_name(pid: int, start_time: float) -> str:
@@ -332,8 +303,6 @@ def _terminate_windows_jobs() -> None:
 
 
 def terminate_recorded(pid: int, start_time: float) -> None:
-    if os.name == "nt" and _terminate_windows_job(pid, start_time):
-        return
     try:
         process = psutil.Process(pid)
         current = process.create_time()
@@ -343,27 +312,33 @@ def terminate_recorded(pid: int, start_time: float) -> None:
         return
     if os.name == "nt":
         try:
-            descendants = [(child.pid, child.create_time()) for child in process.children(recursive=True)]
+            descendants = [
+                (child.pid, child.create_time())
+                for child in process.children(recursive=True)
+            ]
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             descendants = []
-        taskkill = shutil.which("taskkill")
-        if taskkill:
-            try:
-                subprocess.run([taskkill, "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=TASKKILL_TIMEOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False)
-            except (OSError, subprocess.SubprocessError) as exc:
-                logging.getLogger(__name__).warning("taskkill failed for recorded job %s: %s", pid, exc)
-        for child_pid, child_start in descendants:
+        _terminate_windows_job(pid, start_time)
+        for child_pid, child_start in reversed(descendants):
             try:
                 child = psutil.Process(child_pid)
                 if abs(child.create_time() - child_start) <= 0.01:
                     child.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
-                logging.getLogger(__name__).warning("Could not reap job child %s: %s", child_pid, exc)
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.AccessDenied, OSError) as exc:
+                logging.getLogger(__name__).warning(
+                    "Could not reap job child %s: %s", child_pid, exc
+                )
         try:
             if abs(process.create_time() - start_time) <= 0.01:
                 process.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
-            logging.getLogger(__name__).warning("Could not reap process %s: %s", pid, exc)
+        except psutil.NoSuchProcess:
+            return
+        except (psutil.AccessDenied, OSError) as exc:
+            logging.getLogger(__name__).warning(
+                "Could not reap process %s: %s", pid, exc
+            )
     else:
         try:
             os.killpg(pid, signal.SIGKILL)  # windows-footgun: ok -- POSIX-only branch

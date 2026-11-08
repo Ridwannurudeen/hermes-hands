@@ -21,6 +21,9 @@ from .protocol import D2R, R2D, canonical_json, fresh, make_bearer, new_nonce, s
 
 logger = logging.getLogger(__name__)
 
+_STOP_FLUSH_SECONDS = 5
+_STOP_REQUEST_TIMEOUT = 2
+
 _BACKGROUND_PID_PROBE = re.compile(
     r"(?ms)^eval 'kill -0 \"\$\(cat "
     r"(('\\'')?[^\n;&|$()<>`']*/hermes_bg_[\w-]+\.pid(?:'\\'')?) 2>/dev/null\)\" "
@@ -49,6 +52,11 @@ class DeviceLoop:
         self.process_lock = threading.Lock()
         self.job_deadlines: dict[str, float] = {}
         self.stop_event = threading.Event()
+        self.session_state = "normal"
+        self.witness = False
+        self.capabilities: list[str] = []
+        self.stop_flush_deadline: float | None = None
+        self._stop_lock = threading.Lock()
         self.fatal: list[Exception] = []
         self.policy_change_logged = False
         self.instance = secrets.token_hex(8)
@@ -72,7 +80,13 @@ class DeviceLoop:
             "X-Hands-Ts": str(ts), "X-Hands-Nonce": nonce,
             "X-Hands-Signature": sign_request(self.private, D2R, ts, nonce, "POST", path, body),
         }
-        return self.client.post(self.gateway_url + endpoint, content=body, headers=headers)
+        request_options = {}
+        remaining = self._stop_flush_remaining()
+        if remaining is not None:
+            if not remaining:
+                raise InterruptedError("stop result flush deadline expired")
+            request_options["timeout"] = min(remaining, _STOP_REQUEST_TIMEOUT)
+        return self.client.post(self.gateway_url + endpoint, content=body, headers=headers, **request_options)
 
     def _verify_response(self, response: httpx.Response, endpoint: str) -> dict:
         if response.status_code in (401, 409):
@@ -142,10 +156,57 @@ class DeviceLoop:
         self.stop_event.wait(delay)
 
     def _poll_body(self) -> dict:
-        return {"wait": 25, "policy_hash": policy.digest(), "instance": self.instance}
+        return {
+            "wait": 25,
+            "policy_hash": policy.digest(),
+            "instance": self.instance,
+            **self._session_status(),
+        }
 
     def _heartbeat_body(self) -> dict:
-        return {"policy_hash": policy.digest(), "os": platform.platform(), "home": str(Path.home()), "agent_version": __version__, "instance": self.instance}
+        return {
+            "policy_hash": policy.digest(),
+            "os": platform.platform(),
+            "home": str(Path.home()),
+            "agent_version": __version__,
+            "instance": self.instance,
+            **self._session_status(),
+        }
+
+    def _session_status(self) -> dict:
+        with self._stop_lock:
+            return {
+                "witness": self.witness,
+                "session_state": self.session_state,
+                "capabilities": self.capabilities.copy(),
+            }
+
+    def _is_stopping(self) -> bool:
+        return getattr(self, "session_state", "normal") == "stopping"
+
+    def _stop_flush_remaining(self) -> float | None:
+        with self._stop_lock:
+            if not self._is_stopping():
+                return None
+            deadline = getattr(self, "stop_flush_deadline", None)
+            if deadline is None:
+                return 0.0
+            return max(0.0, deadline - time.monotonic())
+
+    def _begin_stopping(self) -> float:
+        if not hasattr(self, "_stop_lock"):
+            self._stop_lock = threading.Lock()
+        with self._stop_lock:
+            if getattr(self, "session_state", "normal") == "stopped":
+                return getattr(self, "stop_flush_deadline", None) or time.monotonic()
+            if not self._is_stopping():
+                self.session_state = "stopping"
+                self.stop_flush_deadline = time.monotonic() + _STOP_FLUSH_SECONDS
+                self.witness = False
+            elif getattr(self, "stop_flush_deadline", None) is None:
+                self.stop_flush_deadline = time.monotonic() + _STOP_FLUSH_SECONDS
+            self.stop_event.set()
+            return self.stop_flush_deadline
 
     def _cancel_all(self) -> None:
         """On revoke, stop foreground and detached Windows jobs before serve exits."""
@@ -166,8 +227,29 @@ class DeviceLoop:
             with self.process_lock:
                 starting = list(self.job_start_events.values())
             for started in starting:
-                started.wait()
+                remaining = self._stop_flush_remaining()
+                if remaining is None:
+                    started.wait()
+                else:
+                    started.wait(timeout=remaining)
             executor._terminate_windows_jobs()
+
+    def _stop_and_flush(self) -> None:
+        deadline = self._begin_stopping()
+        if getattr(self, "session_state", "normal") == "stopped":
+            return
+        try:
+            self._cancel_running_jobs()
+            if not hasattr(self, "process_lock"):
+                self.process_lock = threading.Lock()
+            with self.process_lock:
+                jobs = list(getattr(self, "running", {}).values())
+            for thread in jobs:
+                if thread is not threading.current_thread():
+                    thread.join(max(0.0, deadline - time.monotonic()))
+        finally:
+            with self._stop_lock:
+                self.session_state = "stopped"
 
     def _result(self, job_id: str, seq: int, *, chunk: str = "", done: bool = False, returncode: int | None = None, error: str | None = None, png: bytes | None = None, policy_hash: str | None = None) -> None:
         if not hasattr(self, "process_lock"):
@@ -179,7 +261,9 @@ class DeviceLoop:
             result["error"] = error
         if png is not None:
             result["png_b64"] = base64.b64encode(png).decode("ascii")
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() or self._is_stopping():
+            if self._is_stopping() and not self._stop_flush_remaining():
+                break
             try:
                 response = self._post("/device/result", result)
                 if response.status_code >= 500:
@@ -197,12 +281,20 @@ class DeviceLoop:
                     raise InterruptedError("relay cancelled the job")
                 return
             except (httpx.HTTPError, ValueError):
-                deadline = getattr(self, "job_deadlines", {}).get(job_id)
-                if deadline is not None and time.monotonic() >= deadline:
-                    logger.warning("Stopping job %s after result delivery expired at sequence %s", job_id, seq)
-                    raise InterruptedError("result delivery expired")
-                self.stop_event.wait(1)
+                if self._is_stopping():
+                    remaining = self._stop_flush_remaining()
+                    if not remaining:
+                        break
+                    time.sleep(min(1.0, remaining))
+                else:
+                    deadline = getattr(self, "job_deadlines", {}).get(job_id)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        logger.warning("Stopping job %s after result delivery expired at sequence %s", job_id, seq)
+                        raise InterruptedError("result delivery expired")
+                    self.stop_event.wait(1)
         logger.debug("Stopping result delivery for %s because the device is stopping", job_id)
+        if self._is_stopping():
+            raise InterruptedError("stop result flush deadline expired")
         raise InterruptedError("device is stopping")
 
     def _run_job(self, job: dict, start_event: threading.Event | None = None) -> None:
@@ -223,6 +315,19 @@ class DeviceLoop:
             self.instance = secrets.token_hex(8)
         tail = b""
         try:
+            if self._is_stopping():
+                start_event.set()
+                self._result(
+                    job_id,
+                    seq,
+                    done=True,
+                    returncode=130,
+                    error="stopped_by_person",
+                )
+                return
+            if self.stop_event.is_set():
+                start_event.set()
+                return
             if job["type"] != "exec":
                 start_event.set()
             if job["type"] == "exec":
@@ -287,7 +392,16 @@ class DeviceLoop:
                     self._result(job_id, seq, chunk=decoder.decode(chunk))
                     seq += 1
                 final = decoder.decode(tail, final=True)
-                if capped.is_set():
+                if self._is_stopping():
+                    self._result(
+                        job_id,
+                        seq,
+                        chunk=final,
+                        done=True,
+                        returncode=130,
+                        error="stopped_by_person",
+                    )
+                elif capped.is_set():
                     self._result(job_id, seq, chunk=final, done=True, returncode=1, error="Output exceeded the 64 MiB device limit")
                 elif truncated.is_set():
                     self._result(job_id, seq, chunk=final, done=True, returncode=1, error="Output was truncated after the post-exit pipe idle limit")
@@ -311,6 +425,19 @@ class DeviceLoop:
         except PermissionError as exc:
             if str(exc) == "pairing_changed":
                 return
+            if self._is_stopping():
+                try:
+                    self._result(
+                        job_id,
+                        seq,
+                        chunk=tail.decode("utf-8", errors="replace"),
+                        done=True,
+                        returncode=130,
+                        error="stopped_by_person",
+                    )
+                except Exception:
+                    logger.debug("Could not deliver stopped result for %s", job_id, exc_info=True)
+                return
             if self.stop_event.is_set():
                 logger.debug("Dropping result for %s because the device is stopping", job_id)
                 return
@@ -327,6 +454,19 @@ class DeviceLoop:
             except Exception:
                 logger.debug("Could not deliver job failure for %s", job_id, exc_info=True)
         except Exception as exc:
+            if self._is_stopping():
+                try:
+                    self._result(
+                        job_id,
+                        seq,
+                        chunk=tail.decode("utf-8", errors="replace"),
+                        done=True,
+                        returncode=130,
+                        error="stopped_by_person",
+                    )
+                except Exception:
+                    logger.debug("Could not deliver stopped result for %s", job_id, exc_info=True)
+                return
             if self.stop_event.is_set():
                 logger.debug("Dropping result for %s because the device is stopping", job_id)
                 return
@@ -429,9 +569,15 @@ class DeviceLoop:
                     if not (isinstance(exc, ValueError) and str(exc).startswith("transient relay status ")):
                         logger.warning("Device poll failed; retrying")
                     self._retry("poll_retry_delay")
+        except KeyboardInterrupt:
+            self._begin_stopping()
+            raise
         finally:
-            self.stop_event.set()
-            self._cancel_running_jobs()
+            if self._is_stopping():
+                self._stop_and_flush()
+            else:
+                self.stop_event.set()
+                self._cancel_running_jobs()
             if os.name == "nt":
                 import msvcrt
 

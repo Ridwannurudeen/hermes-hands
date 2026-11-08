@@ -377,32 +377,84 @@ def test_stdin_base64_is_staged_byte_exact_and_removed(monkeypatch, tmp_path):
     assert not list((tmp_path / ".hermes-hands/out").glob("*.stdin"))
 
 
-def test_taskkill_timeout_falls_back_without_raising(monkeypatch):
+def test_terminate_kills_checked_descendants_after_job_termination(monkeypatch):
+    events = []
+
     class Process:
-        pid = 4321
-        killed = False
+        def __init__(self, pid, created, children=()):
+            self.pid = pid
+            self.created = created
+            self.descendants = children
+
+        def create_time(self):
+            return self.created
+
+        def children(self, recursive=False):
+            events.append(("snapshot", self.pid, recursive))
+            return self.descendants
 
         def kill(self):
-            self.killed = True
+            events.append(("kill", self.pid))
+
+    escaped = Process(8765, 2.0)
+
+    class ReusedProcess(Process):
+        checks = 0
+
+        def create_time(self):
+            self.checks += 1
+            return 2.0 if self.checks == 1 else 3.0
+
+    reused = ReusedProcess(9876, 2.0)
+    root = Process(4321, 1.0, (escaped, reused))
+    processes = {process.pid: process for process in (root, escaped, reused)}
+    monkeypatch.setattr(executor.os, "name", "nt")
+    monkeypatch.setattr(executor.psutil, "Process", lambda pid: processes[pid])
+    monkeypatch.setattr(
+        executor,
+        "_terminate_windows_job",
+        lambda pid, start_time: events.append(("job", pid, start_time)) or True,
+    )
+
+    executor._terminate(SimpleNamespace(pid=4321), 1.0)
+
+    assert events == [
+        ("snapshot", 4321, True),
+        ("job", 4321, 1.0),
+        ("kill", 8765),
+        ("kill", 4321),
+    ]
+
+
+def test_terminate_does_not_kill_reused_root_pid(monkeypatch):
+    calls = []
+
+    class ReusedProcess:
+        checks = 0
+
+        def create_time(self):
+            self.checks += 1
+            return 1.0 if self.checks == 1 else 2.0
 
         def children(self, recursive=False):
             return []
 
-    proc = Process()
-    calls = []
+        def kill(self):
+            calls.append("kill")
+
+    process = ReusedProcess()
     monkeypatch.setattr(executor.os, "name", "nt")
-    monkeypatch.setattr(executor.psutil, "Process", lambda pid: type("Live", (), {"create_time": lambda self: 1.0, "children": lambda self, recursive=False: []})())
-    monkeypatch.setattr(executor, "_open_windows_job", lambda pid, start_time: None)
-    monkeypatch.setattr(executor.shutil, "which", lambda name: "taskkill.exe")
+    monkeypatch.setattr(executor.psutil, "Process", lambda pid: process)
+    monkeypatch.setattr(
+        executor,
+        "_terminate_windows_job",
+        lambda pid, start_time: calls.append(("job", pid, start_time)) or True,
+    )
 
-    def slow_taskkill(args, **kwargs):
-        calls.append(kwargs["timeout"])
-        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+    executor.terminate_recorded(4321, 1.0)
 
-    monkeypatch.setattr(executor.subprocess, "run", slow_taskkill)
-    executor._terminate(proc, 1.0)
-    assert calls == [10]
-    assert proc.killed
+    assert process.checks == 2
+    assert calls == [("job", 4321, 1.0)]
 
 
 @pytest.mark.parametrize("failure", ["record", "start"])
@@ -627,6 +679,7 @@ def test_windows_job_close_waits_for_inflight_termination(monkeypatch):
     monkeypatch.setattr(executor.os, "name", "nt")
     monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel32, raising=False)
     monkeypatch.setattr(executor, "_WINDOWS_JOBS", {1234: 5678})
+    monkeypatch.setattr(executor.psutil, "Process", lambda pid: SimpleNamespace(create_time=lambda: 1.0, children=lambda recursive=False: [], kill=lambda: None))
     process = SimpleNamespace(pid=1234)
     terminator = threading.Thread(target=executor._terminate, args=(process, 1.0))
     closer = threading.Thread(target=executor._close_windows_job, args=(process, 5678))

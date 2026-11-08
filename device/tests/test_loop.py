@@ -508,6 +508,245 @@ def test_signed_unknown_device_kills_background_child_after_shell_exit(monkeypat
         agent.client.close()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows App Execution Alias revoke containment")
+def test_signed_heartbeat_revoke_kills_python3_alias_child(monkeypatch, tmp_path):
+    bash = loop.executor.resolve_bash()
+    if not bash:
+        pytest.skip("Git Bash is unavailable")
+    alias = loop.executor.subprocess.run(
+        [bash, "-c", "command -v python3"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=5,
+    )
+    if (
+        alias.returncode
+        or "/windowsapps/" not in alias.stdout.strip().replace("\\", "/").lower()
+    ):
+        pytest.skip("Python 3 App Execution Alias is unavailable inside Git Bash")
+
+    import ctypes
+    from ctypes import wintypes
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(loop.executor, "resolve_bash", lambda: bash)
+    monkeypatch.setattr(loop.executor.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(loop.executor, "_WINDOWS_JOBS", {})
+    monkeypatch.setattr(
+        loop.policy, "snapshot", lambda: ("accepted-hash", loop.policy.DEFAULTS.copy())
+    )
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    monkeypatch.setattr(
+        config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands"
+    )
+    monkeypatch.setattr(config, "device_id", lambda: "device-1")
+    monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    monkeypatch.setattr(
+        config,
+        "load",
+        lambda: {
+            "gateway_url": "https://example.test/api/plugins/hermes-hands",
+            "device_id": "device-1",
+            "relay_public_key": b64u(public),
+        },
+    )
+
+    revoked = threading.Event()
+    heartbeat_ready = threading.Event()
+    timestamps = {}
+
+    def handler(request):
+        if request.url.path.endswith("/device/heartbeat") and revoked.is_set():
+            body = canonical_json({"error": "unknown_device"})
+            nonce = request.headers["X-Hands-Nonce"]
+            path = "/api/plugins/hermes-hands/device/heartbeat"
+            ts = int(time.time())
+            return httpx.Response(
+                401,
+                content=body,
+                request=request,
+                headers={
+                    "X-Hands-Ts": str(ts),
+                    "X-Hands-Nonce": nonce,
+                    "X-Hands-Signature": sign_request(
+                        private, R2D, ts, nonce, "POST", path, body
+                    ),
+                },
+            )
+        return httpx.Response(204, request=request)
+
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(handler))
+    agent.accepted_policy_hash = "accepted-hash"
+    output = ""
+    child_pids = []
+    child_ready = threading.Event()
+
+    def collect_output(job_id, seq, **values):
+        nonlocal output
+        output += values.get("chunk", "")
+        for line in output.splitlines():
+            if line.isdecimal():
+                child_pids.append(int(line))
+                child_ready.set()
+                return
+
+    agent._result = collect_output
+    original_verify = agent._verify_response
+
+    def trace_verify(response, endpoint):
+        if response.status_code == 401 and endpoint == "/device/heartbeat":
+            timestamps["first_signed_401"] = time.monotonic()
+            timestamps["first_signed_401_utc"] = datetime.now(timezone.utc).isoformat(
+                timespec="milliseconds"
+            )
+        result = original_verify(response, endpoint)
+        if response.status_code == 204 and endpoint == "/device/heartbeat":
+            timestamps["heartbeat_success"] = time.monotonic()
+            heartbeat_ready.set()
+        return result
+
+    agent._verify_response = trace_verify
+    original_cancel = agent._cancel_all
+
+    def trace_cancel():
+        timestamps["cancel_all"] = time.monotonic()
+        timestamps["cancel_all_utc"] = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
+        original_cancel()
+
+    agent._cancel_all = trace_cancel
+    job = threading.Thread(
+        target=agent._run_job,
+        args=(
+            {
+                "job_id": "revoke-alias",
+                "type": "exec",
+                "script": f"python3 -B -c {shlex.quote('import os,time; print(os.getpid(), flush=True); time.sleep(60)')}",
+            },
+        ),
+    )
+    heartbeat = threading.Thread(target=agent._heartbeat_loop)
+    tracked = set()
+
+    try:
+        job.start()
+        assert child_ready.wait(5), "App Execution Alias command did not report its PID"
+        child_pid = child_pids[0]
+        assert psutil.pid_exists(child_pid)
+        proc = next(iter(agent.processes.values()))[0]
+        job_handle = loop.executor._WINDOWS_JOBS[proc.pid]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.IsProcessInJob.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        kernel32.IsProcessInJob.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        child_handle = kernel32.OpenProcess(0x1000, False, child_pid)
+        assert child_handle, (
+            f"Could not open Python child {child_pid} for IsProcessInJob"
+        )
+        in_job = wintypes.BOOL()
+        try:
+            assert kernel32.IsProcessInJob(
+                child_handle, wintypes.HANDLE(job_handle), ctypes.byref(in_job)
+            )
+        finally:
+            kernel32.CloseHandle(child_handle)
+        alias_in_job = bool(in_job.value)
+
+        root = psutil.Process(proc.pid)
+        tracked.add((root.pid, root.create_time()))
+        tracked.update(
+            (descendant.pid, descendant.create_time())
+            for descendant in root.children(recursive=True)
+        )
+        assert any(pid == child_pid for pid, _ in tracked), (
+            "Alias Python was not a descendant of the executor process"
+        )
+
+        heartbeat.start()
+        assert heartbeat_ready.wait(5), (
+            "Device heartbeat did not complete before revoke"
+        )
+        timestamps["revoke"] = time.monotonic()
+        timestamps["revoke_utc"] = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
+        revoked.set()
+        deadline = timestamps["revoke"] + 8
+        while time.monotonic() < deadline:
+            alive = False
+            for pid, started in tracked:
+                try:
+                    current = psutil.Process(pid)
+                except psutil.NoSuchProcess:
+                    continue
+                if abs(current.create_time() - started) <= 0.01:
+                    alive = True
+                    break
+            if not alive:
+                timestamps["process_death"] = time.monotonic()
+                timestamps["process_death_utc"] = datetime.now(timezone.utc).isoformat(
+                    timespec="milliseconds"
+                )
+                break
+            time.sleep(0.02)
+
+        assert "first_signed_401" in timestamps
+        assert "cancel_all" in timestamps
+        assert "process_death" in timestamps, (
+            f"python3 alias child survived revoke; IsProcessInJob={alias_in_job}"
+        )
+        assert timestamps["first_signed_401"] - timestamps["revoke"] <= 5.5
+        assert timestamps["process_death"] - timestamps["cancel_all"] <= 3
+        print(
+            "revoke timestamps UTC: "
+            f"revoke={timestamps['revoke_utc']} "
+            f"first_signed_401={timestamps['first_signed_401_utc']} "
+            f"_cancel_all={timestamps['cancel_all_utc']} "
+            f"process_death={timestamps['process_death_utc']} "
+            f"IsProcessInJob={alias_in_job}"
+        )
+        heartbeat.join(2)
+        job.join(5)
+        assert not heartbeat.is_alive()
+        assert not job.is_alive()
+    finally:
+        revoked.set()
+        agent.stop_event.set()
+        if heartbeat.ident is not None:
+            heartbeat.join(2)
+        for proc, started in tuple(agent.processes.values()):
+            try:
+                root = psutil.Process(proc.pid)
+                if abs(root.create_time() - started) <= 0.01:
+                    tracked.add((root.pid, root.create_time()))
+                    tracked.update(
+                        (descendant.pid, descendant.create_time())
+                        for descendant in root.children(recursive=True)
+                    )
+            except psutil.NoSuchProcess:
+                continue
+        for pid, started in reversed(tuple(tracked)):
+            try:
+                process = psutil.Process(pid)
+                if abs(process.create_time() - started) <= 0.01:
+                    process.kill()
+            except psutil.NoSuchProcess:
+                continue
+        job.join(5)
+        agent.client.close()
+
+
 def test_retry_backoff_caps_at_3_seconds(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.poll_retry_delay = 1
@@ -566,9 +805,18 @@ def test_heartbeat_retries_within_5_seconds_after_policy_changed(monkeypatch):
 def test_poll_and_heartbeat_share_instance(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.instance = "1234567890abcdef"
+    agent.witness = False
+    agent.session_state = "normal"
+    agent.capabilities = []
+    agent._stop_lock = threading.Lock()
     monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
     agent.accepted_policy_hash = "hash"
-    assert agent._poll_body()["instance"] == agent._heartbeat_body()["instance"] == agent.instance
+    poll = agent._poll_body()
+    heartbeat = agent._heartbeat_body()
+    assert poll["instance"] == heartbeat["instance"] == agent.instance
+    assert poll["witness"] is heartbeat["witness"] is False
+    assert poll["session_state"] == heartbeat["session_state"] == "normal"
+    assert poll["capabilities"] == heartbeat["capabilities"] == []
 
 
 def test_loop_204_is_no_job_and_non_200_is_not_parsed():
@@ -601,6 +849,7 @@ def test_loop_posts_seq_ordered_chunks(monkeypatch):
 def test_exec_refuses_changed_policy_and_posts_current_hash(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.processes, agent.running = {}, {}
+    agent.stop_event = threading.Event()
     posted = []
     monkeypatch.setattr(loop.policy, "snapshot", lambda: ("new-hash", loop.policy.DEFAULTS.copy()))
     monkeypatch.setattr(loop.executor, "run", lambda *a, **kw: pytest.fail("job ran under unaccepted policy"))
@@ -613,6 +862,7 @@ def test_exec_refuses_changed_policy_and_posts_current_hash(monkeypatch):
 def test_exec_runs_when_policy_matches_accepted_hash(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.processes, agent.running = {}, {}
+    agent.stop_event = threading.Event()
     posted = []
     monkeypatch.setattr(loop.policy, "snapshot", lambda: ("same-hash", loop.policy.DEFAULTS.copy()))
     monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
@@ -627,6 +877,7 @@ def test_loop_incrementally_decodes_split_utf8(monkeypatch):
     posted = []
     agent = object.__new__(loop.DeviceLoop)
     agent.processes, agent.running = {}, {}
+    agent.stop_event = threading.Event()
     agent.cancelled_jobs = set()
     agent.job_deadlines = {}
     monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
@@ -643,6 +894,7 @@ def test_loop_passes_base64_stdin_to_executor(monkeypatch):
     agent.accepted_policy_hash = "hash"
     agent.processes = {}
     agent.running = {}
+    agent.stop_event = threading.Event()
     agent.cancelled_jobs = set()
     agent.job_deadlines = {}
     received = []
@@ -709,6 +961,7 @@ def test_model_workdir_inside_eval_is_checked_for_self_protection(monkeypatch):
     agent.accepted_policy_hash = "hash"
     agent.processes = {}
     agent.running = {}
+    agent.stop_event = threading.Event()
     agent.cancelled_jobs = set()
     agent.job_deadlines = {}
     agent.process_lock = threading.Lock()
@@ -947,6 +1200,7 @@ def test_loop_does_not_strip_injected_shell_from_quoted_pid_path(monkeypatch):
     agent = object.__new__(loop.DeviceLoop)
     agent.processes = {}
     agent.running = {}
+    agent.stop_event = threading.Event()
     posted = []
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
     monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter(()))
@@ -970,6 +1224,7 @@ def test_loop_refuses_denied_commands_even_when_preceded_by_background_probe(mon
         agent = object.__new__(loop.DeviceLoop)
         agent.processes = {}
         agent.running = {}
+        agent.stop_event = threading.Event()
         posted = []
         monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append(kwargs))
         monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: iter(()))
@@ -1225,6 +1480,195 @@ def test_stopping_during_result_delivery_does_not_escape_job_thread(monkeypatch)
     assert errors == []
 
 
+def test_result_posts_in_flight_chunk_during_stopping(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.stop_event.set()
+    agent.session_state = "stopping"
+    agent.stop_flush_deadline = time.monotonic() + 5
+    agent._stop_lock = threading.Lock()
+    agent.process_lock = threading.Lock()
+    agent.processes = {}
+    agent.job_deadlines = {}
+    posted = []
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+    monkeypatch.setattr(agent, "_post", lambda endpoint, body: posted.append((endpoint, body)) or httpx.Response(204))
+    monkeypatch.setattr(agent, "_verify_response", lambda *args: {})
+
+    agent._result("job", 0, chunk="observed output")
+
+    assert posted == [
+        (
+            "/device/result",
+            {
+                "job_id": "job",
+                "seq": 0,
+                "chunk": "observed output",
+                "done": False,
+                "policy_hash": "hash",
+            },
+        )
+    ]
+
+
+def test_result_retries_during_stopping_until_shared_flush_deadline(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.stop_event = threading.Event()
+    agent.stop_event.set()
+    agent.session_state = "stopping"
+    agent.stop_flush_deadline = 105.0
+    agent._stop_lock = threading.Lock()
+    agent.process_lock = threading.Lock()
+    agent.processes = {}
+    agent.job_deadlines = {}
+    now = [100.0]
+    attempts = []
+    monkeypatch.setattr(loop.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(loop.time, "sleep", lambda delay: now.__setitem__(0, now[0] + delay))
+
+    def post(endpoint, body):
+        attempts.append((endpoint, body))
+        now[0] += 2.1
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(agent, "_post", post)
+    monkeypatch.setattr(loop.policy, "digest", lambda: "hash")
+
+    with pytest.raises(InterruptedError, match="flush"):
+        agent._result("job", 0, chunk="observed output")
+
+    assert len(attempts) == 2
+    assert now[0] >= agent.stop_flush_deadline
+
+
+def test_stopping_result_request_timeout_uses_remaining_global_budget(monkeypatch):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    monkeypatch.setattr(config, "gateway_url", lambda: "https://example.test/api/plugins/hermes-hands")
+    monkeypatch.setattr(config, "device_id", lambda: "device-1")
+    monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    monkeypatch.setattr(
+        config,
+        "load",
+        lambda: {
+            "gateway_url": "https://example.test/api/plugins/hermes-hands",
+            "device_id": "device-1",
+            "relay_public_key": b64u(public),
+        },
+    )
+    timeouts = []
+    agent = loop.DeviceLoop(
+        transport=httpx.MockTransport(
+            lambda request: timeouts.append(request.extensions["timeout"])
+            or httpx.Response(204, request=request)
+        )
+    )
+    agent.session_state = "stopping"
+    monkeypatch.setattr(loop.time, "monotonic", lambda: 10.0)
+
+    try:
+        agent.stop_flush_deadline = 11.25
+        agent._post("/device/result", {})
+        agent.stop_flush_deadline = 12.5
+        agent._post("/device/result", {})
+        agent.stop_flush_deadline = 9.0
+        with pytest.raises(InterruptedError, match="flush"):
+            agent._post("/device/result", {})
+    finally:
+        agent.client.close()
+
+    assert [max(timeout.values()) for timeout in timeouts] == [1.25, 2.0]
+
+
+def test_stopping_job_reports_observed_output_and_stopped_result(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.accepted_policy_hash = "hash"
+    agent.processes = {}
+    agent.running = {}
+    agent.cancelled_jobs = set()
+    agent.job_deadlines = {}
+    agent.job_start_events = {}
+    agent.process_lock = threading.Lock()
+    agent.stop_event = threading.Event()
+    agent.session_state = "normal"
+    posted = []
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.policy, "refusal", lambda script, deny=None: None)
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **values: posted.append((seq, values)))
+
+    class Process:
+        def poll(self):
+            return None
+
+    def run(*args, on_start, on_exit, **kwargs):
+        on_start(Process(), 1.0)
+        yield b"before stop"
+        agent.session_state = "stopping"
+        agent.stop_event.set()
+        yield b"during stop"
+        on_exit(-9)
+
+    monkeypatch.setattr(loop.executor, "run", run)
+
+    agent._run_job({"job_id": "stopped", "type": "exec", "script": "echo output"})
+
+    assert posted == [
+        (0, {"chunk": "before stop"}),
+        (1, {"chunk": "during stop"}),
+        (2, {"chunk": "", "done": True, "returncode": 130, "error": "stopped_by_person"}),
+    ]
+
+
+def test_job_returned_after_stop_is_refused_without_execution(monkeypatch):
+    agent = object.__new__(loop.DeviceLoop)
+    agent.accepted_policy_hash = "hash"
+    agent.processes = {}
+    agent.running = {}
+    agent.cancelled_jobs = set()
+    agent.job_deadlines = {}
+    agent.job_start_events = {}
+    agent.process_lock = threading.Lock()
+    agent.stop_event = threading.Event()
+    agent.stop_event.set()
+    agent.session_state = "stopping"
+    posted = []
+    monkeypatch.setattr(agent, "_result", lambda job_id, seq, **values: posted.append(values))
+    monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: pytest.fail("raced job executed"))
+
+    agent._run_job({"job_id": "raced", "type": "exec", "script": "echo must not run"})
+
+    assert posted == [{"done": True, "returncode": 130, "error": "stopped_by_person"}]
+
+
+def test_external_stop_event_preserves_agent_restart_semantics(monkeypatch, tmp_path):
+    agent = object.__new__(loop.DeviceLoop)
+    monkeypatch.setattr(loop.Path, "home", lambda: tmp_path)
+    agent.stop_event = threading.Event()
+    agent.fatal = []
+    agent.running = {}
+    agent.processes = {}
+    agent.instance = "1234567890abcdef"
+    agent.session_state = "normal"
+    agent.witness = False
+    agent.capabilities = []
+    agent._poll_body = lambda: {}
+    agent._post = lambda *args: agent.stop_event.set() or httpx.Response(204)
+    agent._verify_response = lambda *args: {}
+    cancelled = []
+    agent._cancel_running_jobs = lambda: cancelled.append(True)
+    monkeypatch.setattr(loop.executor, "reap_recorded_processes", lambda: None)
+    monkeypatch.setattr(
+        loop.threading,
+        "Thread",
+        lambda **kwargs: type("Thread", (), {"start": lambda self: None})(),
+    )
+
+    agent.run_forever()
+
+    assert cancelled == [True]
+    assert agent.session_state == "normal"
+
+
 def test_run_forever_terminates_jobs_when_loop_exits(monkeypatch, tmp_path):
     agent = object.__new__(loop.DeviceLoop)
     monkeypatch.setattr(loop.Path, "home", lambda: tmp_path)
@@ -1233,6 +1677,10 @@ def test_run_forever_terminates_jobs_when_loop_exits(monkeypatch, tmp_path):
     agent.running = {}
     agent.processes = {"job": (object(), 1.0)}
     agent.instance = "1234567890abcdef"
+    agent.session_state = "normal"
+    agent.witness = False
+    agent.capabilities = []
+    agent._stop_lock = threading.Lock()
     calls = []
     monkeypatch.setattr(loop.executor, "reap_recorded_processes", lambda: None)
     monkeypatch.setattr(loop.threading, "Thread", lambda **kwargs: type("Thread", (), {"start": lambda self: None})())
