@@ -336,7 +336,13 @@ class ConsoleOwner:
     def _show_prompt_locked(self, prompt: _Prompt) -> None:
         if self._closed or self._active is not prompt or prompt.expired:
             return
-        self._discard_pending_line()
+        self._lock.release()
+        try:
+            self._discard_pending_line()
+        finally:
+            self._lock.acquire()
+        if self._closed or self._active is not prompt or prompt.expired:
+            return
         self.console.write(f"\n{_timestamped(self._prompt_text(prompt))}\n")
         prompt.printed_at = time.monotonic()
         prompt.shown = True
@@ -345,12 +351,17 @@ class ConsoleOwner:
             self._read_prompt = prompt
 
     def _announce_expired_locked(self) -> None:
-        self._discard_pending_line()
+        self._lock.release()
+        try:
+            self._discard_pending_line()
+        finally:
+            self._lock.acquire()
+        if self._closed:
+            return
         output = f"\n{_timestamped('No answer, so this was declined.')}\n"
         next_prompt = None
         if self._reading and self._read_prompt is None:
             if self._active is not None:
-                self._discard_pending_line()
                 output += f"\n{_timestamped(self._prompt_text(self._active))}\n"
                 next_prompt = self._active
                 self._read_prompt = self._active
@@ -475,7 +486,7 @@ class ConsoleOwner:
         while not self._closed:
             text, prompt = self._read_line("Help message, or Escape to cancel: ")
             if prompt is not None:
-                if text == "S":
+                if text in ("S", "s"):
                     self._deliver_prompt(prompt, "")
                     self._stop()
                     return
@@ -489,7 +500,7 @@ class ConsoleOwner:
             if text == "\x1b":
                 self.console.write("Help request cancelled.\n")
                 return
-            if text == "S":
+            if text in ("S", "s"):
                 self._stop()
                 return
             if not text:

@@ -106,6 +106,69 @@ def test_terminal_console_preserves_the_start_time_of_a_typed_line(monkeypatch):
     assert line.submitted_at == 11.0
 
 
+@pytest.mark.parametrize("expire", [False, True])
+def test_windows_prompt_discard_does_not_deadlock_the_input_ready_callback(monkeypatch, expire):
+    keys = queue.Queue()
+    monkeypatch.setattr(console_module.os, "name", "nt")
+    monkeypatch.setitem(
+        sys.modules,
+        "msvcrt",
+        types.SimpleNamespace(kbhit=lambda: not keys.empty(), getwch=keys.get_nowait),
+    )
+    console = console_module.TerminalConsole()
+    initial_write = threading.Event()
+    resume_write = threading.Event()
+    discard_started = threading.Event()
+    outputs = []
+
+    def write(text):
+        outputs.append(text)
+        if not initial_write.is_set():
+            initial_write.set()
+            resume_write.wait(2)
+
+    original_discard = console.discard_pending_line
+
+    def discard():
+        discard_started.set()
+        original_discard()
+
+    console.write = write
+    console.discard_pending_line = discard
+    owner = ConsoleOwner(console, on_stop=lambda: None, on_help=lambda text: None)
+    answers = []
+    request = threading.Thread(
+        target=lambda: answers.append(owner.request("request", "Allow screenshot?", timeout=0.1 if expire else 2)),
+        daemon=True,
+    )
+    try:
+        if not expire:
+            owner.start()
+            assert initial_write.wait(1)
+        request.start()
+        assert initial_write.wait(1)
+        assert discard_started.wait(1)
+        resume_write.set()
+        if expire:
+            request.join(1)
+            assert not request.is_alive()
+            assert answers == [None]
+            assert any("No answer, so this was declined." in item for item in outputs)
+        else:
+            assert _wait_for(lambda: any("[request] Allow screenshot?" in item for item in outputs))
+            keys.put("Y")
+            keys.put("\r")
+            request.join(1)
+            assert answers == ["Y"]
+    finally:
+        resume_write.set()
+        console._input_generation_ack.set()
+        keys.put("\x1a")
+        request.join(1)
+        owner.close()
+        owner.join(1)
+
+
 def _wait_for(predicate, timeout=1.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -240,17 +303,23 @@ def test_startup_console_read_error_reaches_caller():
     owner.join(1)
 
 
-def test_uppercase_s_stops_from_help_editor():
-    console = FakeConsole("H", "S")
+@pytest.mark.parametrize("stop_key", ["S", "s"])
+def test_s_stops_from_help_editor(stop_key):
+    console = FakeConsole("H", stop_key)
     stopped = threading.Event()
     help_requests = []
     owner = ConsoleOwner(console, on_stop=stopped.set, on_help=help_requests.append)
 
     owner.start()
 
-    assert stopped.wait(1)
-    owner.join(1)
-    assert help_requests == []
+    try:
+        assert stopped.wait(1)
+        owner.join(1)
+        assert help_requests == []
+    finally:
+        owner.close()
+        console.feed(None)
+        owner.join(1)
 
 
 def test_escape_cancels_help_editor_without_stopping():

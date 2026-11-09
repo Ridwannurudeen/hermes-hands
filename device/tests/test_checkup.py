@@ -142,6 +142,19 @@ def test_windows_print_queue_has_observed_count(monkeypatch):
     assert "2 queues" in facts["print_queue_jobs"]["source"]
 
 
+@pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf"])
+def test_dns_servers_include_first_nameserver_with_or_without_utf8_bom(monkeypatch, tmp_path, prefix):
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_bytes(prefix + b"nameserver 1.1.1.1\n")
+    monkeypatch.setattr(checkup, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(checkup, "Path", lambda path: resolv)
+
+    fact = checkup._dns_servers_fact()
+
+    assert fact["value"] == "1.1.1.1"
+    assert fact["availability"] == "observed"
+
+
 def test_windows_print_queue_slow_probe_is_bounded_and_says_when_unavailable(monkeypatch):
     monkeypatch.setattr(checkup.platform, "system", lambda: "Windows")
     monkeypatch.setitem(checkup._WINDOWS_PROBE_TIMEOUTS, "print_queue", 0.05)

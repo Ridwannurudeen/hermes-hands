@@ -2105,7 +2105,7 @@ def test_stop_flush_writes_local_receipt_and_sends_stopped_heartbeat(
     def post(endpoint, body):
         posted.append((endpoint, body))
         receipt_file = next((tmp_path / ".hermes-hands" / "receipts").glob("*.json"))
-        saved = json.loads(receipt_file.read_text(encoding="utf-8"))["payload"]
+        saved = json.loads(receipt_file.read_text(encoding="utf-8-sig"))["payload"]
         assert saved["shutdown_delivery"] == "pending"
         if not relay_available:
             raise httpx.ConnectError("offline")
@@ -2125,16 +2125,16 @@ def test_stop_flush_writes_local_receipt_and_sends_stopped_heartbeat(
     assert agent.session_state == "stopped"
     receipt_file = next((tmp_path / ".hermes-hands" / "receipts").glob("*.json"))
     text_file = receipt_file.with_suffix(".txt")
-    saved = json.loads(receipt_file.read_text(encoding="utf-8"))["payload"]
+    saved = json.loads(receipt_file.read_text(encoding="utf-8-sig"))["payload"]
     assert saved["end_reason"] == stop_reason
     assert saved["shutdown_delivery"] == expected_delivery
     assert saved["events"][-1]["label"] == "Session stopped"
     assert saved["events"][-1]["delivery_status"] == expected_delivery
     assert saved["events"][1]["delivery_status"] == "pending"
-    assert "Running a command: Completed with exit code 0" in text_file.read_text(encoding="utf-8")
-    assert "Help request: Accepted by relay (delivery: pending)" in text_file.read_text(encoding="utf-8")
-    assert "private-command" not in receipt_file.read_text(encoding="utf-8")
-    assert "private-output" not in receipt_file.read_text(encoding="utf-8")
+    assert "Running a command: Completed with exit code 0" in text_file.read_text(encoding="utf-8-sig")
+    assert "Help request: Accepted by relay (delivery: pending)" in text_file.read_text(encoding="utf-8-sig")
+    assert "private-command" not in receipt_file.read_text(encoding="utf-8-sig")
+    assert "private-output" not in receipt_file.read_text(encoding="utf-8-sig")
     assert any(str(text_file) in output for output in agent.console.outputs)
     assert any(str(receipt_file) in output for output in agent.console.outputs)
 
@@ -2469,7 +2469,7 @@ def test_exec_and_file_operation_jobs_print_and_record_command_transcripts(
     )
     saved = loop.receipt.verify_receipt(paths[0])
     assert saved["events"][0]["outcome"] == expected_command
-    receipt_text = paths[1].read_text(encoding="utf-8")
+    receipt_text = paths[1].read_text(encoding="utf-8-sig")
     assert f"[2026-11-09T00:00:01Z] Running a command: {expected_command}" in receipt_text
     assert "[2026-11-09T00:00:02Z] Running a command: Completed with exit code 0" in receipt_text
 

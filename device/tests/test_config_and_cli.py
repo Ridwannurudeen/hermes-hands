@@ -495,7 +495,8 @@ def test_witness_stop_at_startup_consent_does_not_start_agent(monkeypatch, stop_
     assert FakeDeviceLoop.last.witness is False
 
 
-def test_receipt_files_are_signed_redacted_and_verifiable_from_cli(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("with_bom", [False, True])
+def test_receipt_files_are_signed_redacted_and_verifiable_from_cli(tmp_path, monkeypatch, capsys, with_bom):
     monkeypatch.setattr(config, "ROOT", tmp_path)
     private, public = generate_keypair()
     payload = {
@@ -543,11 +544,13 @@ def test_receipt_files_are_signed_redacted_and_verifiable_from_cli(tmp_path, mon
     }
 
     json_path, text_path = receipt.write_receipt(payload, private, public)
+    if with_bom:
+        json_path.write_bytes(b"\xef\xbb\xbf" + json_path.read_bytes())
 
     assert json_path.suffix == ".json"
     assert text_path.suffix == ".txt"
     assert json_path.stem == text_path.stem
-    envelope = json.loads(json_path.read_text(encoding="utf-8"))
+    envelope = json.loads(json_path.read_text(encoding="utf-8-sig"))
     assert set(envelope) == {"payload", "signature"}
     assert "signature" not in envelope["payload"]
     assert receipt.verify_receipt(json_path) == envelope["payload"]
@@ -556,15 +559,15 @@ def test_receipt_files_are_signed_redacted_and_verifiable_from_cli(tmp_path, mon
         "label": "Running a command",
         "outcome": "Completed with exit code 0",
     }
-    text_receipt = text_path.read_text(encoding="utf-8")
+    text_receipt = text_path.read_text(encoding="utf-8-sig")
     assert "stopped_by_person" in text_receipt
     assert "Running a command: Completed with exit code 0" in text_receipt
     assert "Help request: Accepted by relay (delivery: pending)" in text_receipt
     assert "Available memory" in text_receipt
     assert "private-command" not in text_receipt
     assert "private-output" not in text_receipt
-    assert "private-command" not in json_path.read_text(encoding="utf-8")
-    assert "private-output" not in json_path.read_text(encoding="utf-8")
+    assert "private-command" not in json_path.read_text(encoding="utf-8-sig")
+    assert "private-output" not in json_path.read_text(encoding="utf-8-sig")
 
     assert cli.main(["receipt", "verify", str(json_path)]) == 0
     assert "signature verified" in capsys.readouterr().out.lower()

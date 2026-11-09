@@ -421,7 +421,7 @@ def _dns_servers_fact() -> dict[str, object]:
     else:
         path = Path("/etc/resolv.conf")
         try:
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
                 fields = line.split("#", 1)[0].split()
                 if len(fields) >= 2 and fields[0] == "nameserver":
                     servers.append(fields[1])

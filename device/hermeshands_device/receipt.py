@@ -154,7 +154,7 @@ def update_receipt(
 
 def verify_receipt(path: str | Path) -> dict:
     try:
-        envelope = json.loads(Path(path).read_text(encoding="utf-8"))
+        envelope = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ReceiptError("could not read JSON receipt") from exc
     if not isinstance(envelope, dict) or set(envelope) != {"payload", "signature"}:
