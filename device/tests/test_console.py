@@ -19,8 +19,10 @@ class FakeConsole:
         self.reader_thread_ids = []
         self.read_started = threading.Event()
         self.lock = threading.Lock()
+        self.partial_text = ""
+        self.partial_started_at = None
         for line in lines:
-            self.lines.put(line)
+            self.lines.put((line, None, None))
 
     def write(self, text):
         with self.lock:
@@ -31,10 +33,43 @@ class FakeConsole:
             self.prompts.append(prompt)
             self.reader_thread_ids.append(threading.get_ident())
         self.read_started.set()
-        return self.lines.get()
+        return self.lines.get()[0]
+
+    def read_line_with_metadata(self, prompt, on_prompt_printed=None):
+        with self.lock:
+            self.prompts.append(prompt)
+            self.reader_thread_ids.append(threading.get_ident())
+        self.read_started.set()
+        if on_prompt_printed is not None:
+            on_prompt_printed()
+        line, started_at, submitted_at = self.lines.get()
+        submitted_at = submitted_at or time.monotonic()
+        started_at = started_at or (submitted_at if line else None)
+        return line, started_at, submitted_at
 
     def feed(self, line):
-        self.lines.put(line)
+        submitted_at = time.monotonic()
+        self.lines.put((line, submitted_at if line else None, submitted_at))
+
+    def type_text(self, text):
+        with self.lock:
+            if not self.partial_text:
+                self.partial_started_at = time.monotonic()
+            self.partial_text += text
+
+    def submit(self):
+        with self.lock:
+            line = self.partial_text
+            started_at = self.partial_started_at
+            self.partial_text = ""
+            self.partial_started_at = None
+        submitted_at = time.monotonic()
+        self.lines.put((line, started_at, submitted_at))
+
+    def discard_pending_line(self):
+        with self.lock:
+            self.partial_text = ""
+            self.partial_started_at = None
 
     def output(self):
         with self.lock:
@@ -43,6 +78,32 @@ class FakeConsole:
     def prompt_text(self):
         with self.lock:
             return "".join(self.prompts)
+
+
+def test_terminal_console_preserves_the_start_time_of_a_typed_line(monkeypatch):
+    class FakeMsvcrt:
+        characters = ["Y", "\r"]
+
+        @classmethod
+        def kbhit(cls):
+            return bool(cls.characters)
+
+        @classmethod
+        def getwch(cls):
+            return cls.characters.pop(0)
+
+    timestamps = iter((10.0, 11.0))
+    monkeypatch.setattr(console_module.os, "name", "nt")
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt)
+    monkeypatch.setattr(console_module.time, "monotonic", lambda: next(timestamps))
+    console = console_module.TerminalConsole()
+    console.write = lambda text: None
+
+    line = console.read_line_with_metadata("Prompt: ")
+
+    assert line.text == "Y"
+    assert line.started_at == 10.0
+    assert line.submitted_at == 11.0
 
 
 def _wait_for(predicate, timeout=1.0):
@@ -112,7 +173,7 @@ def test_startup_questions_and_interactive_input_have_one_owner_thread():
     owner = ConsoleOwner(console, on_stop=stopped.set, on_help=lambda text: None)
 
     assert owner.startup_consent("Start? [Y/N]: ") == "Y"
-    assert owner.request("session", "Allow screenshots?", timeout=1) == "Y"
+    assert owner.request("session-screenshots", console_module.SCREENSHOT_SESSION_PROMPT, timeout=1) == "Y"
     assert stopped.wait(1)
 
     owner.close()
@@ -266,11 +327,11 @@ def test_late_answer_is_bound_to_expired_prompt_id():
     assert console.read_started.wait(1)
 
     assert owner.request("old-request", "Allow screenshot?", timeout=0.02) is None
+    console.feed("Y")
     answers = []
     later = threading.Thread(target=lambda: answers.append(owner.request("new-request", "Allow this screenshot?", timeout=1)))
     later.start()
-    console.feed("Y")
-    assert _wait_for(lambda: "new-request" in console.prompt_text())
+    assert _wait_for(lambda: "[new-request] Allow this screenshot?" in console.output())
     console.feed("N")
     later.join(1)
 
@@ -279,7 +340,7 @@ def test_late_answer_is_bound_to_expired_prompt_id():
     owner.join(1)
     assert answers == ["N"]
     assert "old-request" in console.output()
-    assert "new-request" in console.prompt_text()
+    assert "[new-request] Allow this screenshot?" in console.output()
 
 
 def test_stop_during_screenshot_request_releases_prompt():
@@ -330,3 +391,162 @@ def test_expired_queued_prompt_is_not_shown_later():
     console.feed("S")
     assert stopped.wait(1)
     owner.join(1)
+
+
+def test_expired_prompt_does_not_wedge_the_next_request():
+    console = FakeConsole()
+    stopped = threading.Event()
+    owner = ConsoleOwner(console, on_stop=stopped.set, on_help=lambda text: None)
+    owner.start()
+    assert console.read_started.wait(1)
+
+    assert owner.request("expired-request", "Allow first screenshot?", timeout=0.2) is None
+    answers = []
+    later = threading.Thread(
+        target=lambda: answers.append(owner.request("fresh-request", "Allow next screenshot?", timeout=2))
+    )
+    later.start()
+    assert _wait_for(lambda: "[fresh-request] Allow next screenshot?" in console.output())
+    assert re.search(r"\[\d{4}-\d{2}-\d{2}T[^\]]+Z\] No answer, so this was declined\.", console.output())
+
+    console.feed("y")
+    later.join(1)
+    assert not later.is_alive()
+    assert answers == ["y"]
+
+    owner.close()
+    console.feed(None)
+    owner.join(1)
+
+
+def test_line_submitted_before_fresh_prompt_cannot_answer_it():
+    console = FakeConsole()
+    stopped = threading.Event()
+    owner = ConsoleOwner(console, on_stop=stopped.set, on_help=lambda text: None)
+    owner.start()
+    assert console.read_started.wait(1)
+
+    assert owner.request("expired-request", "Allow first screenshot?", timeout=0.2) is None
+    console.feed("Y")
+    answers = []
+    later = threading.Thread(
+        target=lambda: answers.append(owner.request("fresh-request", "Allow next screenshot?", timeout=2))
+    )
+    later.start()
+    assert _wait_for(lambda: "[fresh-request] Allow next screenshot?" in console.output())
+    assert not _wait_for(lambda: answers, timeout=0.05)
+
+    console.feed("Y")
+    later.join(1)
+    assert not later.is_alive()
+    assert answers == ["Y"]
+
+    owner.close()
+    console.feed(None)
+    owner.join(1)
+
+
+def test_line_started_before_fresh_prompt_cannot_answer_it():
+    console = FakeConsole()
+    stopped = threading.Event()
+    owner = ConsoleOwner(console, on_stop=stopped.set, on_help=lambda text: None)
+    owner.start()
+    assert console.read_started.wait(1)
+
+    assert owner.request("expired-request", "Allow first screenshot?", timeout=0.2) is None
+    answers = []
+    later = threading.Thread(
+        target=lambda: answers.append(owner.request("fresh-request", "Allow next screenshot?", timeout=2))
+    )
+    later.start()
+    assert _wait_for(lambda: "[fresh-request] Allow next screenshot?" in console.output())
+    with owner._lock:
+        printed_at = owner._active.printed_at
+    assert printed_at is not None
+
+    console.lines.put(("Y", printed_at - 0.1, printed_at + 0.1))
+    assert _wait_for(lambda: len(console.prompts) > 1)
+    assert not answers
+
+    console.feed("Y")
+    later.join(1)
+    assert not later.is_alive()
+    assert answers == ["Y"]
+
+    owner.close()
+    console.feed(None)
+    owner.join(1)
+
+
+def test_half_typed_expired_answer_is_discarded_before_fresh_prompt():
+    console = FakeConsole()
+    stopped = threading.Event()
+    owner = ConsoleOwner(console, on_stop=stopped.set, on_help=lambda text: None)
+    owner.start()
+    assert console.read_started.wait(1)
+
+    assert owner.request("expired-request", "Allow first screenshot?", timeout=0.2) is None
+    console.type_text("Y")
+    answers = []
+    later = threading.Thread(
+        target=lambda: answers.append(owner.request("fresh-request", "Allow next screenshot?", timeout=2))
+    )
+    later.start()
+    assert _wait_for(lambda: "[fresh-request] Allow next screenshot?" in console.output())
+    with console.lock:
+        assert console.partial_text == ""
+
+    console.submit()
+    assert not _wait_for(lambda: answers == ["Y"], timeout=0.05)
+    console.feed("Y")
+    later.join(1)
+    assert not later.is_alive()
+    assert answers == [""]
+
+    owner.close()
+    console.feed(None)
+    owner.join(1)
+
+
+@pytest.mark.parametrize("command", ["S", "s", "H"])
+def test_stop_and_help_commands_still_work_after_prompt_expiry(command):
+    console = FakeConsole()
+    stopped = threading.Event()
+    help_requests = []
+    owner = ConsoleOwner(console, on_stop=stopped.set, on_help=help_requests.append)
+    owner.start()
+    assert console.read_started.wait(1)
+
+    assert owner.request("expired-request", "Allow screenshot?", timeout=0.2) is None
+    console.feed(command)
+    if command == "H":
+        assert _wait_for(lambda: "Help message" in console.prompt_text())
+        console.feed("Please help.")
+        assert _wait_for(lambda: help_requests == ["Please help."])
+        console.feed("S")
+    assert stopped.wait(1)
+    owner.join(1)
+    assert help_requests == (["Please help."] if command == "H" else [])
+
+
+@pytest.mark.parametrize("command", ["S", "s"])
+def test_stop_during_fresh_prompt_after_expired_prompt(command):
+    console = FakeConsole()
+    stopped = threading.Event()
+    owner = ConsoleOwner(console, on_stop=stopped.set, on_help=lambda text: None)
+    owner.start()
+    assert console.read_started.wait(1)
+
+    assert owner.request("expired-request", "Allow first screenshot?", timeout=0.2) is None
+    answers = []
+    later = threading.Thread(
+        target=lambda: answers.append(owner.request("fresh-request", "Allow next screenshot?", timeout=2))
+    )
+    later.start()
+    assert _wait_for(lambda: "[fresh-request] Allow next screenshot?" in console.output())
+
+    console.feed(command)
+    later.join(1)
+    owner.join(1)
+    assert stopped.is_set()
+    assert answers == [command]

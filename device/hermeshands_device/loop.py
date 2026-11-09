@@ -60,6 +60,17 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _command_text(script: str) -> str:
+    wrapped_command = _CORE_EVAL_COMMAND.search(script)
+    if not wrapped_command:
+        wrapped_command = _CORE_PLAIN_EVAL_COMMAND.search(script)
+    if wrapped_command:
+        script = wrapped_command.group(1).replace("'\\''", "'")
+    else:
+        script = _CORE_CWD.sub("", script, count=1)
+    return script.strip()
+
+
 class DeviceLoop:
     def __init__(self, *, allow_screen: bool = False, transport: httpx.BaseTransport | None = None, console: ConsoleInput | None = None):
         self.allow_screen = allow_screen
@@ -271,6 +282,26 @@ class DeviceLoop:
             event["request_id"] = request_id
         with self.receipt_lock:
             self.receipt_events.append(event)
+
+    def _record_job_event(
+        self,
+        label: str,
+        outcome: str,
+        *,
+        timestamp: str | None = None,
+        checkup_result: dict | None = None,
+    ) -> None:
+        timestamp = _utc_timestamp() if timestamp is None else timestamp
+        if getattr(self, "witness", False) or getattr(self, "session_started_at", None) is not None:
+            console = getattr(self, "console", None)
+            if console is not None:
+                console.write(f"[{timestamp}] {label}: {outcome}\n")
+        self._record_receipt_event(
+            label,
+            outcome,
+            timestamp=timestamp,
+            checkup_result=checkup_result,
+        )
 
     def _request_session_screenshot_consent(self) -> None:
         answer = self.console_owner.request(
@@ -577,7 +608,7 @@ class DeviceLoop:
             self._send_help_request(text)
 
     def _refuse_unknown_job(self, job_id: str, seq: int) -> None:
-        self._record_receipt_event("Unknown job type", "Refused: unknown_job_type")
+        self._record_job_event("Unknown job type", "Refused: unknown_job_type")
         self._result(job_id, seq, done=True, returncode=126, error="unknown_job_type")
 
     def _run_job(self, job: dict, start_event: threading.Event | None = None) -> None:
@@ -590,6 +621,8 @@ class DeviceLoop:
             "cancel": "Cancellation request",
         }.get(job_type, "Unknown job type")
         receipt_outcome = None
+        receipt_checkup = None
+        receipt_timestamp = None
         if not hasattr(self, "cancelled_jobs"):
             self.cancelled_jobs = set()
         if not hasattr(self, "process_lock"):
@@ -676,6 +709,8 @@ class DeviceLoop:
                     receipt_outcome = "Refused by device policy"
                     self._result(job_id, seq, chunk=f"Policy refused command matching: {refused}\n", done=True, returncode=126)
                     return
+                receipt_label = "Running a command"
+                self._record_job_event(receipt_label, _command_text(script))
                 exit_code = [0]
                 capped = threading.Event()
                 truncated = threading.Event()
@@ -683,8 +718,6 @@ class DeviceLoop:
                 self.job_deadlines[job_id] = time.monotonic() + timeout
                 decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                 def on_start(proc, started):
-                    nonlocal receipt_label
-                    receipt_label = "Running a command"
                     with self.process_lock:
                         self.processes[job_id] = (proc, started)
                         stopping = self.stop_event.is_set()
@@ -727,23 +760,16 @@ class DeviceLoop:
                     receipt_outcome = f"Completed with exit code {exit_code[0]}"
                     self._result(job_id, seq, chunk=final, done=True, returncode=exit_code[0])
             elif job_type == "checkup":
-                self.console.write(f"{receipt_label}\n")
+                self._record_job_event(receipt_label, "Started")
                 result = checkup.collect()
                 if self._is_stopping():
                     returncode, error = self._stopped_result()
                     receipt_outcome = f"Stopped: {error}"
-                    self.console.write(f"{receipt_outcome}.\n")
                     self._result(job_id, seq, done=True, returncode=returncode, error=error)
                     return
                 receipt_outcome = "Completed"
-                self._record_receipt_event(
-                    "System checkup",
-                    receipt_outcome,
-                    timestamp=result["observed_at"],
-                    checkup_result=result,
-                )
-                self.console.write(f"{receipt_outcome}.\n")
-                receipt_label = None
+                receipt_timestamp = result["observed_at"]
+                receipt_checkup = result
                 self._result(
                     job_id,
                     seq,
@@ -753,6 +779,7 @@ class DeviceLoop:
                     checkup=result,
                 )
             elif job_type == "screenshot":
+                self._record_job_event(receipt_label, "Started")
                 if getattr(self, "witness", False):
                     if not self.allow_screen:
                         receipt_outcome = "Declined"
@@ -798,6 +825,7 @@ class DeviceLoop:
                 receipt_outcome = "Captured"
                 self._result(job_id, seq, done=True, returncode=0, png=image)
             elif job_type == "cancel":
+                self._record_job_event(receipt_label, "Started")
                 with self.process_lock:
                     target = self.processes.get(job["target_job_id"])
                     if target is None:
@@ -885,7 +913,12 @@ class DeviceLoop:
                 logger.debug("Could not deliver job failure for %s", job_id, exc_info=True)
         finally:
             if receipt_label is not None and receipt_outcome is not None:
-                self._record_receipt_event(receipt_label, receipt_outcome)
+                self._record_job_event(
+                    receipt_label,
+                    receipt_outcome,
+                    timestamp=receipt_timestamp,
+                    checkup_result=receipt_checkup,
+                )
             start_event.set()
             with self.process_lock:
                 self.processes.pop(job_id, None)

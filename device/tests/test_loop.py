@@ -2314,6 +2314,7 @@ def test_checkup_job_returns_only_the_compiled_checkup(monkeypatch):
     agent.console.outputs = []
     result = {"schema_version": 1, "observed_at": "2026-11-08T00:00:00Z", "platform": "test", "facts": [], "inferences": []}
     posted = []
+    monkeypatch.setattr(loop, "_utc_timestamp", lambda: "2026-11-09T00:00:00Z")
     monkeypatch.setattr(loop.checkup, "collect", lambda: result)
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((job_id, seq, kwargs)))
 
@@ -2326,10 +2327,12 @@ def test_checkup_job_returns_only_the_compiled_checkup(monkeypatch):
             {"done": True, "returncode": 0, "error": None, "checkup": result},
         )
     ]
-    assert agent.receipt_events[0]["checkup"] == result
+    assert agent.receipt_events[-1]["checkup"] == result
     console_output = "".join(agent.console.outputs)
-    assert "System checkup" in console_output
-    assert "Completed" in console_output
+    assert console_output == (
+        "[2026-11-09T00:00:00Z] System checkup: Started\n"
+        "[2026-11-08T00:00:00Z] System checkup: Completed\n"
+    )
     assert console_output.index("System checkup") < console_output.index("Completed")
 
 
@@ -2352,7 +2355,9 @@ def test_unknown_or_malformed_jobs_are_refused_and_recorded(monkeypatch, job):
     agent.job_deadlines = {}
     agent.receipt_events = []
     agent.witness = True
+    agent.console = type("Console", (), {"outputs": [], "write": lambda self, text: self.outputs.append(text)})()
     posted = []
+    monkeypatch.setattr(loop, "_utc_timestamp", lambda: "2026-11-09T00:00:00Z")
     monkeypatch.setattr(loop.checkup, "collect", lambda: pytest.fail("malformed checkup ran"))
     monkeypatch.setattr(loop.executor, "run", lambda *args, **kwargs: pytest.fail("unknown job ran"))
     monkeypatch.setattr(agent, "_result", lambda job_id, seq, **kwargs: posted.append((job_id, seq, kwargs)))
@@ -2367,6 +2372,144 @@ def test_unknown_or_malformed_jobs_are_refused_and_recorded(monkeypatch, job):
         )
     ]
     assert agent.receipt_events[0]["outcome"] == "Refused: unknown_job_type"
+    assert agent.console.outputs == [
+        "[2026-11-09T00:00:00Z] Unknown job type: Refused: unknown_job_type\n"
+    ]
+
+
+class TranscriptConsole:
+    def __init__(self):
+        self.outputs = []
+
+    def write(self, text):
+        self.outputs.append(text)
+
+
+def _transcript_agent():
+    agent = object.__new__(loop.DeviceLoop)
+    agent.accepted_policy_hash = "hash"
+    agent.allow_screen = True
+    agent.cancelled_jobs = set()
+    agent.console = TranscriptConsole()
+    agent.instance = "transcript-instance"
+    agent.job_deadlines = {}
+    agent.job_start_events = {}
+    agent.processes = {}
+    agent.process_lock = threading.Lock()
+    agent.receipt_events = []
+    agent.running = {}
+    agent.session_state = "active"
+    agent.stop_event = threading.Event()
+    agent.witness = True
+    return agent
+
+
+@pytest.mark.parametrize(
+    ("job_id", "script", "file_op", "expected_command"),
+    [
+        ("exec-transcript", _core_wrapped("ls /mnt/c/Users"), False, "ls /mnt/c/Users"),
+        ("read-transcript", "  cat /mnt/c/Users/gudma/notes.txt  ", True, "cat /mnt/c/Users/gudma/notes.txt"),
+        ("write-transcript", "  printf '%s' hello > /mnt/c/Users/gudma/notes.txt  ", True, "printf '%s' hello > /mnt/c/Users/gudma/notes.txt"),
+        ("patch-transcript", "  python -c 'print(\"patch\")'  ", True, "python -c 'print(\"patch\")'"),
+    ],
+)
+def test_exec_and_file_operation_jobs_print_and_record_command_transcripts(
+    monkeypatch, tmp_path, job_id, script, file_op, expected_command
+):
+    agent = _transcript_agent()
+    timestamps = iter(("2026-11-09T00:00:01Z", "2026-11-09T00:00:02Z"))
+    monkeypatch.setattr(loop, "_utc_timestamp", lambda: next(timestamps))
+    monkeypatch.setattr(loop.policy, "snapshot", lambda: ("hash", loop.policy.DEFAULTS.copy()))
+    monkeypatch.setattr(loop.policy, "refusal", lambda command, deny=None: None)
+    monkeypatch.setattr(agent, "_result", lambda *args, **kwargs: None)
+
+    class Process:
+        def poll(self):
+            return 0
+
+    def run(*args, on_start, on_exit, **kwargs):
+        assert agent.console.outputs == [
+            f"[2026-11-09T00:00:01Z] Running a command: {expected_command}\n"
+        ]
+        on_start(Process(), 1.0)
+        on_exit(0)
+        return iter(())
+
+    monkeypatch.setattr(loop.executor, "run", run)
+
+    agent._run_job({"job_id": job_id, "type": "exec", "script": script, "file_op": file_op})
+
+    assert agent.console.outputs == [
+        f"[2026-11-09T00:00:01Z] Running a command: {expected_command}\n",
+        "[2026-11-09T00:00:02Z] Running a command: Completed with exit code 0\n",
+    ]
+    assert [event["label"] for event in agent.receipt_events] == [
+        "Running a command",
+        "Running a command",
+    ]
+    assert [event["outcome"] for event in agent.receipt_events] == [
+        expected_command,
+        "Completed with exit code 0",
+    ]
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop.receipt.config, "ROOT", tmp_path / ".hermes-hands")
+    paths = loop.receipt.write_receipt(
+        {
+            "schema_version": 1,
+            "device_id": "device-1",
+            "instance": "transcript-instance",
+            "started_at": "2026-11-09T00:00:00Z",
+            "ended_at": "2026-11-09T00:00:02Z",
+            "end_reason": "stopped_by_person",
+            "shutdown_delivery": "confirmed",
+            "events": agent.receipt_events,
+        },
+        private,
+        public,
+    )
+    saved = loop.receipt.verify_receipt(paths[0])
+    assert saved["events"][0]["outcome"] == expected_command
+    receipt_text = paths[1].read_text(encoding="utf-8")
+    assert f"[2026-11-09T00:00:01Z] Running a command: {expected_command}" in receipt_text
+    assert "[2026-11-09T00:00:02Z] Running a command: Completed with exit code 0" in receipt_text
+
+
+def test_screenshot_job_prints_and_records_request_and_outcome(monkeypatch):
+    agent = _transcript_agent()
+    agent.console_owner = PromptOwner(["y"])
+    timestamps = iter(("2026-11-09T00:00:01Z", "2026-11-09T00:00:02Z"))
+    monkeypatch.setattr(loop, "_utc_timestamp", lambda: next(timestamps))
+    monkeypatch.setattr(loop.screen, "capture", lambda **kwargs: b"png")
+    monkeypatch.setattr(agent, "_result", lambda *args, **kwargs: None)
+
+    agent._run_job({"job_id": "screenshot-transcript", "type": "screenshot"})
+
+    assert agent.console.outputs == [
+        "[2026-11-09T00:00:01Z] Screenshot request: Started\n",
+        "[2026-11-09T00:00:02Z] Screenshot request: Captured\n",
+    ]
+    assert [(event["label"], event["outcome"]) for event in agent.receipt_events] == [
+        ("Screenshot request", "Started"),
+        ("Screenshot request", "Captured"),
+    ]
+
+
+def test_cancel_job_prints_and_records_request_and_outcome(monkeypatch):
+    agent = _transcript_agent()
+    timestamps = iter(("2026-11-09T00:00:01Z", "2026-11-09T00:00:02Z"))
+    monkeypatch.setattr(loop, "_utc_timestamp", lambda: next(timestamps))
+    monkeypatch.setattr(agent, "_result", lambda *args, **kwargs: None)
+
+    agent._run_job({"job_id": "cancel-transcript", "type": "cancel", "target_job_id": "job-to-cancel"})
+
+    assert agent.console.outputs == [
+        "[2026-11-09T00:00:01Z] Cancellation request: Started\n",
+        "[2026-11-09T00:00:02Z] Cancellation request: Cancellation request completed\n",
+    ]
+    assert [(event["label"], event["outcome"]) for event in agent.receipt_events] == [
+        ("Cancellation request", "Started"),
+        ("Cancellation request", "Cancellation request completed"),
+    ]
 
 
 def test_result_carries_checkup_object_only_on_final_result(monkeypatch):

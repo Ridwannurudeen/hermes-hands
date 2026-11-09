@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -46,9 +47,21 @@ class ConsoleInput(Protocol):
     def read_line(self, prompt: str) -> str | None: ...
 
 
+@dataclass(frozen=True)
+class _ConsoleLine:
+    text: str | None
+    started_at: float | None
+    submitted_at: float
+
+
 class TerminalConsole:
     def __init__(self):
         self._write_lock = threading.Lock()
+        self._input_lock = threading.Lock()
+        self._current_line: list[tuple[str, float]] | None = None
+        self._input_generation = 0
+        self._input_generation_ack = threading.Event()
+        self._pending_lines: deque[_ConsoleLine] = deque()
 
     def write(self, text: str) -> None:
         with self._write_lock:
@@ -56,62 +69,150 @@ class TerminalConsole:
             sys.stdout.flush()
 
     def read_line(self, prompt: str) -> str | None:
+        return self.read_line_with_metadata(prompt).text
+
+    def read_line_with_metadata(
+        self,
+        prompt: str,
+        *,
+        on_prompt_printed: Callable[[], None] | None = None,
+    ) -> _ConsoleLine:
+        with self._input_lock:
+            if self._pending_lines:
+                return self._pending_lines.popleft()
+            characters: list[tuple[str, float]] = []
+            self._current_line = characters
+            reader_generation = self._input_generation
         self.write(prompt)
-        characters = []
-        if os.name == "nt":
-            import msvcrt
+        if on_prompt_printed is not None:
+            on_prompt_printed()
 
-            while True:
-                character = msvcrt.getwch()
-                if character in ("\x00", "\xe0"):
-                    msvcrt.getwch()
-                    continue
-                if character == "\x1a":
-                    return None
-                if character in ("\r", "\n"):
-                    self.write("\n")
-                    return "".join(characters)
-                if character == "\x1b":
-                    self.write("\n")
-                    return character
-                if character == "\x03":
-                    raise KeyboardInterrupt
-                if character in ("\b", "\x7f"):
-                    if characters:
-                        characters.pop()
-                        self.write("\b \b")
-                    continue
-                characters.append(character)
-                self.write(character)
+        def finish(text: str | None, submitted_at: float) -> _ConsoleLine:
+            with self._input_lock:
+                started_at = characters[0][1] if characters else None
+                if self._current_line is characters:
+                    self._current_line = None
+            return _ConsoleLine(text, started_at, submitted_at)
 
-        import termios
-        import tty
-
-        descriptor = sys.stdin.fileno()
-        previous = termios.tcgetattr(descriptor)
         try:
-            tty.setraw(descriptor)
-            while True:
-                character = sys.stdin.read(1)
-                if character in ("", "\x04"):
+            if os.name == "nt":
+                import msvcrt
+
+                def process_character(character: str, character_at: float, *, echo: bool) -> _ConsoleLine | None:
+                    if character in ("\x00", "\xe0"):
+                        msvcrt.getwch()
+                        return None
+                    if character == "\x1a":
+                        return _ConsoleLine(None, None, character_at)
+                    if character in ("\r", "\n"):
+                        with self._input_lock:
+                            started_at = characters[0][1] if characters else None
+                            text = "".join(char for char, _ in characters)
+                            characters.clear()
+                        if echo:
+                            self.write("\n")
+                        return _ConsoleLine(text, started_at, character_at)
+                    if character == "\x1b":
+                        with self._input_lock:
+                            started_at = characters[0][1] if characters else character_at
+                            characters.clear()
+                        if echo:
+                            self.write("\n")
+                        return _ConsoleLine(character, started_at, character_at)
+                    if character == "\x03":
+                        raise KeyboardInterrupt
+                    if character in ("\b", "\x7f"):
+                        with self._input_lock:
+                            if characters:
+                                characters.pop()
+                                if echo:
+                                    self.write("\b \b")
+                        return None
+                    with self._input_lock:
+                        characters.append((character, character_at))
+                    if echo:
+                        self.write(character)
                     return None
-                if character in ("\r", "\n"):
-                    self.write("\n")
-                    return "".join(characters)
-                if character == "\x1b":
-                    self.write("\n")
-                    return character
-                if character == "\x03":
-                    raise KeyboardInterrupt
-                if character in ("\b", "\x7f"):
-                    if characters:
-                        characters.pop()
-                        self.write("\b \b")
-                    continue
-                characters.append(character)
-                self.write(character)
+
+                while True:
+                    with self._input_lock:
+                        generation = self._input_generation
+                    if generation != reader_generation:
+                        while msvcrt.kbhit():
+                            character = msvcrt.getwch()
+                            line = process_character(character, time.monotonic(), echo=False)
+                            if line is not None:
+                                with self._input_lock:
+                                    self._pending_lines.append(line)
+                        with self._input_lock:
+                            if self._input_generation != generation:
+                                continue
+                            characters.clear()
+                            reader_generation = generation
+                            self._input_generation_ack.set()
+                            line = self._pending_lines.popleft() if self._pending_lines else None
+                        if line is not None:
+                            return line
+                        continue
+                    if not msvcrt.kbhit():
+                        time.sleep(0.01)
+                        continue
+                    character = msvcrt.getwch()
+                    character_at = time.monotonic()
+                    line = process_character(character, character_at, echo=True)
+                    if line is not None:
+                        with self._input_lock:
+                            if self._current_line is characters:
+                                self._current_line = None
+                        return line
+
+            import termios
+            import tty
+
+            descriptor = sys.stdin.fileno()
+            previous = termios.tcgetattr(descriptor)
+            try:
+                tty.setraw(descriptor)
+                while True:
+                    character = sys.stdin.read(1)
+                    character_at = time.monotonic()
+                    if character in ("", "\x04"):
+                        return finish(None, character_at)
+                    if character in ("\r", "\n"):
+                        self.write("\n")
+                        return finish("".join(char for char, _ in characters), character_at)
+                    if character == "\x1b":
+                        self.write("\n")
+                        return finish(character, character_at)
+                    if character == "\x03":
+                        raise KeyboardInterrupt
+                    if character in ("\b", "\x7f"):
+                        with self._input_lock:
+                            if characters:
+                                characters.pop()
+                                self.write("\b \b")
+                        continue
+                    with self._input_lock:
+                        characters.append((character, character_at))
+                    self.write(character)
+            finally:
+                termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
         finally:
-            termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+            with self._input_lock:
+                if self._current_line is characters:
+                    self._current_line = None
+                self._input_generation_ack.set()
+
+    def discard_pending_line(self) -> None:
+        with self._input_lock:
+            if self._current_line is None:
+                return
+            if os.name != "nt":
+                self._current_line.clear()
+                return
+            self._input_generation += 1
+            self._input_generation_ack.clear()
+        self._input_generation_ack.wait()
 
 
 @dataclass
@@ -121,6 +222,8 @@ class _Prompt:
     ready: threading.Event = field(default_factory=threading.Event)
     answer: str | None = None
     expired: bool = False
+    printed_at: float | None = None
+    shown: bool = False
 
 
 class ConsoleOwner:
@@ -133,6 +236,8 @@ class ConsoleOwner:
         self._active: _Prompt | None = None
         self._reading = False
         self._read_prompt: _Prompt | None = None
+        self._command_prompt: str | None = None
+        self._command_prompt_shown = False
         self._thread: threading.Thread | None = None
         self._closed = False
         self._startup_ready = threading.Event()
@@ -165,7 +270,6 @@ class ConsoleOwner:
 
     def request(self, prompt_id: str, text: str, *, timeout: float | None = None) -> str | None:
         prompt = _Prompt(prompt_id, text)
-        dynamic_prompt = False
         with self._lock:
             if self._closed:
                 return None
@@ -177,20 +281,22 @@ class ConsoleOwner:
             self._queued.append(prompt)
             self._promote_locked()
             if self._active is prompt and self._reading and self._read_prompt is None:
-                self._read_prompt = prompt
-                dynamic_prompt = True
-        if dynamic_prompt:
-            self.console.write(f"\n{_timestamped(f'[{prompt_id}] {text}')}\n")
+                self._show_prompt_locked(prompt)
         self._startup_resume.set()
         self.start()
         if not prompt.ready.wait(timeout):
             with self._lock:
+                if prompt.ready.is_set():
+                    return prompt.answer
                 prompt.expired = True
-                if self._active is prompt and self._read_prompt is not prompt:
+                if self._active is prompt:
                     self._active = None
+                    if self._read_prompt is prompt:
+                        self._read_prompt = None
                     self._promote_locked()
                 elif prompt in self._queued:
                     self._queued.remove(prompt)
+                self._announce_expired_locked()
             return None
         return prompt.answer
 
@@ -219,6 +325,43 @@ class ConsoleOwner:
         if self._active is None and self._queued:
             self._active = self._queued.popleft()
 
+    def _discard_pending_line(self) -> None:
+        discard = getattr(self.console, "discard_pending_line", None)
+        if callable(discard):
+            discard()
+
+    def _prompt_text(self, prompt: _Prompt) -> str:
+        return f"[{prompt.prompt_id}] {prompt.text} [Y/N]: "
+
+    def _show_prompt_locked(self, prompt: _Prompt) -> None:
+        if self._closed or self._active is not prompt or prompt.expired:
+            return
+        self._discard_pending_line()
+        self.console.write(f"\n{_timestamped(self._prompt_text(prompt))}\n")
+        prompt.printed_at = time.monotonic()
+        prompt.shown = True
+        self._command_prompt_shown = False
+        if self._reading and self._read_prompt is None:
+            self._read_prompt = prompt
+
+    def _announce_expired_locked(self) -> None:
+        self._discard_pending_line()
+        output = f"\n{_timestamped('No answer, so this was declined.')}\n"
+        next_prompt = None
+        if self._reading and self._read_prompt is None:
+            if self._active is not None:
+                self._discard_pending_line()
+                output += f"\n{_timestamped(self._prompt_text(self._active))}\n"
+                next_prompt = self._active
+                self._read_prompt = self._active
+            elif self._command_prompt is not None:
+                output += f"{_timestamped(self._command_prompt)}"
+                self._command_prompt_shown = True
+        self.console.write(output)
+        if next_prompt is not None:
+            next_prompt.printed_at = time.monotonic()
+            next_prompt.shown = True
+
     def _deliver_prompt(self, prompt: _Prompt, answer: str | None) -> None:
         with self._lock:
             if self._closed:
@@ -230,6 +373,19 @@ class ConsoleOwner:
                 prompt.ready.set()
             self._promote_locked()
 
+    def _read_console_line(self, text: str, on_prompt_printed: Callable[[], None]) -> _ConsoleLine:
+        read_with_metadata = getattr(self.console, "read_line_with_metadata", None)
+        if callable(read_with_metadata):
+            line = read_with_metadata(text, on_prompt_printed=on_prompt_printed)
+            if isinstance(line, _ConsoleLine):
+                return line
+            answer, started_at, submitted_at = line
+            return _ConsoleLine(answer, started_at, submitted_at)
+        on_prompt_printed()
+        answer = self.console.read_line(text)
+        submitted_at = time.monotonic()
+        return _ConsoleLine(answer, submitted_at if answer else None, submitted_at)
+
     def _read_line(self, command_prompt: str) -> tuple[str | None, _Prompt | None]:
         with self._lock:
             if self._closed:
@@ -238,9 +394,22 @@ class ConsoleOwner:
             prompt = self._active
             self._read_prompt = prompt
             self._reading = True
-            text = f"[{prompt.prompt_id}] {prompt.text} [Y/N]: " if prompt else command_prompt
+            self._command_prompt = command_prompt
+            text = self._prompt_text(prompt) if prompt and not prompt.shown else command_prompt
+            if (prompt is not None and prompt.shown) or (prompt is None and self._command_prompt_shown):
+                text = ""
+
+        def on_prompt_printed() -> None:
+            with self._lock:
+                if prompt is None:
+                    if self._read_prompt is None:
+                        self._command_prompt_shown = True
+                elif self._active is prompt and not prompt.shown:
+                    prompt.printed_at = time.monotonic()
+                    prompt.shown = True
+
         try:
-            answer = self.console.read_line(_timestamped(text))
+            line = self._read_console_line(_timestamped(text) if text else "", on_prompt_printed)
         except KeyboardInterrupt:
             with self._lock:
                 self._reading = False
@@ -259,15 +428,25 @@ class ConsoleOwner:
             prompt = self._read_prompt
             self._read_prompt = None
             self._reading = False
+            self._command_prompt_shown = False
             closed = self._closed
         if closed:
             return None, prompt
-        if answer is None:
+        if line.text is not None and prompt is not None:
+            if (
+                prompt.expired
+                or prompt is not self._active
+                or prompt.printed_at is None
+                or (line.started_at is not None and line.started_at < prompt.printed_at)
+                or line.submitted_at < prompt.printed_at
+            ):
+                prompt = None
+        if line.text is None:
             if prompt is not None:
                 self._deliver_prompt(prompt, None)
             self.on_stop()
             self.close()
-        return answer, prompt
+        return line.text, prompt
 
     def _stop(self) -> None:
         self.on_stop()
