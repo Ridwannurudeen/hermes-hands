@@ -5,11 +5,12 @@ version: "0.2.0"
 author: Ridwan Nurudeen
 homepage: https://github.com/Ridwannurudeen/hermes-hands
 description: >
-  Your own laptop as Hermes's hands. Hermes stays on your server; the terminal and file tools, and
-  a screenshot you consented to, run on a laptop you paired (native Windows with Git Bash, or Linux;
-  no Hermes on the laptop). The laptop dials out over HTTPS and never listens; both ends sign with
-  Ed25519 keys pinned at pairing; Hermes approvals stay on; an offline, revoked or unreachable device
-  fails closed. Select it with terminal.backend: hands.
+  Help a paired Windows or Linux computer from chat while Hermes stays on a Linux or WSL gateway.
+  Optional witness mode requires local consent, prints commands with timestamps, asks before every
+  screenshot, and lets the person stop with S. The gateway asks the helper to approve file operations
+  and commands outside an exact read-only list. Sessions end after 30 minutes with signed receipts.
+  The device connects out over HTTPS with pinned Ed25519 keys. Offline, revoked, or unreachable
+  device targets fail closed. Select it with terminal.backend: hands.
 requires_hermes: ">=0.23.0"
 python_dependencies: []
 provides_tools: [hands_screenshot, hands_devices, hands_checkup]
