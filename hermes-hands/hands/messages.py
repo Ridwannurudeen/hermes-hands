@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import re
+
 UPGRADE = "pipx install hermes-hands==0.1.0"
+_DEVICE_ERROR_CODE = re.compile(r"[^A-Za-z0-9_.-]+")
+_DEVICE_ERROR_CODE_LIMIT = 64
 
 RELAY_DOWN = (
     "hands: the relay (the hermes dashboard on the gateway host) is not reachable, so nothing ran on the device. "
@@ -187,6 +191,32 @@ def output_omitted(omitted: int, job_id: str | None) -> str:
         f"is in ~/.hermes-hands/out/{job_id}.log on the device, which the device deny-list keeps "
         f"from the agent]"
     )
+
+
+def device_result_error(error: str, device: str) -> str:
+    """Turn a final device error code into a fixed model-facing sentence."""
+    if error == "screenshot_declined":
+        return (
+            f"The person at {device} said no to this screenshot. Nothing was captured. "
+            "Do not guess a reason or retry."
+        )
+    if error == "stopped_by_person":
+        return (
+            f"The person at {device} stopped the session. Nothing else will run. "
+            "Do not guess a reason or retry."
+        )
+    if error == "session_timeout":
+        return (
+            f"The 30 minute session on {device} ended. Nothing else will run. "
+            "Do not guess a reason or retry."
+        )
+    if error == "unknown_job_type":
+        return "The device rejected this job type. Nothing ran. Do not guess a reason or retry."
+    if error.startswith("hands:"):
+        return error
+    code = _DEVICE_ERROR_CODE.sub("_", error).strip("_.-")[:_DEVICE_ERROR_CODE_LIMIT]
+    code = code.rstrip("_.-") or "unknown"
+    return f"The device reported: {code}. Do not guess a reason or retry."
 
 
 def alerts(devices: list[dict]) -> list[str]:

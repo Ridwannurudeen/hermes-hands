@@ -165,7 +165,8 @@ class RemoteProcessHandle:
                     self._emit(chunk)
                 after = out["next"]
                 if out["done"]:
-                    notice = out.get("error")
+                    error = out.get("error")
+                    notice = messages.device_result_error(str(error), device) if error else None
                     returncode = (
                         UNREACHABLE if out.get("returncode") is None else int(out["returncode"])
                     )

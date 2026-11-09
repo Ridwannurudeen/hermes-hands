@@ -165,8 +165,11 @@ def request_screenshot(device_name: str) -> bytes:
         if not out["done"]:
             continue
         if out.get("error") or not out.get("png_b64"):
+            error = out.get("error")
             raise HandsError(
-                str(out.get("error") or "".join(out["chunks"]) or messages.SCREENSHOT_FAILED)
+                messages.device_result_error(str(error), device_name)
+                if error
+                else "".join(out["chunks"]) or messages.SCREENSHOT_FAILED
             )
         try:
             return base64.b64decode(out["png_b64"], validate=True)
@@ -189,7 +192,10 @@ def request_checkup(device_name: str) -> dict:
             checkup = output.get("checkup")
             if isinstance(checkup, dict):
                 return checkup
-            raise HandsError(str(output.get("error") or messages.BAD_REQUEST))
+            error = output.get("error")
+            raise HandsError(
+                messages.device_result_error(str(error), device_name) if error else messages.BAD_REQUEST
+            )
         after = output["next"]
 
 

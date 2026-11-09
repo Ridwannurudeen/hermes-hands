@@ -165,6 +165,54 @@ def test_relay_failure_without_returncode_is_255_with_reason(fake):
     assert read_to_eof(proc) == b"a\nhands: laptop went offline"
 
 
+@pytest.mark.parametrize(
+    ("error", "returncode", "expected"),
+    [
+        (
+            "stopped_by_person",
+            130,
+            "The person at laptop stopped the session. Nothing else will run. "
+            "Do not guess a reason or retry.",
+        ),
+        (
+            "session_timeout",
+            124,
+            "The 30 minute session on laptop ended. Nothing else will run. "
+            "Do not guess a reason or retry.",
+        ),
+        (
+            "unknown_job_type",
+            126,
+            "The device rejected this job type. Nothing ran. Do not guess a reason or retry.",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("script", "file_op"),
+    [("echo terminal", False), ("cat report.txt", True), ("sleep 30 &", False)],
+    ids=["terminal", "file", "background"],
+)
+def test_device_result_codes_are_plain_for_remote_outputs(
+    fake, error, returncode, expected, script, file_op
+):
+    relay = fake(
+        [
+            {
+                "chunks": [],
+                "next": 0,
+                "done": True,
+                "returncode": returncode,
+                "error": error,
+            }
+        ]
+    )
+    proc = RemoteProcessHandle("laptop", script, login=False, timeout=5, file_op=file_op)
+
+    assert read_to_eof(proc).decode("utf-8") == expected
+    assert wait_exit(proc) == returncode
+    assert relay.file_op is file_op
+
+
 def test_kill_cancels_at_the_relay_and_drops_later_output(fake):
     relay = fake([{"chunks": ["too late"], "next": 1, "done": True, "returncode": 137}])
     relay.release.clear()
