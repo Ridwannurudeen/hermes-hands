@@ -129,7 +129,7 @@ def test_task_xml_uses_utf16_bom_and_declaration():
 def test_install_service_refuses_non_windows(monkeypatch, capsys):
     monkeypatch.setattr(service.sys, "platform", "linux")
     assert service.install() == 1
-    assert "not supported in v0.1" in capsys.readouterr().err
+    assert "not supported in v0.2.0" in capsys.readouterr().err
 
 
 def test_install_service_refuses_from_device_job(monkeypatch, capsys):

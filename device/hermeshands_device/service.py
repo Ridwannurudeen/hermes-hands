@@ -56,7 +56,7 @@ def install(*, dry_run: bool = False, remove: bool = False, allow_screen: bool =
         print("install-service is unavailable from a Hermes Hands device job", file=sys.stderr)
         return 1
     if sys.platform != "win32":
-        print("install-service is not supported in v0.1 on this platform", file=sys.stderr)
+        print("install-service is not supported in v0.2.0 on this platform", file=sys.stderr)
         return 1
     if remove:
         args = command(remove=True)

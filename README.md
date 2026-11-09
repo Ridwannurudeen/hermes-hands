@@ -10,21 +10,21 @@ Hermes Hands pairs a laptop with a one-time code. The device connects out over H
 
 1. On the gateway host (Linux, or Windows inside WSL), install the plugin with `hermes plugins install Ridwannurudeen/hermes-hands/hermes-hands --enable`, then run `hermes hands setup` and follow its prompts. Once Hermes Hands is in the plugin catalog, `hermes plugins install hermes-hands` installs the reviewed version instead.
 
-   Neither route works outside this project yet: the repository is private until the `v0.1.0` tag, and `hermes-hands` is not on PyPI. Until then a collaborator installs the device half from the tag, with the git URL in [Device](#device).
+   For an unreleased checkout, install the plugin from a repository copy you can access. The device package is distributed separately. Before `hermes-hands==0.2.0` is published on PyPI, install it from a reachable checkout or the `v0.2.0` tag as shown in [Device](#device).
 2. Run the two lines setup prints, `hermes config set terminal.backend hands` and `hermes config set bot_desktop.placement gateway`. Restart the gateway, and start the dashboard on loopback with `hermes dashboard --host 127.0.0.1 --port 9119 --no-open`. Any device that is not the gateway host needs the public HTTPS route in [Setup](#gateway); a loopback URL cannot pair a laptop on another machine.
 3. Pair a named device with `/hands pair laptop` in a direct Telegram chat with the bot or `hermes hands pair laptop` on the gateway. On the device, run the printed `hermes-hands pair` command, then `hermes-hands serve`.
 4. In a direct chat with the bot, run `/hands use laptop`.
 
 ## Versions
 
-Hermes Hands 0.1.0 for the gateway plugin and device package, same version. Requires Hermes 0.23.0 or later.
+Hermes Hands 0.2.0 for the gateway plugin and device package, same version. Requires Hermes 0.23.0 or later.
 
 ## How it compares
 
 | Capability | dirtside | hermes-teleoperator | Hermes Hands |
 |---|---|---|---|
-| Device systems | macOS and Linux; its reported internet run used a WSL2 device | Linux receiver | Native Windows with Git Bash, tested live; Linux and macOS code has unit tests but no live device test |
-| Device install | Hermes on both ends | Rust receiver over SSH | `pipx install hermes-hands==0.1.0` |
+| Device systems | macOS and Linux; its reported internet run used a WSL2 device | Linux receiver | Native Windows with Git Bash, tested live; Linux has an interactive console path but has not been tested live; macOS is not a supported device platform |
+| Device install | Hermes on both ends | Rust receiver over SSH | `pipx install hermes-hands==0.2.0` |
 | Connection | Outbound long poll | Inbound SSH | Outbound HTTPS long poll |
 | Signing | Ed25519, pinned keys | SSH | Ed25519 in both directions, pinned keys, no shared secret |
 | Shell and file tools | Yes | Yes | Yes |
@@ -93,12 +93,12 @@ On Windows, in PowerShell:
 3. Open a new terminal again, then install the device agent:
 
    ```powershell
-   pipx install hermes-hands==0.1.0
+   pipx install hermes-hands==0.2.0
    ```
 
-   Before 0.1.0 is on PyPI, install it from the tag instead, which needs access to the repository: `pipx install "git+https://github.com/Ridwannurudeen/hermes-hands@v0.1.0#subdirectory=device"`.
+   Before 0.2.0 is on PyPI, install it from a reachable repository checkout or tag instead: `pipx install "git+https://github.com/Ridwannurudeen/hermes-hands@v0.2.0#subdirectory=device"`.
 
-   To keep the device's private key in the OS keyring instead of a file, install it with `pipx install "hermes-hands[keyring]==0.1.0"`.
+   To keep the device's private key in the OS keyring instead of a file, install it with `pipx install "hermes-hands[keyring]==0.2.0"`.
 
 4. Make `python3` work inside Git Bash. In Git Bash, `python3 -c "import sys; print(sys.version)"` must print a Python version. The python.org build from step 1 has no `python3.exe`, so Git Bash finds the Microsoft Store alias instead, which only prints "Python was not found". Installing the Python Install Manager gives Git Bash a working `python3`; on the laptop used for the live checks it runs the Python 3.12 from step 1. `hermes-hands doctor` runs the same check in Git Bash and names the Store alias if that is what it finds.
 
@@ -113,7 +113,43 @@ hermes-hands serve
 
 Run one `hermes-hands serve` per device; `serve` holds an exclusive lock on `~/.hermes-hands/serve.lock` and refuses to start if another `serve` process is already running for that device home. Screen capture is off by default; to opt in, run the agent as `hermes-hands serve --allow-screen`. To start the agent at logon instead, run `hermes-hands install-service`, which registers a Windows scheduled task that runs `pythonw -I -m hermeshands_device.cli serve`; add `--allow-screen` (`hermes-hands install-service --allow-screen`) to let that agent take screenshots. To change the flag later, stop the running task, remove it with `hermes-hands install-service --remove`, and install it again. `hermes-hands install-service --dry-run` prints the planned action.
 
-Linux devices need Python 3.11 or later, pipx, and a Bash environment. Install `hermes-hands==0.1.0` (or `"hermes-hands[keyring]==0.1.0"`, or from the git URL above before the release), pair using the command printed by `/hands pair <name>`, then run `hermes-hands serve`. The service installer is implemented for Windows Task Scheduler.
+Linux devices need Python 3.11 or later, pipx, and a Bash environment. Install `hermes-hands==0.2.0` (or `"hermes-hands[keyring]==0.2.0"`, or from the git URL above before the release), pair using the command printed by `/hands pair <name>`, then run `hermes-hands serve`. The service installer is implemented for Windows Task Scheduler. Linux `serve --witness` uses an interactive TTY console, but has not been tested live.
+
+## Witness mode: help someone else's computer
+
+Witness mode lets a paired device owner ask for help while keeping control at the keyboard. Pair the device first. Then start this command in an interactive terminal on that device:
+
+```sh
+hermes-hands serve --witness
+```
+
+The command requires stdin and stdout TTYs. It does not run under `pythonw` or as a service. The console shows the paired owner label when configured, otherwise the device ID, the gateway host, the 30 minute session limit, the available features, and the stop key. The person at the device must type `Y` at `Start witness mode? [Y/N]` to begin. `S` stops before the session starts. Other input leaves witness mode inactive.
+
+The session lasts at most 30 minutes. Press `S` or `s` to stop. Press `H` to write a help request, or Escape to cancel that request. Up to three help requests are accepted per session. The helper needs a saved owner chat origin from `/hands use` for the relay to accept a request. An accepted request is marked pending until the gateway delivers it. The device console says when the request was not sent or when delivery is still pending.
+
+The helper can request the built in `hands_checkup` tool. It returns structured device facts with `observed`, `unsupported`, or `error` availability. Its `inferences` list is currently empty. The checkup does not inspect print queues or pending operating system updates. Those facts are returned as unsupported.
+
+Screenshots require two separate permissions. The person first answers `Y` to allow screenshot requests for the session. Each screenshot then asks `Allow this screenshot?` and requires another `Y`. A declined or unanswered request does not capture an image. This session consent is separate from the normal `serve --allow-screen` setting.
+
+The bundled `hands` skill contains five Windows troubleshooting playbooks. They start with diagnostics, state the limits of the live standard user checks, request owner approval for one repair, then recheck the result. Linux notes are read only comparisons and were not run live. The Windows checklist was tested as a standard user on Windows 11 Home. All listed diagnostics ran without elevation. No real repair was applied. The printer resume probe returned access denied even with `-WhatIf`, so permission to resume a real job is not established.
+
+During an active witness session, the plugin's `pre_tool_call` hook blocks `execute_code`. For terminal commands, it also blocks shell composition and script launches. A small exact read only command list can run without owner approval. Other terminal commands and all `write_file` or `patch` calls require owner approval. The hook does not cover `read_file` or `search_files`.
+
+The console timestamps its prompts and status lines. It does not print the helper's command text. Local receipts use labels such as `Running a command` and record outcomes, timestamps, checkup facts, and the session end reason. They do not contain the command text, command output, or a list of changes. The device writes a text receipt and a signed JSON receipt under `~/.hermes-hands/receipts/`. Verify the JSON file with:
+
+```sh
+hermes-hands receipt verify ~/.hermes-hands/receipts/session-name.json
+```
+
+`S` starts shutdown, cancels registered jobs, rejects work once the device enters its stopping state, and attempts a final relay heartbeat. A process detached into a separate session can outlive the witness session on Linux. The device agent runs with the logged in user's permissions. A compromised helper account or gateway can still issue requests to paired devices. Local consent and the stop key do not protect files from a compromised account.
+
+## How this is different from a tech support scam
+
+The person at the computer starts the witness session and can stop it locally. The helper cannot start or restart witness mode remotely. The session is time limited, and screenshot sharing needs session consent plus consent for every capture.
+
+The device has an owner approval hook for commands and changes. It blocks code execution, scripts, and shell composition. It requires approval for commands outside its exact read only list and for writes or patches. `read_file` and `search_files` are outside that hook. The device process can access files allowed to the logged in account, including credentials, so witness mode is not a security sandbox.
+
+The device connects out over HTTPS and does not open a listening port. Both sides sign requests with Ed25519 keys pinned at pairing. A local text receipt and signed JSON receipt record session events and outcomes. The receipt does not show command text, output, or exactly what changed. A compromised helper account or gateway can still control paired devices, so the consent screen and stop key reduce risk but do not remove that risk.
 
 Optional on Windows: `winget install BurntSushi.ripgrep.MSVC` enables ripgrep features in search. `hermes-hands doctor` reports whether Git Bash and Python are available inside it. The device needs Python on Git Bash's PATH for `execute_code` and some file operations.
 
@@ -121,7 +157,7 @@ In Git Bash, a native Windows program turns a `/switch` argument into a path, so
 
 ## What runs on the device
 
-With Hermes 0.23.0, Hands routes these tools through the selected device terminal backend: `terminal`, `execute_code`, `read_file`, `write_file`, `patch`, and `search_files`. `execute_code` needs Python available inside Git Bash. Hands also registers `hands_screenshot` and `hands_devices` as its own tools.
+With Hermes 0.23.0, Hands routes these tools through the selected device terminal backend: `terminal`, `execute_code`, `read_file`, `write_file`, `patch`, and `search_files`. `execute_code` needs Python available inside Git Bash. Hands also registers `hands_screenshot`, `hands_devices`, and `hands_checkup` as its own tools.
 
 The target is selected for each terminal call. The first terminal result after a target change identifies the target and device home. Terminal commands on a device start in the device's home folder. A relative path in a file tool resolves against the device's current terminal folder, as on a local backend, except that a `terminal.cwd` configured on the gateway still wins; the bundled skill tells the model to prefer absolute device paths. `search_files` patterns reach the device exactly as the model wrote them. `/hands use server` switches terminal calls back to the gateway host. A chat that never chose a target uses `default_target`, which defaults to `server`; cron execution always uses `server`. The target belongs to the chat, so `/new` and `/reset` keep it: send `/hands use server` first when a fresh conversation should run on the gateway. A device command never falls back to the gateway.
 
@@ -133,9 +169,12 @@ The target is selected for each terminal call. The first terminal result after a
 - When the device agent restarts, the gateway notices within about 10 seconds and then fails a command the old agent had taken, saying it may have partly run.
 - A file tool path written as `~/...` lands in the device home, but the tool result's `resolved_path` shows the gateway's home, because core expands `~` on the gateway.
 - Switching targets calls `clear_file_ops_cache` for the task, which also clears Hermes's read tracker and file-state registry for that task. Stale-write and concurrent-edit checks from reads before the switch are lost, and overwriting an existing server file after switching back requires reading it again first.
-- On Windows, revoking a device stops every job the agent started, foreground and background. On macOS and Linux the agent stops the process groups it started; a job that detached itself into a new session (for example with `setsid`) keeps running, so stop it on the device yourself.
+- On Windows, revoking a device stops every job the agent started, foreground and background. On Linux the agent stops the process groups it started; a job that detached itself into a new session (for example with `setsid`) keeps running, so stop it on the device yourself.
 - File tools (`read_file`, `write_file`, `patch`, and `search_files`) check their generated command against only the first four deny list entries, which are the self-protection rules (`.hermes-hands`, `hermes-hands` management commands, killing the agent PID, and stopping or removing the `HermesHands` task), not general shell words such as `sudo` or `shutdown`. A file path or `search_files` pattern whose text matches one of those self-protection rules is still refused with exit 126.
 - A command handed to a connection the device can no longer read, for example during a Wi-Fi switch while the same agent process keeps running, is not delivered again; it fails when the gateway's terminal timeout ends.
+- macOS is not a supported device platform.
+- Linux device behavior, including witness mode, has not been tested live. Linux witness mode needs an interactive TTY. The service installer supports Windows Task Scheduler only.
+- `hands_checkup` reports print queue jobs and pending operating system updates as unsupported. It does not run Windows printer or update queries.
 
 ## Security model
 
@@ -151,7 +190,7 @@ The device connects out and does not open a listening port. Ed25519 signatures a
 
 ## Stored data and retention
 
-The gateway stores the relay seed through Hermes's declared secret configuration, and stores device public keys and pairing metadata in the plugin database. It does not store device private keys. The device stores its Ed25519 private key in the OS keyring only when the agent was installed with the `keyring` extra (`pipx install "hermes-hands[keyring]==0.1.0"`); otherwise, as with the plain install, it uses `~/.hermes-hands/device.json`. The keyring service is `hermes-hands` and the entry username is `device-private`. The fallback file is restricted to the device user: an owner only ACL on Windows, mode 0600 elsewhere.
+The gateway stores the relay seed through Hermes's declared secret configuration, and stores device public keys and pairing metadata in the plugin database. It does not store device private keys. The device stores its Ed25519 private key in the OS keyring only when the agent was installed with the `keyring` extra (`pipx install "hermes-hands[keyring]==0.2.0"`); otherwise, as with the plain install, it uses `~/.hermes-hands/device.json`. The keyring service is `hermes-hands` and the entry username is `device-private`. The fallback file is restricted to the device user: an owner only ACL on Windows, mode 0600 elsewhere.
 
 Device output logs are written under `~/.hermes-hands/out/` and the device agent deletes them after 7 days. Hermes's temporary shell and cwd files on the device (`hermes-snap-*.sh` and `hermes-cwd-*.txt` in the system temp folder and in a local Hermes install's `cache/terminal` folder, if one exists) are removed after 24 hours. Both cleanups run when `serve` starts and then hourly while it runs. Delete output logs sooner with `rm -rf ~/.hermes-hands/out` or remove selected files there.
 
@@ -170,24 +209,27 @@ About 0.4 s per small command (p50 409 ms, p90 411 ms over 30 runs, measured twi
 
 A skill can explain how to use a feature, but cannot register a terminal backend, provide authenticated relay routes, run a laptop process, or enforce local policy.
 
+The current hook API coupling and proposed public interfaces are documented in [the hook request issue](docs/HOOK-REQUEST-ISSUE.md).
+
 ## Tests and validation
 
-[COUNT_AT_PIN] tests run against Hermes 0.23.0: [COUNT_AT_PIN] plugin tests, [COUNT_AT_PIN] of them end to end with the real device agent and the real relay in one process, and [COUNT_AT_PIN] device tests. On Windows [COUNT_AT_PIN] pass and [COUNT_AT_PIN] are skipped by design (one needs a Linux gateway, one is POSIX only).
+The shared local suite covers the gateway plugin and device agent. The result below is from the requested local run.
 
-The workflows in `.github/workflows/` cover the plugin on Ubuntu and Windows and the device on Ubuntu, Windows and macOS. No run has reached its first step yet: GitHub stops every job with a billing message for the repository owner's account, so the numbers above were produced by a local run against Hermes 0.23.0 on Linux and have not been reproduced on Windows.
+```powershell
+.venv\Scripts\python -m pytest hermes-hands/tests device/tests -q -p no:cacheprovider
+```
+
+Result: 464 passed, 18 skipped in 73.88s (0:01:13).
+
+The workflows in `.github/workflows/` cover the plugin on Ubuntu and Windows and the device on Ubuntu, Windows and macOS.
 
 The device CI tests on Python 3.11 and 3.12. Plugin CI validates the plugin and doctor, runs the plugin suite against Hermes 0.23.0, validates catalog shape, scans plugin payloads, and checks Python changes for Windows footguns.
 
-## Not yet verified live
+## Live verification
 
-- Telegram interactions
-- Screenshot capture and delivery
-- The Desktop pane inside the app
-- Linux devices
-- macOS devices
-- `hermes-hands install-service` (the Windows scheduled task)
+Live checks on a real Hermes 0.23.0 gateway in WSL and a native Windows 11 laptop confirmed pairing, terminal work on the laptop, persistent working directory, a 200,001 byte `write_file` round trip verified by SHA-256, timeout handling, offline failure without execution, and recovery after the device restarted. A witness run confirmed local consent, the exact read only command allowlist, write blocking, screenshot decline and grant, checkup results, and signed JSON receipt verification. A follow up run verified that `S` stopped the active child, the gateway received `stopped_by_person`, and the device exited 2.59 seconds after `S`; both receipt paths existed.
 
-This list will shrink as live tests land. Live checks on a real Hermes 0.23.0 gateway in WSL and a native Windows 11 laptop confirmed pairing, terminal work on the laptop, persistent working directory, a 200,001 byte `write_file` round trip verified by SHA-256, timeout handling, offline failure without execution, and recovery after the device restarted.
+Successful help delivery to a chat has not been tested. The live device had no saved `/hands use` chat origin, so the relay refused the request and the console explained that it was not sent. Telegram interactions, screenshot delivery in chat, the Desktop pane, the Windows service installer, and Linux device behavior have not been tested live. macOS is not a supported device platform.
 
 ## Uninstall
 
