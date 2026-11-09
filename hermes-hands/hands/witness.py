@@ -7,7 +7,8 @@ from functools import partial
 
 from . import messages, store, targets
 
-_PROTECTED_TOOLS = frozenset({"terminal", "write_file", "patch", "execute_code"})
+_PROTECTED_TOOLS = frozenset({"terminal", "read_file", "write_file", "patch", "execute_code"})
+_APPROVAL_DETAIL_MAX = 300
 _READ_ONLY_ARGV = frozenset(
     {
         ("pwd",),
@@ -90,10 +91,25 @@ def _witness_device(ctx) -> dict | None:
     return device
 
 
-def _approval(device_name: str) -> dict:
+def _sanitize_approval_text(value: str) -> str:
+    text = "".join(
+        " " if unicodedata.category(char) in {"Cc", "Cf", "Cs"} else char
+        for char in value
+    )
+    text = " ".join(text.split())
+    if len(text) > _APPROVAL_DETAIL_MAX:
+        return f"{text[:_APPROVAL_DETAIL_MAX - 3].rstrip()}..."
+    return text
+
+
+def _approval(tool_name: str, device_name: str, details: str) -> dict:
     return {
         "action": "approve",
-        "message": messages.WITNESS_APPROVAL.format(device=device_name),
+        "message": messages.WITNESS_APPROVAL.format(
+            tool=_sanitize_approval_text(tool_name),
+            device=_sanitize_approval_text(device_name),
+            details=_sanitize_approval_text(details),
+        ),
         "rule_key": f"hands-witness:{secrets.token_hex(16)}",
     }
 
@@ -121,7 +137,7 @@ def _command_decision(command: str, device_name: str) -> dict | None:
         return None
     if executable in _READ_ONLY_EXECUTABLES:
         return {"action": "block", "message": messages.WITNESS_COMMAND_BLOCKED}
-    return _approval(device_name)
+    return _approval("terminal", device_name, f"command={command}")
 
 
 def pre_tool_call(ctx, tool_name: str, args: dict, **kwargs):
@@ -135,8 +151,15 @@ def pre_tool_call(ctx, tool_name: str, args: dict, **kwargs):
             return {"action": "block", "message": messages.WITNESS_EXECUTE_CODE_BLOCKED}
         if not isinstance(args, dict):
             return {"action": "block", "message": messages.WITNESS_COMMAND_BLOCKED}
-        if tool_name in {"write_file", "patch"}:
-            return _approval(device["name"])
+        if tool_name in {"read_file", "write_file", "patch"}:
+            path = args.get("path")
+            path = path if isinstance(path, str) else "(path unavailable)"
+            operation = {"read_file": "read", "write_file": "write", "patch": "patch"}[tool_name]
+            return _approval(
+                tool_name,
+                device["name"],
+                f"operation={operation}; path={path}",
+            )
         command = args.get("command")
         if not isinstance(command, str):
             return {"action": "block", "message": messages.WITNESS_COMMAND_BLOCKED}

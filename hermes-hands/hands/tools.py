@@ -116,8 +116,10 @@ def register_tools(ctx) -> None:
         schema={
             "name": "hands_checkup",
             "description": (
-                "Run the selected paired device's built-in read-only checkup, "
-                "with observed facts separate from inferences."
+                "For any request to run a checkup, perform a health check, or diagnose why a laptop is slow, "
+                "call hands_checkup first. This built-in read-only device report separates observed facts "
+                "from inferences. Ad hoc terminal commands on witness devices are blocked or require "
+                "owner approval."
             ),
             "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
         },

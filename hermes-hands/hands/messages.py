@@ -38,8 +38,8 @@ PAIR_NAME_RESERVED = (
 PAIR_BAD_SIGNATURE = "hands: the pairing request is not signed by the public key it carries."
 TARGET_NOTE_SERVER = "hands: now on server (the gateway host)"
 WITNESS_APPROVAL = (
-    "This action can change files or run a command on {device}. Review the tool arguments and "
-    "approve this call to continue."
+    "Hands witness approval required: tool={tool}; device={device}; {details}. "
+    "Review the request before approving."
 )
 WITNESS_COMMAND_BLOCKED = (
     "Hermes Hands blocks shell composition, scripts, redirects, malformed commands, and unsupported "

@@ -131,6 +131,14 @@ def test_manifest_advertises_the_checkup_tool():
     )
 
 
+def test_hands_skill_starts_checkup_requests_with_builtin_tool():
+    source = " ".join(SKILL_MD.read_text(encoding="utf-8-sig").split()).casefold()
+
+    assert "call `hands_checkup` as your first tool call" in source
+    assert "ad hoc terminal commands on witness devices are blocked or require owner approval" in source
+    assert "ask any clarifying questions after the checkup" in source
+
+
 def test_f4_playbooks_keep_diagnostics_approval_and_rechecks():
     source = SKILL_MD.read_text(encoding="utf-8-sig")
     expected_commands = {

@@ -32,6 +32,15 @@ paths built from the note's home (`/c/Users/ridwan/...` on Windows, `/home/ridwa
 
 Do not use `sudo` on a device: its default deny list refuses it with exit 126.
 
+## Checkup first
+
+For any request to run a checkup, perform a health check, or diagnose why a laptop is slow, call
+`hands_checkup` as your first tool call, before using `terminal` or another diagnostic tool. The
+checkup returns the paired device's built-in read-only facts and separates them from inferences.
+Ad hoc terminal commands on witness devices are blocked or require owner approval. Ask any
+clarifying questions after the checkup, and ask the owner to run extra read-only commands locally
+when the checkup does not provide a needed fact.
+
 ## Windows devices (Git Bash)
 
 - Commands run in Git Bash: bash, coreutils, `find` and `grep`. Write bash, not PowerShell or cmd.
@@ -120,7 +129,9 @@ were not run, and they do not provide Windows repair support through WSL.
 
 ### Shared F4 rules
 
-1. Confirm the owner's symptom and selected Windows device before checking anything.
+1. Confirm the selected Windows device. For a general checkup, health check, or slow-laptop request,
+   call `hands_checkup` first and ask any needed symptom questions afterward. For other symptoms,
+   confirm the owner's symptom before checking anything.
 2. Call `hands_checkup` for observed device facts. Keep its `facts` and `inferences` separate; do
    not repeat an inference as an observation. A fact's `availability` may be `unsupported` or
    `error`, which is not evidence that the condition is absent.
@@ -237,9 +248,9 @@ queue exist. WSL does not imply access to the Windows Spooler or these queues.
 
 ### Slow PC (Windows-only)
 
-**Confirm the symptom.** Ask what feels slow and whether it is specifically window/menu
-transitions. The visual-effects repair below is only for slow-feeling transitions, not a general
-CPU or memory repair.
+**Confirm the symptom.** After the initial `hands_checkup`, ask what feels slow and whether it is
+specifically window/menu transitions. The visual-effects repair below is only for slow-feeling
+transitions, not a general CPU or memory repair.
 
 **Read-only diagnostics.** Run `hands_checkup` and report `memory_used_percent`,
 `memory_available_bytes`, and the sampled `top_process_*` facts. It does not measure CPU utilization
