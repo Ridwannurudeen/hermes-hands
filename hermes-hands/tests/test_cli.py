@@ -264,7 +264,7 @@ def test_pair_cli_mints_code_and_prints_device_command(monkeypatch, capsys):
     config.load_config_readonly = lambda: {"dashboard": {"public_url": "https://hands.example.com"}}
     monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
     monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
-    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name: "pair-code")
+    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name, **kwargs: "pair-code")
     ctx = Context()
     cli.register_cli(ctx, has_seed=True)
     parser = argparse.ArgumentParser()
@@ -275,6 +275,7 @@ def test_pair_cli_mints_code_and_prints_device_command(monkeypatch, capsys):
 
     assert capsys.readouterr().out == (
         "Pair code: pair-code\n"
+        "Owner label: local owner\n"
         "Run on the device: hermes-hands pair https://hands.example.com --name 'my laptop' --code=pair-code\n"
     )
 
@@ -300,7 +301,7 @@ def test_pair_cli_falls_back_to_dashboard_url(monkeypatch, capsys):
     config.load_config_readonly = lambda: {}
     monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
     monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
-    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name: "pair-code")
+    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name, **kwargs: "pair-code")
     ctx = Context()
     ctx.config["dashboard_url"] = "http://127.0.0.1:9119"
     cli.register_cli(ctx, has_seed=True)
@@ -347,7 +348,7 @@ def test_pair_cli_ignores_an_undeclared_public_url_setting(monkeypatch, capsys):
     config.load_config_readonly = lambda: {"dashboard": {"public_url": "https://hands.example.com"}}
     monkeypatch.setitem(sys.modules, "hermes_cli", hermes_cli)
     monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
-    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name: "pair-code")
+    monkeypatch.setattr(cli.store, "mint_pairing_code", lambda name, **kwargs: "pair-code")
     ctx = Context()
     ctx.config["public_url"] = "http://10.0.0.5:1234"
     cli.register_cli(ctx, has_seed=True)

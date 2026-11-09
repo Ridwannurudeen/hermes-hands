@@ -21,6 +21,7 @@ def register_cli(ctx, *, has_seed: bool) -> None:
         subparsers.add_parser("doctor")
         pair = subparsers.add_parser("pair")
         pair.add_argument("name")
+        pair.add_argument("--owner-label")
 
     def handler(args):
         action = args.hands_action
@@ -42,7 +43,11 @@ def register_cli(ctx, *, has_seed: bool) -> None:
                 print(f"{device['name']}: {'online' if device['online'] else 'offline'}")
             return
         if action == "pair":
-            print(commands.pair_reply(ctx, args.name, has_seed=has_seed))
+            print(
+                commands.pair_reply(
+                    ctx, args.name, has_seed=has_seed, owner_label=args.owner_label
+                )
+            )
             return
         if action == "revoke":
             if not args.yes and input(f"Revoke {args.name}? [y/N] ").strip().lower() != "y":

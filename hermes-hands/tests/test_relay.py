@@ -1231,7 +1231,7 @@ def pair_request(device_private, device_public, code, **overrides):
 
 def test_pair_happy_path_and_refusals(hub):
     private, public = protocol.generate_keypair()
-    code = store.mint_pairing_code("laptop")
+    code = store.mint_pairing_code("laptop", owner_label="Ridwan")
     reply = run(hub.pair(*pair_request(private, public, code, protocol="hands/0")))
     assert (
         reply.status == 426
@@ -1248,6 +1248,7 @@ def test_pair_happy_path_and_refusals(hub):
         reply.status == 200
         and protocol.unb64u(paired["relay_public_key"]) == hub._keys.relay_public
     )
+    assert paired["owner_label"] == "Ridwan"
     assert store.device_by_id(paired["device_id"])["public_key"] == public
     reused = run(hub.pair(principal, headers, path, raw))
     assert (reused.status, body(reused)["error"]) == (401, "bad_code")
@@ -1259,6 +1260,17 @@ def test_pair_happy_path_and_refusals(hub):
     )
     assert (reserved.status, body(reserved)["detail"]) == (409, messages.PAIR_NAME_RESERVED)
     assert run(hub.pair(principal, headers, path, b"not json")).status == 400
+
+
+def test_pair_without_owner_label_keeps_the_legacy_signed_response(hub):
+    private, public = protocol.generate_keypair()
+    code = store.mint_pairing_code("laptop")
+
+    reply = run(hub.pair(*pair_request(private, public, code)))
+    paired = verified(hub, reply, relay.API + "/pair")
+
+    assert reply.status == 200
+    assert "owner_label" not in paired
 
 
 def test_state_lists_devices_and_policy_alerts(hub):

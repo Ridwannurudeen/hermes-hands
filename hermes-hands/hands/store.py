@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS revoked_devices (
 CREATE TABLE IF NOT EXISTS pairing_codes (
     code_hash TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    owner_label TEXT NOT NULL DEFAULT '',
     expires_at INTEGER NOT NULL,
     used INTEGER NOT NULL DEFAULT 0
 );
@@ -128,6 +129,7 @@ def _db() -> Iterator[sqlite3.Connection]:
         _add_column(conn, "devices", "session_state", "TEXT NOT NULL DEFAULT 'normal'")
         _add_column(conn, "devices", "capabilities", "TEXT NOT NULL DEFAULT '[]'")
         _add_column(conn, "devices", "session_ended_at", "INTEGER")
+        _add_column(conn, "pairing_codes", "owner_label", "TEXT NOT NULL DEFAULT ''")
         with conn:
             yield conn
     finally:
@@ -155,13 +157,13 @@ def _public(row: sqlite3.Row, now: int) -> dict:
     }
 
 
-def mint_pairing_code(name: str, ttl: int = 600) -> str:
-    """A single-use 32-byte code for pairing a device called ``name``; only its hash is stored."""
+def mint_pairing_code(name: str, ttl: int = 600, *, owner_label: str = "") -> str:
+    """A single-use code for one device; only its hash and consent-screen owner label are stored."""
     code = secrets.token_urlsafe(32)
     with _db() as conn:
         conn.execute(
-            "INSERT INTO pairing_codes (code_hash, name, expires_at) VALUES (?, ?, ?)",
-            (_code_hash(code), name, int(time.time()) + ttl),
+            "INSERT INTO pairing_codes (code_hash, name, owner_label, expires_at) VALUES (?, ?, ?, ?)",
+            (_code_hash(code), name, owner_label, int(time.time()) + ttl),
         )
     return code
 
@@ -172,7 +174,8 @@ def _live_code(conn: sqlite3.Connection, code: str, now: int) -> sqlite3.Row | N
     digest = _code_hash(code)
     match = None
     rows = conn.execute(
-        "SELECT code_hash, name FROM pairing_codes WHERE used = 0 AND expires_at > ?", (now,)
+        "SELECT code_hash, name, owner_label FROM pairing_codes WHERE used = 0 AND expires_at > ?",
+        (now,),
     ).fetchall()
     for row in rows:
         if hmac.compare_digest(row["code_hash"], digest):
@@ -185,6 +188,13 @@ def pairing_code_name(code: str) -> str | None:
     with _db() as conn:
         row = _live_code(conn, code, int(time.time()))
     return None if row is None else row["name"]
+
+
+def pairing_code_owner_label(code: str) -> str | None:
+    """The consent-screen owner label for a live code, else None for a legacy unlabeled code."""
+    with _db() as conn:
+        row = _live_code(conn, code, int(time.time()))
+    return None if row is None or not row["owner_label"] else row["owner_label"]
 
 
 def complete_pairing(

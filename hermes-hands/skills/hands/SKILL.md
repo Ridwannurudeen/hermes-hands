@@ -191,8 +191,9 @@ not a Linux/WSL repair.
 **Confirm the symptom.** Ask which queue and document the owner expects to print. Resume a job only
 if the owner confirms that exact paused job should print.
 
-**Read-only diagnostics.** Run `hands_checkup`; its `print_queue_jobs` fact is unsupported in this
-device build. Ask the owner to run these exact read-only checks locally:
+**Read-only diagnostics.** Run `hands_checkup` and report the `print_queue_jobs` count across the
+visible Windows queues. The checkup does not collect queue names, document names, or job IDs. If its
+fact is an error or unavailable, ask the owner to run these exact read-only checks locally:
 
 ```powershell
 Get-Service -Name Spooler | Select-Object Name,Status,StartType
@@ -201,8 +202,9 @@ Get-PrintJob -PrinterName 'Microsoft Print to PDF' | Select-Object PrinterName,I
 Get-PrintJob -PrinterName 'OneNote (Desktop)' | Select-Object PrinterName,ID,DocumentName,JobStatus
 ```
 
-**Facts.** Report the spooler status, queue status, and exact job ID/status. The live read-only
-checks worked as a standard user; the two listed queues had no jobs at that time.
+**Facts.** Report the checkup's aggregate job count, plus the spooler status, queue status, and exact
+job ID/status from the local checks. The live read-only checks worked as a standard user; the two
+listed queues had no jobs at that time.
 
 **Uncertainty.** The live checklist found no job to repair. It does not establish access to a
 different queue or job. The standard-user probe

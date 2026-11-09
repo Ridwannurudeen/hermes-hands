@@ -26,8 +26,10 @@ def _timestamped(text: str) -> str:
 
 
 def witness_consent_copy(owner_label: str, gateway_host: str) -> str:
+    owner_label = "".join(char for char in owner_label if char.isprintable()).strip()[:80]
+    owner_label = owner_label or "paired owner"
     return (
-        f"Witness session for paired owner: {owner_label}\n"
+        f"{owner_label}'s Hermes wants to help\n"
         f"Gateway: {gateway_host}\n"
         "Session limit: 30 minutes\n"
         f"Capabilities: {', '.join(WITNESS_CAPABILITIES)}\n"

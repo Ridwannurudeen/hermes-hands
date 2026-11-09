@@ -32,6 +32,16 @@ def _quiet_probes(monkeypatch):
             return False
 
     monkeypatch.setattr(checkup.socket, "create_connection", lambda *args, **kwargs: Connection())
+    monkeypatch.setattr(
+        checkup,
+        "_run_windows_probe",
+        lambda name, deadline: (
+            {"print_queue_jobs": 0, "print_queue_count": 2}
+            if name == "print_queue"
+            else {"pending_updates": 0}
+        ),
+        raising=False,
+    )
 
 
 def _facts(result):
@@ -114,6 +124,90 @@ def test_checkup_keeps_unsupported_and_failed_facts_explicit(monkeypatch):
     assert facts["battery_percent"]["value"] is None
     assert facts["battery_percent"]["status"] == "unknown"
     assert facts["battery_percent"]["availability"] == "unsupported"
+
+
+def test_windows_print_queue_and_pending_updates_have_observed_counts(monkeypatch):
+    _quiet_probes(monkeypatch)
+    monkeypatch.setattr(checkup.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        checkup,
+        "_run_windows_probe",
+        lambda name, deadline: (
+            {"print_queue_jobs": 3, "print_queue_count": 2}
+            if name == "print_queue"
+            else {"pending_updates": 4}
+        ),
+    )
+
+    facts = _facts(checkup.collect())
+
+    assert facts["print_queue_jobs"]["value"] == 3
+    assert facts["print_queue_jobs"]["status"] == "warn"
+    assert facts["print_queue_jobs"]["availability"] == "observed"
+    assert "2 queues" in facts["print_queue_jobs"]["source"]
+    assert facts["pending_updates"]["value"] == 4
+    assert facts["pending_updates"]["status"] == "warn"
+    assert facts["pending_updates"]["availability"] == "observed"
+
+
+def test_linux_print_queue_and_pending_updates_are_explicitly_unsupported(monkeypatch):
+    _quiet_probes(monkeypatch)
+    monkeypatch.setattr(checkup.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        checkup,
+        "_run_windows_probe",
+        lambda *args, **kwargs: pytest.fail("Windows probe used on Linux"),
+    )
+
+    facts = _facts(checkup.collect())
+
+    for fact_id in ("print_queue_jobs", "pending_updates"):
+        assert facts[fact_id]["value"] is None
+        assert facts[fact_id]["status"] == "unknown"
+        assert facts[fact_id]["availability"] == "unsupported"
+
+
+def test_windows_probes_are_fixed_non_interpolated_and_never_use_shell(
+    monkeypatch, tmp_path
+):
+    run_windows_probe = getattr(checkup, "_run_windows_probe", None)
+    _quiet_probes(monkeypatch)
+    if run_windows_probe is not None:
+        monkeypatch.setattr(checkup, "_run_windows_probe", run_windows_probe)
+    monkeypatch.setattr(checkup.platform, "system", lambda: "Windows")
+    injected_value = f"{tmp_path}; Start-Process {tmp_path / 'injected'}"
+    monkeypatch.setenv("TEMP", injected_value)
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    marker = tmp_path / "injected"
+    calls = []
+
+    def run(args, **kwargs):
+        script = args[-1]
+        calls.append((args, kwargs))
+        assert kwargs["shell"] is False
+        assert injected_value not in script
+        assert str(marker) not in script
+        if "Get-PrintJob" in script:
+            output = '{"print_queue_jobs":0,"print_queue_count":2}'
+        else:
+            output = '{"pending_updates":0}'
+        return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: pytest.fail("Popen used"))
+    monkeypatch.setattr(subprocess, "call", lambda *args, **kwargs: pytest.fail("subprocess.call used"))
+    monkeypatch.setattr(checkup.os, "system", lambda *args, **kwargs: pytest.fail("os.system used"))
+    monkeypatch.setattr(checkup.os, "popen", lambda *args, **kwargs: pytest.fail("os.popen used"))
+
+    facts = _facts(checkup.collect())
+
+    assert [args[-1] for args, _ in calls] == list(checkup._WINDOWS_PROBES.values())
+    assert len(calls) == 2
+    assert all(args[-2] == "-Command" for args, _ in calls)
+    assert all(kwargs["timeout"] > 0 for _, kwargs in calls)
+    assert facts["print_queue_jobs"]["availability"] == "observed"
+    assert facts["pending_updates"]["availability"] == "observed"
+    assert not marker.exists()
 
 
 def test_process_facts_never_request_or_read_command_lines(monkeypatch):

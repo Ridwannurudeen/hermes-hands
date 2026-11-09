@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import platform
 import queue
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -17,9 +19,26 @@ MAX_FOLDER_ENTRIES = 2048
 MAX_FOLDER_DEPTH = 8
 MAX_FOLDER_SECONDS = 0.5
 MAX_PROCESS_SAMPLE = 128
-MAX_CHECKUP_SECONDS = 4.0
+MAX_CHECKUP_SECONDS = 9.0
 _DNS_TIMEOUT = 1.0
 _REACHABILITY_TIMEOUT = 0.75
+_WINDOWS_PROBE_TIMEOUTS = {"print_queue": 1.5, "pending_updates": 2.5}
+_WINDOWS_PROBES = {
+    "print_queue": (
+        "$ErrorActionPreference = 'Stop'; "
+        "$printers = @(Get-Printer -ErrorAction Stop); "
+        "$jobs = @(foreach ($printer in $printers) { "
+        "Get-PrintJob -PrinterName $printer.Name -ErrorAction Stop }); "
+        "[ordered]@{ print_queue_jobs = [int]$jobs.Count; "
+        "print_queue_count = [int]$printers.Count } | ConvertTo-Json -Compress"
+    ),
+    "pending_updates": (
+        "$ErrorActionPreference = 'Stop'; "
+        "$session = New-Object -ComObject Microsoft.Update.Session; "
+        "$result = $session.CreateUpdateSearcher().Search(\"IsInstalled=0 and Type='Software' and IsHidden=0\"); "
+        "[ordered]@{ pending_updates = [int]$result.Updates.Count } | ConvertTo-Json -Compress"
+    ),
+}
 _REACHABILITY_TARGETS = (
     ("reachability_cloudflare", "1.1.1.1", 443),
     ("reachability_google", "8.8.8.8", 443),
@@ -504,13 +523,63 @@ def _reachability_facts(deadline: float) -> list[dict[str, object]]:
     return facts
 
 
-def _print_queue_fact() -> dict[str, object]:
-    return _unsupported_fact(
-        "print_queue_jobs",
-        "Print queue job count",
-        "jobs",
-        "No bounded cross-platform print queue query is available in this device build",
+def _run_windows_probe(probe_name: str, deadline: float) -> dict[str, int]:
+    if probe_name not in _WINDOWS_PROBES:
+        raise ValueError("unknown Windows checkup probe")
+    timeout = min(_WINDOWS_PROBE_TIMEOUTS[probe_name], deadline - time.monotonic())
+    if timeout <= 0:
+        raise TimeoutError("checkup time budget expired")
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+    if not system_root:
+        raise OSError("Windows system directory is unavailable")
+    powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    result = subprocess.run(
+        [str(powershell), "-NoProfile", "-NonInteractive", "-Command", _WINDOWS_PROBES[probe_name]],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        shell=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
     )
+    if result.returncode != 0:
+        raise RuntimeError("fixed Windows checkup probe failed")
+    value = json.loads(result.stdout)
+    if not isinstance(value, dict):
+        raise ValueError("invalid Windows checkup probe result")
+    expected = {
+        "print_queue": ("print_queue_jobs", "print_queue_count"),
+        "pending_updates": ("pending_updates",),
+    }[probe_name]
+    if any(type(value.get(key)) is not int or value[key] < 0 for key in expected):
+        raise ValueError("invalid Windows checkup probe result")
+    return {key: value[key] for key in expected}
+
+
+def _print_queue_fact(deadline: float) -> dict[str, object]:
+    fact_id = "print_queue_jobs"
+    label = "Print queue job count"
+    if platform.system() != "Windows":
+        return _unsupported_fact(
+            fact_id,
+            label,
+            "jobs",
+            "Windows PrintManagement is unavailable on Linux; WSL does not expose Windows print queues",
+        )
+    source = "fixed PowerShell Get-Printer and Get-PrintJob probe; queue names and documents are not collected"
+    try:
+        result = _run_windows_probe("print_queue", deadline)
+    except Exception as exc:
+        return _error_fact(fact_id, label, "jobs", source, exc)
+    jobs = result["print_queue_jobs"]
+    queues = result["print_queue_count"]
+    status: Status = "warn" if jobs > 0 or queues == 0 else "ok"
+    queue_word = "queue" if queues == 1 else "queues"
+    return _fact(fact_id, label, jobs, "jobs", status, "observed", f"{source}; {queues} {queue_word} queried")
 
 
 def _uptime_fact() -> dict[str, object]:
@@ -586,13 +655,23 @@ def _pending_reboot_fact() -> dict[str, object]:
     )
 
 
-def _pending_updates_fact() -> dict[str, object]:
-    return _unsupported_fact(
-        "pending_updates",
-        "Pending operating system updates",
-        None,
-        "No bounded in-process cross-platform update catalog query is available",
-    )
+def _pending_updates_fact(deadline: float) -> dict[str, object]:
+    fact_id = "pending_updates"
+    label = "Pending Windows software updates"
+    if platform.system() != "Windows":
+        return _unsupported_fact(
+            fact_id,
+            label,
+            "updates",
+            "Windows Update Agent is unavailable on Linux; update checks are distribution-specific",
+        )
+    source = "fixed Windows Update Agent search for non-installed, non-hidden software updates"
+    try:
+        result = _run_windows_probe("pending_updates", deadline)
+    except Exception as exc:
+        return _error_fact(fact_id, label, "updates", source, exc)
+    count = result["pending_updates"]
+    return _fact(fact_id, label, count, "updates", "warn" if count else "ok", "observed", source)
 
 
 def _battery_facts() -> list[dict[str, object]]:
@@ -712,15 +791,15 @@ def collect() -> dict[str, object]:
     facts.extend(_disk_facts())
     facts.extend(_memory_facts())
     facts.extend(_process_facts(deadline))
+    facts.append(_print_queue_fact(deadline))
+    facts.append(_pending_updates_fact(deadline))
     facts.extend(_folder_facts(deadline))
     facts.append(_wifi_fact())
     facts.append(_dns_servers_fact())
     facts.append(_dns_resolution_fact(deadline))
     facts.extend(_reachability_facts(deadline))
-    facts.append(_print_queue_fact())
     facts.append(_uptime_fact())
     facts.append(_pending_reboot_fact())
-    facts.append(_pending_updates_fact())
     facts.extend(_battery_facts())
     facts.append(_startup_item_fact())
     observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")

@@ -39,6 +39,36 @@ def test_pairing_code_is_single_use(hands_db):
     assert (burned.value.status, burned.value.error) == (401, "bad_code")
 
 
+def test_pairing_code_keeps_owner_label_until_successful_pair(hands_db):
+    code = store.mint_pairing_code("laptop", owner_label="Ridwan")
+
+    assert store.pairing_code_owner_label(code) == "Ridwan"
+    device_id = store.complete_pairing(
+        code,
+        name="laptop",
+        public_key=protocol.b64u(b"k" * 32),
+        os="Windows",
+        home="C:\\Users\\r",
+        policy_hash="p0",
+    )
+    assert len(device_id) == 16
+    assert store.pairing_code_owner_label(code) is None
+
+
+def test_old_pairing_code_table_gains_owner_label_column(hands_db):
+    conn = sqlite3.connect(hands_db / "hands.db")
+    conn.execute(
+        "CREATE TABLE pairing_codes (code_hash TEXT PRIMARY KEY, name TEXT NOT NULL,"
+        " expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    code = store.mint_pairing_code("laptop", owner_label="Ridwan")
+
+    assert store.pairing_code_owner_label(code) == "Ridwan"
+
+
 def test_expired_code_is_refused(hands_db):
     code = store.mint_pairing_code("laptop", ttl=-1)
     assert store.pairing_code_name(code) is None

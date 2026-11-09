@@ -68,7 +68,17 @@ def _pair(url: str, name: str, code: str, *, force: bool = False) -> int:
         return 1
     try:
         data = response.json()
+        if not isinstance(data, dict):
+            raise ValueError("invalid pairing response")
         relay_key = unb64u(data["relay_public_key"])
+        owner_label = data.get("owner_label", "")
+        if (
+            not isinstance(owner_label, str)
+            or len(owner_label) > 80
+            or (owner_label and owner_label.strip() != owner_label)
+            or any(not char.isprintable() for char in owner_label)
+        ):
+            raise ValueError("invalid owner label")
         response_ts, response_nonce = int(response.headers["X-Hands-Ts"]), response.headers["X-Hands-Nonce"]
         response_path = urlparse(pair_url).path
         valid_signature = verify_request(relay_key, response.headers["X-Hands-Signature"], R2D, response_ts, response_nonce, "POST", response_path, response.content)
@@ -80,7 +90,14 @@ def _pair(url: str, name: str, code: str, *, force: bool = False) -> int:
     if not re.fullmatch(r"[a-z0-9-]{1,40}", data.get("device_id", "")) or len(relay_key) != 32 or not fresh(response_ts, int(time.time())) or not valid_signature:
         print("Pairing failed: invalid relay signature", file=sys.stderr)
         return 1
-    config.save({"gateway_url": base_url + API, "device_id": data["device_id"], "relay_public_key": data["relay_public_key"]})
+    pairing = {
+        "gateway_url": base_url + API,
+        "device_id": data["device_id"],
+        "relay_public_key": data["relay_public_key"],
+    }
+    if owner_label:
+        pairing["owner_label"] = owner_label
+    config.save(pairing)
     print(f"Paired as {data['device_id']}")
     return 0
 

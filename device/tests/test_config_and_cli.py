@@ -1,11 +1,33 @@
 import json
 import re
+import time
 import types
 
 import pytest
 
 from hermeshands_device import cli, config, receipt
-from hermeshands_device.protocol import b64u, generate_keypair
+from hermeshands_device.protocol import R2D, b64u, canonical_json, generate_keypair, new_nonce, sign_request
+
+
+def _signed_pair_response(data, *, signed_data=None):
+    relay_private, relay_public = generate_keypair()
+    relay_key = b64u(relay_public)
+    signed_payload = {**(data if signed_data is None else signed_data), "relay_public_key": relay_key}
+    body = canonical_json(signed_payload)
+    response_body = canonical_json({**data, "relay_public_key": relay_key})
+    ts, nonce = int(time.time()), new_nonce()
+    path = "/api/plugins/hermes-hands/pair"
+    signature = sign_request(relay_private, R2D, ts, nonce, "POST", path, body)
+    return cli.httpx.Response(
+        200,
+        content=response_body,
+        headers={
+            "X-Hands-Ts": str(ts),
+            "X-Hands-Nonce": nonce,
+            "X-Hands-Signature": signature,
+        },
+        request=cli.httpx.Request("POST", "https://hands.example.com" + path),
+    )
 
 
 def test_config_round_trip_and_paths(tmp_path, monkeypatch):
@@ -110,6 +132,45 @@ def test_pair_force_flag_is_parsed_and_forwarded(monkeypatch):
 
     assert cli.main(["pair", "https://hands.example.com", "--name", "laptop", "--code", "code", "--force"]) == 0
     assert calls == [("https://hands.example.com", "laptop", "code", True)]
+
+
+@pytest.mark.parametrize("response_data", [
+    {"device_id": "device-1", "owner_label": "Ridwan"},
+    {"device_id": "device-1"},
+])
+def test_pair_persists_only_owner_label_from_signed_relay_response(monkeypatch, response_data):
+    saved = []
+    monkeypatch.setattr(cli.config, "load", lambda: {})
+    monkeypatch.setattr(cli.config, "save", saved.append)
+    monkeypatch.setattr(cli, "get_or_create", lambda: (b"p" * 32, b"q" * 32))
+    monkeypatch.setattr(cli.policy, "digest", lambda: "policy")
+    response = _signed_pair_response(response_data)
+    monkeypatch.setattr(cli.httpx, "post", lambda *args, **kwargs: response)
+
+    assert cli._pair("https://hands.example.com", "laptop", "code") == 0
+
+    assert saved[0]["device_id"] == "device-1"
+    if "owner_label" in response_data:
+        assert saved[0]["owner_label"] == "Ridwan"
+    else:
+        assert "owner_label" not in saved[0]
+
+
+def test_pair_rejects_owner_label_tampering_in_signed_response(monkeypatch, capsys):
+    saved = []
+    monkeypatch.setattr(cli.config, "load", lambda: {})
+    monkeypatch.setattr(cli.config, "save", saved.append)
+    monkeypatch.setattr(cli, "get_or_create", lambda: (b"p" * 32, b"q" * 32))
+    monkeypatch.setattr(cli.policy, "digest", lambda: "policy")
+    signed = {"device_id": "device-1", "owner_label": "Ridwan"}
+    tampered = {"device_id": "device-1", "owner_label": "Mallory"}
+    response = _signed_pair_response(tampered, signed_data=signed)
+    monkeypatch.setattr(cli.httpx, "post", lambda *args, **kwargs: response)
+
+    assert cli._pair("https://hands.example.com", "laptop", "code") == 1
+
+    assert saved == []
+    assert "invalid relay signature" in capsys.readouterr().err
 
 
 def test_pair_refuses_from_device_job(monkeypatch, capsys):
@@ -260,7 +321,15 @@ class FakeDeviceLoop:
         self.console_owner.join(1)
 
 
-def _prepare_witness_cli(monkeypatch, console, *, executable=r"C:\Python\python.exe", input_tty=True, output_tty=True):
+def _prepare_witness_cli(
+    monkeypatch,
+    console,
+    *,
+    executable=r"C:\Python\python.exe",
+    input_tty=True,
+    output_tty=True,
+    owner_label=None,
+):
     from hermeshands_device import janitor, loop
 
     monkeypatch.setattr(cli, "TerminalConsole", lambda: console, raising=False)
@@ -269,14 +338,13 @@ def _prepare_witness_cli(monkeypatch, console, *, executable=r"C:\Python\python.
     monkeypatch.setattr(cli.sys, "stdout", types.SimpleNamespace(isatty=lambda: output_tty))
     monkeypatch.setattr(config, "device_id", lambda: "device-1")
     monkeypatch.setattr(config, "gateway_url", lambda: "https://hands.example.test/api/plugins/hermes-hands")
-    monkeypatch.setattr(
-        config,
-        "load",
-        lambda: {
-            "device_id": "device-1",
-            "gateway_url": "https://hands.example.test/api/plugins/hermes-hands",
-        },
-    )
+    pairing = {
+        "device_id": "device-1",
+        "gateway_url": "https://hands.example.test/api/plugins/hermes-hands",
+    }
+    if owner_label is not None:
+        pairing["owner_label"] = owner_label
+    monkeypatch.setattr(config, "load", lambda: pairing)
     monkeypatch.setattr(janitor, "start", lambda: None)
     monkeypatch.setattr(loop, "DeviceLoop", FakeDeviceLoop)
     FakeDeviceLoop.last = None
@@ -328,12 +396,22 @@ def test_witness_y_starts_session_after_initial_consent(monkeypatch):
     assert agent.capabilities == ["witness-v1", "checkup-v1", "help-v1", "receipt-v1"]
     text = "".join(console.outputs)
     assert "device-1" in text
+    assert "device-1's Hermes wants to help" in text
     assert "hands.example.test" in text
     assert "30 minutes" in text
     assert "No mouse or keyboard control" in text
     assert "Commands and outcomes are recorded" in text
     assert len(console.prompts) == 1
     assert re.match(r"^\[\d{4}-\d{2}-\d{2}T[^\]]+Z\] Start witness mode\? \[Y/N\]: $", console.prompts[0])
+
+
+def test_witness_consent_screen_uses_persisted_owner_label(monkeypatch):
+    console = FakeConsole("Y")
+    _prepare_witness_cli(monkeypatch, console, owner_label="Ridwan")
+
+    assert cli.main(["serve", "--witness"]) == 0
+
+    assert "Ridwan's Hermes wants to help" in "".join(console.outputs)
 
 
 @pytest.mark.parametrize(("answer", "expected"), [("N", 0), (None, 1)])

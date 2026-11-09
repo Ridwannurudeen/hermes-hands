@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 from . import client, messages, store, targets
 
 DEFAULT_DASHBOARD_URL = "http://127.0.0.1:9119"
+MAX_OWNER_LABEL_LENGTH = 80
 # Reject characters core refuses in dashboard.public_url (hermes_cli/dashboard_auth/prefix.py:24).
 _REJECT_CHARS = frozenset(('"', "'", "<", ">", " ", "\n", "\r", "\t"))
 # Unexpanded shell text core replaces with a random per-process key (plugins/dashboard_auth/basic/__init__.py:199).
@@ -141,7 +142,21 @@ def basic_auth_fix() -> str:
     return ""
 
 
-def pair_reply(ctx, name: str, *, has_seed: bool) -> str:
+def _safe_owner_label(value: str) -> str | None:
+    if not isinstance(value, str) or any(not char.isprintable() for char in value):
+        return None
+    label = value.strip()
+    return label if label and len(label) <= MAX_OWNER_LABEL_LENGTH else None
+
+
+def pair_reply(
+    ctx,
+    name: str,
+    *,
+    has_seed: bool,
+    owner_id: str | None = None,
+    owner_label: str | None = None,
+) -> str:
     """Mint and format a pairing reply for ``name``, or refuse without minting a code."""
     if name == store.RESERVED_NAME:
         return messages.PAIR_NAME_RESERVED
@@ -168,9 +183,15 @@ def pair_reply(ctx, name: str, *, has_seed: bool) -> str:
             "pairing URL. Set dashboard.public_url to the https URL of the Hands host, then run "
             "this again."
         )
-    code = store.mint_pairing_code(name)
+    if owner_label is None:
+        configured_owners = _ids(ctx.get_config("owner_ids", default=[]))
+        owner_label = owner_id or (next(iter(configured_owners)) if len(configured_owners) == 1 else "local owner")
+    safe_owner_label = _safe_owner_label(owner_label)
+    if safe_owner_label is None:
+        return f"Owner label must contain 1 to {MAX_OWNER_LABEL_LENGTH} printable characters."
+    code = store.mint_pairing_code(name, owner_label=safe_owner_label)
     command = f"hermes-hands pair {gateway_url} --name {shlex.quote(name)} --code={shlex.quote(code)}"
-    lines = [f"Pair code: {code}", f"Run on the device: {command}"]
+    lines = [f"Pair code: {code}", f"Owner label: {safe_owner_label}", f"Run on the device: {command}"]
     if loopback_url(gateway_url):
         lines.append("Note: a loopback URL pairs only a device on the gateway host itself.")
     return "\n".join(lines)
@@ -330,13 +351,25 @@ def register_commands(ctx, *, has_seed: bool) -> None:
                 "Set desktop placement with: hermes config set bot_desktop.placement gateway\n"
                 "Then restart the gateway and the dashboard."
             )
+        if action == "pair":
+            if len(args) == 4 and args[2] == "--owner-label":
+                owner_label = args[3]
+            elif len(args) == 2:
+                owner_label = None
+            else:
+                return "Usage: /hands pair <name> [--owner-label <label>]"
+            if _in_shared_chat(source):
+                return messages.PAIR_DIRECT_ONLY
+            return pair_reply(
+                ctx,
+                args[1],
+                has_seed=has_seed,
+                owner_id=_caller(platform, source),
+                owner_label=owner_label,
+            )
         if len(args) != 2:
             return f"Usage: /hands {action} <name>"
         name = args[1]
-        if action == "pair":
-            if _in_shared_chat(source):
-                return messages.PAIR_DIRECT_ONLY
-            return pair_reply(ctx, name, has_seed=has_seed)
         if action == "use":
             if name != "server" and _in_shared_chat(source):
                 return messages.USE_DIRECT_ONLY

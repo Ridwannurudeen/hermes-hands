@@ -116,9 +116,34 @@ def test_pair_reply_has_exact_device_command(monkeypatch):
     ctx = setup(monkeypatch, ["telegram:42"])
     ctx.config["dashboard_url"] = "https://gateway.example"
     install_config(monkeypatch, {"dashboard": {}})
-    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name: "secret-code")
+    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name, **kwargs: "secret-code")
     result = ctx.handler("pair laptop", session_key="s", platform="telegram", source=Source())
     assert "hermes-hands pair https://gateway.example --name laptop --code=secret-code" in result
+
+
+def test_pairing_label_defaults_to_owner_id_and_can_be_set_by_owner(monkeypatch):
+    ctx = setup(monkeypatch, ["telegram:42"])
+    ctx.config["dashboard_url"] = "https://gateway.example"
+    install_config(monkeypatch, {"dashboard": {}})
+    minted = []
+    monkeypatch.setattr(
+        commands.store,
+        "mint_pairing_code",
+        lambda name, *, owner_label: minted.append((name, owner_label)) or "secret-code",
+    )
+
+    default = ctx.handler("pair laptop", session_key="s", platform="telegram", source=Source())
+    custom = ctx.handler(
+        'pair laptop --owner-label "Ridwan"',
+        session_key="s",
+        platform="telegram",
+        source=Source(),
+    )
+
+    assert minted == [("laptop", "telegram:42"), ("laptop", "Ridwan")]
+    assert "Owner label: telegram:42" in default
+    assert "Owner label: Ridwan" in custom
+    assert "--owner-label" not in custom.split("Run on the device: ", 1)[1]
 
 
 def test_the_device_cli_accepts_a_printed_code_that_starts_with_a_dash(monkeypatch):
@@ -127,7 +152,7 @@ def test_the_device_cli_accepts_a_printed_code_that_starts_with_a_dash(monkeypat
 
     ctx = setup(monkeypatch, ["telegram:42"])
     install_config(monkeypatch, {"dashboard": {"public_url": "https://hands.example.com"}})
-    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name: "-Q3xk_Abc")
+    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name, **kwargs: "-Q3xk_Abc")
     reply = ctx.handler("pair laptop", session_key="s", platform="telegram", source=Source())
     command = shlex.split(reply.split("Run on the device: ", 1)[1])
     calls = []
@@ -144,7 +169,7 @@ def test_the_device_cli_accepts_a_printed_code_that_starts_with_a_dash(monkeypat
 def test_pair_refuses_without_a_relay_seed(monkeypatch):
     ctx = setup(monkeypatch, ["telegram:42"], has_seed=False)
     minted = []
-    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name: minted.append(name) or "code")
+    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name, **kwargs: minted.append(name) or "code")
     reply = ctx.handler("pair laptop", session_key="s", platform="telegram", source=Source())
     assert reply == commands.messages.NOT_SET_UP
     assert minted == []
@@ -241,7 +266,7 @@ def test_pair_codes_are_given_only_in_a_direct_chat(monkeypatch):
     """V51: a code posted to a group lets any member pair their own machine under that name."""
     ctx = setup(monkeypatch, ["telegram:42"])
     minted = []
-    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name: minted.append(name) or "c")
+    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name, **kwargs: minted.append(name) or "c")
     reply = ctx.handler("pair desk", session_key="g", platform="telegram", source=Source(chat_type="group"))
     assert reply == commands.messages.PAIR_DIRECT_ONLY and minted == []
 
@@ -348,7 +373,7 @@ def test_a_slack_group_dm_is_a_shared_chat(monkeypatch):
     monkeypatch.setattr(commands, "terminal_backend", lambda: "hands")
     monkeypatch.setattr(commands.store, "get_device", lambda name: {"name": name})
     minted = []
-    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name: minted.append(name) or "c")
+    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name, **kwargs: minted.append(name) or "c")
     group_dm, im = Source("U1", Platform.SLACK), Source("U1", Platform.SLACK)
     group_dm.chat_id, im.chat_id = "G0MPIM", "D0IM"
     reply = ctx.handler("use laptop", session_key="g", platform="slack", source=group_dm)
@@ -362,7 +387,7 @@ def test_no_device_can_be_named_server(monkeypatch):
     """Critic: a device called server could never be targeted; /hands use server means the host."""
     ctx = setup(monkeypatch, ["telegram:42"])
     minted = []
-    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name: minted.append(name) or "c")
+    monkeypatch.setattr(commands.store, "mint_pairing_code", lambda name, **kwargs: minted.append(name) or "c")
     reply = ctx.handler("pair server", session_key="d", platform="telegram", source=Source())
     assert reply == commands.messages.PAIR_NAME_RESERVED and minted == []
 
@@ -397,17 +422,22 @@ def test_pair_command_and_cli_agree_on_urls_env_overrides_and_refusals(monkeypat
 
     minted = []
     monkeypatch.setattr(
-        commands.store, "mint_pairing_code", lambda name: minted.append(name) or "pair-code"
+        commands.store,
+        "mint_pairing_code",
+        lambda name, **kwargs: minted.append((name, kwargs.get("owner_label"))) or "pair-code",
     )
 
-    def run_both(cfg, *, dashboard_url=None, name="laptop"):
+    def run_both(cfg, *, dashboard_url=None, name="laptop", owner_label=None):
         install_config(monkeypatch, cfg)
         chat_ctx = setup(monkeypatch, ["telegram:42"])
+        cli_config = {"owner_ids": ["telegram:42"]}
+        if dashboard_url is not None:
+            cli_config["dashboard_url"] = dashboard_url
         c_ctx = type(
             "CliCtx",
             (),
             {
-                "config": {} if dashboard_url is None else {"dashboard_url": dashboard_url},
+                "config": cli_config,
                 "get_config": lambda self, k, default=None: self.config.get(k, default),
                 "register_cli_command": lambda self, n, h, s, fn: setattr(self, "setup_fn", s)
                 or setattr(self, "handler", fn),
@@ -418,10 +448,13 @@ def test_pair_command_and_cli_agree_on_urls_env_overrides_and_refusals(monkeypat
         cli.register_cli(c_ctx, has_seed=True)
         parser = argparse.ArgumentParser()
         c_ctx.setup_fn(parser)
-        chat_out = chat_ctx.handler(
-            f"pair {shlex.quote(name)}", session_key="s", platform="telegram", source=Source()
-        )
-        c_ctx.handler(parser.parse_args(["pair", name]))
+        chat_args = f"pair {shlex.quote(name)}"
+        cli_args = ["pair", name]
+        if owner_label is not None:
+            chat_args += f" --owner-label {shlex.quote(owner_label)}"
+            cli_args.extend(["--owner-label", owner_label])
+        chat_out = chat_ctx.handler(chat_args, session_key="s", platform="telegram", source=Source())
+        c_ctx.handler(parser.parse_args(cli_args))
         cli_out = capsys.readouterr().out.rstrip("\n")
         return chat_out, cli_out
 
@@ -463,6 +496,11 @@ def test_pair_command_and_cli_agree_on_urls_env_overrides_and_refusals(monkeypat
     assert chat_out == cli_out
     assert "hermes-hands pair http://127.0.0.1:9119 --name laptop --code=pair-code" in chat_out
     assert "a loopback URL pairs only a device on the gateway host itself" in chat_out
+
+    chat_out, cli_out = run_both(
+        {"dashboard": {"public_url": "https://hands.example.com"}}, owner_label="Ridwan"
+    )
+    assert chat_out == cli_out and "Owner label: Ridwan" in chat_out
 
     minted.clear()
     chat_out, cli_out = run_both({"dashboard": {"public_url": "https://hands.example.com"}}, name="server")

@@ -558,6 +558,9 @@ class Relay:
             return self._signed(
                 401, {"error": "bad_signature", "detail": messages.PAIR_BAD_SIGNATURE}, path
             )
+        owner_label = await asyncio.to_thread(
+            store.pairing_code_owner_label, _bearer(headers)
+        )
         try:
             device_id = await asyncio.to_thread(
                 store.complete_pairing,
@@ -572,9 +575,15 @@ class Relay:
             return self._signed(
                 exc.status, {"error": exc.error, "detail": _pairing_detail(exc)}, path
             )
+        response = {
+            "device_id": device_id,
+            "relay_public_key": protocol.b64u(self._keys.relay_public),
+        }
+        if owner_label is not None:
+            response["owner_label"] = owner_label
         reply = self._signed(
             200,
-            {"device_id": device_id, "relay_public_key": protocol.b64u(self._keys.relay_public)},
+            response,
             path,
         )
         reply.devices_changed = {"reason": "paired", "device": name}
