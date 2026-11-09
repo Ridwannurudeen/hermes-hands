@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 _STOP_FLUSH_SECONDS = 5
 _STOP_REQUEST_TIMEOUT = 2
+_WITNESS_POLL_SECONDS = 2
 _SCREENSHOT_REQUEST_TIMEOUT = 30
 _WITNESS_SESSION_SECONDS = 30 * 60
 _MAX_HELP_REQUESTS = 3
@@ -90,7 +91,7 @@ class DeviceLoop:
         self.help_request_count = 0
         self.help_accepted_count = 0
         self.receipt_events: list[dict] = []
-        self.console_owner = ConsoleOwner(self.console, on_stop=self._begin_stopping, on_help=self.help_requests.put)
+        self.console_owner = ConsoleOwner(self.console, on_stop=self._stop_from_console, on_help=self.help_requests.put)
         self.fatal: list[Exception] = []
         self.policy_change_logged = False
         self.instance = secrets.token_hex(8)
@@ -138,7 +139,8 @@ class DeviceLoop:
             except (ValueError, json.JSONDecodeError):
                 payload = {}
             expected = "unknown_device" if response.status_code == 401 else "policy_changed"
-            if payload.get("error") == expected and self._error_signature_valid(response, endpoint):
+            error_signature_valid = self._error_signature_valid(response, endpoint)
+            if payload.get("error") == expected and error_signature_valid:
                 if expected == "unknown_device":
                     self._cancel_all()
                     self.fatal.append(PermissionError("unknown_device"))
@@ -148,6 +150,13 @@ class DeviceLoop:
                     logger.warning("Relay policy changed; cancelling running jobs and backing off")
                     self.policy_change_logged = True
                 raise PermissionError("policy_changed")
+            if (
+                response.status_code == 409
+                and endpoint == "/device/help"
+                and payload.get("error") == "owner_origin_required"
+                and error_signature_valid
+            ):
+                raise PermissionError("owner_origin_required")
             self._transient_status(response.status_code)
             raise ValueError(f"transient relay status {response.status_code}")
         if response.status_code == 429:
@@ -203,6 +212,8 @@ class DeviceLoop:
 
     def _poll_body(self) -> dict:
         wait = 25
+        if self.witness and self.session_state == "active":
+            wait = min(wait, _WITNESS_POLL_SECONDS)
         remaining = self._session_remaining()
         if remaining is not None:
             wait = min(wait, max(1, int(remaining)))
@@ -331,6 +342,10 @@ class DeviceLoop:
         self.stop_event.set()
         self._cancel_running_jobs()
 
+    def _stop_from_console(self) -> None:
+        self._begin_stopping()
+        self._cancel_running_jobs()
+
     def _cancel_running_jobs(self) -> None:
         if not hasattr(self, "process_lock"):
             self.process_lock = threading.Lock()
@@ -440,7 +455,7 @@ class DeviceLoop:
                         receipt.update_receipt(paths, payload, self.private, self.public)
                     except OSError as exc:
                         logger.warning("Could not update local session receipt (%s)", type(exc).__name__)
-                    self.console.write(RECEIPT_SAVED.format(path=paths[1]))
+                    self.console.write(RECEIPT_SAVED.format(text_path=paths[1], json_path=paths[0]))
         finally:
             with self._stop_lock:
                 self.session_state = "stopped"
@@ -526,7 +541,13 @@ class DeviceLoop:
                 if response.status_code >= 500:
                     response.raise_for_status()
                 payload = self._verify_response(response, "/device/help")
-            except (httpx.HTTPError, PermissionError, ValueError, KeyError) as exc:
+            except PermissionError as exc:
+                if str(exc) == "owner_origin_required":
+                    self.console.write("Your helper has not connected a chat yet, so the request was not sent.\n")
+                else:
+                    logger.warning("Help request was not accepted by the relay: %s", type(exc).__name__)
+                return False
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
                 logger.warning("Help request was not accepted by the relay: %s", type(exc).__name__)
                 return False
             if (
@@ -706,18 +727,22 @@ class DeviceLoop:
                     receipt_outcome = f"Completed with exit code {exit_code[0]}"
                     self._result(job_id, seq, chunk=final, done=True, returncode=exit_code[0])
             elif job_type == "checkup":
+                self.console.write(f"{receipt_label}\n")
                 result = checkup.collect()
                 if self._is_stopping():
                     returncode, error = self._stopped_result()
                     receipt_outcome = f"Stopped: {error}"
+                    self.console.write(f"{receipt_outcome}.\n")
                     self._result(job_id, seq, done=True, returncode=returncode, error=error)
                     return
+                receipt_outcome = "Completed"
                 self._record_receipt_event(
                     "System checkup",
-                    "Completed",
+                    receipt_outcome,
                     timestamp=result["observed_at"],
                     checkup_result=result,
                 )
+                self.console.write(f"{receipt_outcome}.\n")
                 receipt_label = None
                 self._result(
                     job_id,

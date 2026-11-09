@@ -67,6 +67,21 @@ def test_console_owner_composes_help_and_lowercase_s_is_text():
     assert help_requests == ["Please help me find the file."]
 
 
+def test_help_composer_does_not_claim_request_is_ready_before_relay_reply():
+    console = FakeConsole("H", "Please help me.")
+    stopped = threading.Event()
+    help_requests = []
+    owner = ConsoleOwner(console, on_stop=stopped.set, on_help=help_requests.append)
+
+    owner.start()
+
+    assert _wait_for(lambda: help_requests)
+    console.feed("S")
+    assert stopped.wait(1)
+    owner.join(1)
+    assert "Help request ready." not in console.output()
+
+
 def test_console_owner_timestamps_interactive_prompts():
     console = FakeConsole("S")
     stopped = threading.Event()

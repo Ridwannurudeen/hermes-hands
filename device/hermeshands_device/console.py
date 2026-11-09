@@ -17,7 +17,7 @@ WITNESS_CONSOLE_CLOSED = "Witness mode declined because the console closed.\n"
 WITNESS_DECLINED = "Witness mode declined. No session was started.\n"
 WITNESS_STOPPED_BEFORE_START = "Witness mode stopped before the session started.\n"
 SCREENSHOTS_DISABLED = "Screenshot requests are disabled for this session.\n"
-RECEIPT_SAVED = "Local receipt saved: {path}\n"
+RECEIPT_SAVED = "Local receipts saved:\nText: {text_path}\nJSON: {json_path}\n"
 
 
 def _timestamped(text: str) -> str:
@@ -315,7 +315,7 @@ class ConsoleOwner:
                 self.console.write("Help message cannot be empty.\n")
                 continue
             self.on_help(text)
-            self.console.write("Help request ready.\n")
+            self.console.write("Help request queued for sending.\n")
             return
 
     def _run(self) -> None:

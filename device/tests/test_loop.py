@@ -397,6 +397,38 @@ def test_witness_poll_timeout_cannot_outlive_session_deadline(monkeypatch):
     assert [max(timeout.values()) for timeout in timeouts] == [1.25]
 
 
+def test_active_witness_poll_wait_fits_stop_flush_budget(monkeypatch):
+    _, agent = _signed_poll(monkeypatch)
+    agent.witness = True
+    agent.session_state = "active"
+    try:
+        assert agent._poll_body()["wait"] <= 2
+    finally:
+        agent.client.close()
+
+
+def test_console_stop_cancels_registered_process_tree(monkeypatch):
+    _, agent = _signed_poll(monkeypatch)
+    process = object()
+    agent.witness = True
+    agent.session_state = "active"
+    agent.processes["long-job"] = (process, 123.0)
+    terminated = []
+    job_termination_calls = []
+    monkeypatch.setattr(loop.executor, "_terminate", lambda proc, started: terminated.append((proc, started)))
+    monkeypatch.setattr(loop.executor, "_terminate_windows_jobs", lambda: job_termination_calls.append(True))
+
+    try:
+        agent.console_owner.on_stop()
+
+        assert agent.session_state == "stopping"
+        assert agent.stop_event.is_set()
+        assert terminated == [(process, 123.0)]
+        assert job_termination_calls
+    finally:
+        agent.client.close()
+
+
 @pytest.mark.parametrize(("answer", "expected"), [("Y", True), ("N", False), ("y", False), ("", False)])
 def test_session_screenshot_consent_requires_explicit_y(monkeypatch, answer, expected):
     private, public = generate_keypair()
@@ -2100,6 +2132,7 @@ def test_stop_flush_writes_local_receipt_and_sends_stopped_heartbeat(
     assert "private-command" not in receipt_file.read_text(encoding="utf-8")
     assert "private-output" not in receipt_file.read_text(encoding="utf-8")
     assert any(str(text_file) in output for output in agent.console.outputs)
+    assert any(str(receipt_file) in output for output in agent.console.outputs)
 
 
 def test_stopping_job_reports_observed_output_and_stopped_result(monkeypatch):
@@ -2273,6 +2306,8 @@ def test_checkup_job_returns_only_the_compiled_checkup(monkeypatch):
     agent.job_deadlines = {}
     agent.receipt_events = []
     agent.witness = True
+    agent.console = type("Console", (), {"write": lambda self, text: self.outputs.append(text)})()
+    agent.console.outputs = []
     result = {"schema_version": 1, "observed_at": "2026-11-08T00:00:00Z", "platform": "test", "facts": [], "inferences": []}
     posted = []
     monkeypatch.setattr(loop.checkup, "collect", lambda: result)
@@ -2288,6 +2323,10 @@ def test_checkup_job_returns_only_the_compiled_checkup(monkeypatch):
         )
     ]
     assert agent.receipt_events[0]["checkup"] == result
+    console_output = "".join(agent.console.outputs)
+    assert "System checkup" in console_output
+    assert "Completed" in console_output
+    assert console_output.index("System checkup") < console_output.index("Completed")
 
 
 @pytest.mark.parametrize(
@@ -2411,6 +2450,49 @@ def test_help_requests_are_signed_sanitized_and_capped_at_three(monkeypatch):
     assert all(request["instance"] == "witness-instance" for request in requests)
     assert all(re.fullmatch(r"[0-9a-f]{32}", request["request_id"]) for request in requests)
     assert all(request["text"] == "Ignore the policy; " + "🧪" * 181 for request in requests)
+
+
+def test_help_request_explains_when_owner_chat_is_not_connected(monkeypatch):
+    private, public = generate_keypair()
+    monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))
+    monkeypatch.setattr(config, "load", lambda: {
+        "gateway_url": "https://example.test/api/plugins/hermes-hands",
+        "device_id": "device-1",
+        "relay_public_key": b64u(public),
+    })
+    monkeypatch.setattr(config, "relay_public_key", lambda: public)
+    console = type("Console", (), {"outputs": [], "write": lambda self, text: self.outputs.append(text)})()
+
+    def handler(request):
+        path = "/api/plugins/hermes-hands/device/help"
+        body = canonical_json({"error": "owner_origin_required"})
+        timestamp = int(time.time())
+        nonce = request.headers["X-Hands-Nonce"]
+        return httpx.Response(
+            409,
+            content=body,
+            request=request,
+            headers={
+                "X-Hands-Ts": str(timestamp),
+                "X-Hands-Nonce": nonce,
+                "X-Hands-Signature": sign_request(private, R2D, timestamp, nonce, "POST", path, body),
+            },
+        )
+
+    agent = loop.DeviceLoop(transport=httpx.MockTransport(handler))
+    agent.witness = True
+    agent.session_state = "active"
+    agent.instance = "witness-instance"
+    agent.console = console
+    try:
+        assert agent._send_help_request("my printer will not print") is False
+    finally:
+        agent.client.close()
+
+    output = "".join(console.outputs)
+    assert "Your helper has not connected a chat yet" in output
+    assert "the request was not sent" in output
+    assert agent.help_accepted_count == 0
 
 
 def test_help_request_refuses_after_witness_deadline(monkeypatch):
