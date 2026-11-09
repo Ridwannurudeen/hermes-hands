@@ -72,8 +72,13 @@ def cleanup(now: float | None = None) -> int:
     return removed
 
 
-def start() -> None:
-    logging.basicConfig(level=logging.INFO)
+def start(*, witness: bool = False) -> None:
+    level = logging.WARNING if witness else logging.INFO
+    logging.basicConfig(level=level)
+    if witness:
+        logging.getLogger().setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
     cleanup()
 
     def sweep_hourly() -> None:

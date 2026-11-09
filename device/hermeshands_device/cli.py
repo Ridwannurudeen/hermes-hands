@@ -226,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
             agent.witness = True
             agent.session_state = "active"
             agent.capabilities = list(WITNESS_CAPABILITIES)
-            start_janitor()
+            start_janitor(witness=True)
             agent.run_forever()
             return 0
         from .loop import DeviceLoop

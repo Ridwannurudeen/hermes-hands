@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import time
 import types
@@ -345,7 +346,7 @@ def _prepare_witness_cli(
     if owner_label is not None:
         pairing["owner_label"] = owner_label
     monkeypatch.setattr(config, "load", lambda: pairing)
-    monkeypatch.setattr(janitor, "start", lambda: None)
+    monkeypatch.setattr(janitor, "start", lambda **_kwargs: None)
     monkeypatch.setattr(loop, "DeviceLoop", FakeDeviceLoop)
     FakeDeviceLoop.last = None
 
@@ -404,6 +405,59 @@ def test_witness_y_starts_session_after_initial_consent(monkeypatch, answer):
     assert "Commands and outcomes are recorded" in text
     assert len(console.prompts) == 1
     assert re.match(r"^\[\d{4}-\d{2}-\d{2}T[^\]]+Z\] Start witness mode\? \[Y/N\]: $", console.prompts[0])
+
+
+def test_witness_startup_suppresses_httpx_info_logs(monkeypatch, capsys):
+    from hermeshands_device import janitor
+
+    console = FakeConsole("Y")
+    real_start = janitor.start
+    _prepare_witness_cli(monkeypatch, console)
+    monkeypatch.setattr(janitor, "start", real_start)
+    monkeypatch.setattr(janitor, "cleanup", lambda: 0)
+
+    root_logger = logging.getLogger()
+    httpx_logger = logging.getLogger("httpx")
+    httpcore_logger = logging.getLogger("httpcore")
+    monkeypatch.setattr(root_logger, "handlers", [])
+    monkeypatch.setattr(root_logger, "level", logging.WARNING)
+    monkeypatch.setattr(httpx_logger, "level", logging.NOTSET)
+    monkeypatch.setattr(httpcore_logger, "level", logging.NOTSET)
+
+    class NoopThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    def start_without_sweeper_thread(**kwargs):
+        with monkeypatch.context() as patch:
+            patch.setattr(janitor.threading, "Thread", NoopThread)
+            real_start(**kwargs)
+
+    monkeypatch.setattr(janitor, "start", start_without_sweeper_thread)
+
+    poll_count = 4
+
+    def run_with_fake_polls(self):
+        self.run = True
+        for _ in range(poll_count):
+            httpx_logger.info(
+                'HTTP Request: POST http://127.0.0.1:9119/api/plugins/hermes-hands/device/poll "HTTP/1.1 204 No Content"'
+            )
+        self.console_owner.close()
+        self.console_owner.join(1)
+
+    monkeypatch.setattr(FakeDeviceLoop, "run_forever", run_with_fake_polls)
+
+    assert cli.main(["serve", "--witness"]) == 0
+
+    console_text = "".join(console.outputs + console.prompts) + capsys.readouterr().err
+    assert "Start witness mode? [Y/N]:" in console_text
+    assert "INFO:httpx:" not in console_text
+    assert httpx_logger.getEffectiveLevel() == logging.WARNING
+    assert httpcore_logger.getEffectiveLevel() == logging.WARNING
 
 
 def test_witness_consent_screen_uses_persisted_owner_label(monkeypatch):
