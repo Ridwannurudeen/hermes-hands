@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 import os
 import platform
 import queue
 import socket
-import subprocess
 import tempfile
 import threading
 import time
@@ -24,16 +22,7 @@ _DNS_TIMEOUT = 1.0
 _REACHABILITY_TIMEOUT = 0.75
 _WINDOWS_PROBE_TIMEOUTS = {"print_queue": 1.5}
 _WINDOWS_REBOOT_TIMEOUT = 0.5
-_WINDOWS_PROBES = {
-    "print_queue": (
-        "$ErrorActionPreference = 'Stop'; "
-        "$printers = @(Get-Printer -ErrorAction Stop); "
-        "$jobs = @(foreach ($printer in $printers) { "
-        "Get-PrintJob -PrinterName $printer.Name -ErrorAction Stop }); "
-        "[ordered]@{ print_queue_jobs = [int]$jobs.Count; "
-        "print_queue_count = [int]$printers.Count } | ConvertTo-Json -Compress"
-    ),
-}
+_WINDOWS_PRINT_PROBE_SLOTS = threading.BoundedSemaphore(1)
 _REACHABILITY_TARGETS = (
     ("reachability_cloudflare", "1.1.1.1", 443),
     ("reachability_google", "8.8.8.8", 443),
@@ -520,37 +509,72 @@ def _reachability_facts(deadline: float) -> list[dict[str, object]]:
 
 
 def _run_windows_probe(probe_name: str, deadline: float) -> dict[str, int]:
-    if probe_name not in _WINDOWS_PROBES:
+    if probe_name != "print_queue":
         raise ValueError("unknown Windows checkup probe")
-    timeout = min(_WINDOWS_PROBE_TIMEOUTS[probe_name], deadline - time.monotonic())
-    if timeout <= 0:
+    if time.monotonic() >= deadline:
         raise TimeoutError("checkup time budget expired")
-    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
-    if not system_root:
-        raise OSError("Windows system directory is unavailable")
-    powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-    result = subprocess.run(
-        [str(powershell), "-NoProfile", "-NonInteractive", "-Command", _WINDOWS_PROBES[probe_name]],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        shell=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        check=False,
+    import ctypes
+    from ctypes import wintypes
+
+    class PrinterInfo2(ctypes.Structure):
+        _fields_ = [
+            ("pServerName", wintypes.LPWSTR),
+            ("pPrinterName", wintypes.LPWSTR),
+            ("pShareName", wintypes.LPWSTR),
+            ("pPortName", wintypes.LPWSTR),
+            ("pDriverName", wintypes.LPWSTR),
+            ("pComment", wintypes.LPWSTR),
+            ("pLocation", wintypes.LPWSTR),
+            ("pDevMode", ctypes.c_void_p),
+            ("pSepFile", wintypes.LPWSTR),
+            ("pPrintProcessor", wintypes.LPWSTR),
+            ("pDatatype", wintypes.LPWSTR),
+            ("pParameters", wintypes.LPWSTR),
+            ("pSecurityDescriptor", ctypes.c_void_p),
+            ("Attributes", wintypes.DWORD),
+            ("Priority", wintypes.DWORD),
+            ("DefaultPriority", wintypes.DWORD),
+            ("StartTime", wintypes.DWORD),
+            ("UntilTime", wintypes.DWORD),
+            ("Status", wintypes.DWORD),
+            ("cJobs", wintypes.DWORD),
+            ("AveragePPM", wintypes.DWORD),
+        ]
+
+    enum_printers = ctypes.WinDLL("winspool.drv", use_last_error=True).EnumPrintersW
+    enum_printers.argtypes = [
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    enum_printers.restype = wintypes.BOOL
+
+    flags = 0x00000002 | 0x00000004
+    needed = wintypes.DWORD()
+    returned = wintypes.DWORD()
+    succeeded = enum_printers(
+        flags, None, 2, None, 0, ctypes.byref(needed), ctypes.byref(returned)
     )
-    if result.returncode != 0:
-        raise RuntimeError("fixed Windows checkup probe failed")
-    value = json.loads(result.stdout)
-    if not isinstance(value, dict):
-        raise ValueError("invalid Windows checkup probe result")
-    expected = ("print_queue_jobs", "print_queue_count")
-    if any(type(value.get(key)) is not int or value[key] < 0 for key in expected):
-        raise ValueError("invalid Windows checkup probe result")
-    return {key: value[key] for key in expected}
+    error = ctypes.get_last_error()
+    if not succeeded and error not in (0, 122):
+        raise ctypes.WinError(error)
+    if needed.value == 0:
+        return {"print_queue_jobs": 0, "print_queue_count": 0}
+
+    buffer = ctypes.create_string_buffer(needed.value)
+    if not enum_printers(
+        flags, None, 2, buffer, needed.value, ctypes.byref(needed), ctypes.byref(returned)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    printers = ctypes.cast(buffer, ctypes.POINTER(PrinterInfo2))
+    count = int(returned.value)
+    jobs = sum(int(printers[index].cJobs) for index in range(count))
+    return {"print_queue_jobs": jobs, "print_queue_count": count}
 
 
 def _print_queue_fact(deadline: float) -> dict[str, object]:
@@ -563,11 +587,54 @@ def _print_queue_fact(deadline: float) -> dict[str, object]:
             "jobs",
             "Windows PrintManagement is unavailable on Linux; WSL does not expose Windows print queues",
         )
-    source = "fixed PowerShell Get-Printer and Get-PrintJob probe; queue names and documents are not collected"
+    source = "Windows Winspool EnumPrintersW level 2; only queue and job counts are retained"
+    timeout = min(_WINDOWS_PROBE_TIMEOUTS["print_queue"], deadline - time.monotonic())
+
+    def timeout_fact(reason: str) -> dict[str, object]:
+        return _fact(
+            fact_id,
+            label,
+            "could not be read in time",
+            "jobs",
+            "unknown",
+            "error",
+            f"{source}; {reason}",
+        )
+
+    if timeout <= 0:
+        return timeout_fact("overall checkup time budget expired")
+    if not _WINDOWS_PRINT_PROBE_SLOTS.acquire(blocking=False):
+        return timeout_fact("a previous print queue probe is still running")
+
+    result_queue: queue.Queue[tuple[bool, dict[str, int] | Exception]] = queue.Queue(maxsize=1)
+
+    def probe() -> None:
+        try:
+            outcome = (True, _run_windows_probe("print_queue", deadline))
+        except Exception as exc:
+            outcome = (False, exc)
+        finally:
+            _WINDOWS_PRINT_PROBE_SLOTS.release()
+        result_queue.put(outcome)
+
+    worker = threading.Thread(target=probe, name="hermes-hands-checkup-print-queue", daemon=True)
     try:
-        result = _run_windows_probe("print_queue", deadline)
-    except Exception as exc:
+        worker.start()
+    except RuntimeError as exc:
+        _WINDOWS_PRINT_PROBE_SLOTS.release()
         return _error_fact(fact_id, label, "jobs", source, exc)
+    try:
+        succeeded, value = result_queue.get(timeout=timeout)
+    except queue.Empty:
+        return timeout_fact("probe did not finish within its time budget")
+    if not succeeded:
+        error = value if isinstance(value, Exception) else RuntimeError("Windows print queue probe failed")
+        if isinstance(error, TimeoutError):
+            return timeout_fact("probe time budget expired")
+        return _error_fact(fact_id, label, "jobs", source, error)
+    result = value
+    if not isinstance(result, dict):
+        return _error_fact(fact_id, label, "jobs", source, ValueError("invalid Windows print queue result"))
     jobs = result["print_queue_jobs"]
     queues = result["print_queue_count"]
     status: Status = "warn" if jobs > 0 or queues == 0 else "ok"

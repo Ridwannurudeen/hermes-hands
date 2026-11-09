@@ -142,6 +142,31 @@ def test_windows_print_queue_has_observed_count(monkeypatch):
     assert "2 queues" in facts["print_queue_jobs"]["source"]
 
 
+def test_windows_print_queue_slow_probe_is_bounded_and_says_when_unavailable(monkeypatch):
+    monkeypatch.setattr(checkup.platform, "system", lambda: "Windows")
+    monkeypatch.setitem(checkup._WINDOWS_PROBE_TIMEOUTS, "print_queue", 0.05)
+    release = threading.Event()
+
+    def slow_probe(name, deadline):
+        release.wait()
+        return {"print_queue_jobs": 0, "print_queue_count": 2}
+
+    monkeypatch.setattr(checkup, "_run_windows_probe", slow_probe)
+    timer = threading.Timer(0.8, release.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        fact = checkup._print_queue_fact(time.monotonic() + 2)
+    finally:
+        release.set()
+        timer.cancel()
+
+    assert time.monotonic() - started < 0.4
+    assert fact["value"] == "could not be read in time"
+    assert fact["status"] == "unknown"
+    assert fact["availability"] == "error"
+
+
 @pytest.mark.parametrize(
     ("marker_path", "rename_operations"),
     [
@@ -279,31 +304,19 @@ def test_linux_print_queue_and_pending_updates_are_explicitly_unsupported(monkey
         assert facts[fact_id]["availability"] == "unsupported"
 
 
-def test_windows_probes_are_fixed_non_interpolated_and_never_use_shell(
-    monkeypatch, tmp_path
-):
-    run_windows_probe = getattr(checkup, "_run_windows_probe", None)
+def test_windows_print_queue_uses_in_process_probe_without_shell(monkeypatch):
     _quiet_probes(monkeypatch)
-    if run_windows_probe is not None:
-        monkeypatch.setattr(checkup, "_run_windows_probe", run_windows_probe)
     monkeypatch.setattr(checkup.platform, "system", lambda: "Windows")
-    injected_value = f"{tmp_path}; Start-Process {tmp_path / 'injected'}"
-    monkeypatch.setenv("TEMP", injected_value)
-    monkeypatch.setenv("SystemRoot", r"C:\Windows")
-    marker = tmp_path / "injected"
     calls = []
 
-    def run(args, **kwargs):
-        script = args[-1]
-        calls.append((args, kwargs))
-        assert kwargs["shell"] is False
-        assert injected_value not in script
-        assert str(marker) not in script
-        assert "Get-PrintJob" in script
-        output = '{"print_queue_jobs":0,"print_queue_count":2}'
-        return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+    def run(probe_name, deadline):
+        calls.append(probe_name)
+        assert probe_name == "print_queue"
+        assert deadline > time.monotonic()
+        return {"print_queue_jobs": 0, "print_queue_count": 2}
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(checkup, "_run_windows_probe", run)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("subprocess used"))
     monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: pytest.fail("Popen used"))
     monkeypatch.setattr(subprocess, "call", lambda *args, **kwargs: pytest.fail("subprocess.call used"))
     monkeypatch.setattr(checkup.os, "system", lambda *args, **kwargs: pytest.fail("os.system used"))
@@ -311,13 +324,9 @@ def test_windows_probes_are_fixed_non_interpolated_and_never_use_shell(
 
     facts = _facts(checkup.collect())
 
-    assert [args[-1] for args, _ in calls] == list(checkup._WINDOWS_PROBES.values())
-    assert len(calls) == 1
-    assert all(args[-2] == "-Command" for args, _ in calls)
-    assert all(kwargs["timeout"] > 0 for _, kwargs in calls)
+    assert calls == ["print_queue"]
     assert facts["print_queue_jobs"]["availability"] == "observed"
     assert facts["pending_updates"]["availability"] == "unsupported"
-    assert not marker.exists()
 
 
 def test_process_facts_never_request_or_read_command_lines(monkeypatch):
