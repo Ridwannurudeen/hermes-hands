@@ -110,3 +110,254 @@ conversation targets; it refuses on the `server` target and in cron.
   describe what is on screen.
 - `Screenshot capture requires serve --allow-screen` means the user has not consented to screen
   capture on that device. Tell them; do not retry.
+
+## Windows troubleshooting playbooks
+
+These five playbooks are Windows-only. The live checklist was run as a standard user on Windows 11
+Home 10.0.26300, build 26300, x64. Those observations are a point-in-time baseline, not a claim
+about the device you are helping now. The Linux equivalents below are read-only comparisons; they
+were not run, and they do not provide Windows repair support through WSL.
+
+### Shared F4 rules
+
+1. Confirm the owner's symptom and selected Windows device before checking anything.
+2. Call `hands_checkup` for observed device facts. Keep its `facts` and `inferences` separate; do
+   not repeat an inference as an observation. A fact's `availability` may be `unsupported` or
+   `error`, which is not evidence that the condition is absent.
+3. If a playbook needs a fact that `hands_checkup` does not provide, ask the owner to run the exact
+   read-only PowerShell command below in a local Windows PowerShell session and share its output.
+   The Hands device terminal is Git Bash, and the witness hook blocks pipelines and shell
+   composition. Do not send these piped commands through the Hands terminal or reword, wrap, or
+   script them to get around that gate.
+4. State the observed UAC/admin facts before asking for a repair. Propose only the single repair
+   listed for the confirmed symptom. Ask for one F2 owner approval, wait for it, and do nothing if
+   it is denied. If the UI or PowerShell step cannot be performed with the available device tools,
+   have the owner perform that exact step after approval; do not work around a policy refusal.
+5. Re-run the same diagnostics after the repair. Report `Before`, `After`, and exactly `fixed` or
+   `not fixed`. Say `fixed` only when the symptom is gone and the recheck supports that result. If
+   the repair was not performed or the recheck is unavailable, report `not fixed` and state that
+   the effect is unknown.
+
+The core dangerous-command patterns include `Remove-Item -Recurse/-Force`, `del /s /q`,
+`taskkill /F`, and `Stop-Process -Force`. None of the selected repairs needs those shell patterns.
+For a frozen app, use Task Manager's **End task** action so the F2 repair approval does not lead to
+a second dangerous-command prompt.
+
+### No internet (Windows-only)
+
+**Confirm the symptom.** Ask whether all internet access fails or only a named site/app, and when
+the problem started. Do not assume a DNS problem from “no internet” alone.
+
+**Read-only diagnostics.** Run `hands_checkup` and report `wifi_status`, `dns_servers`,
+`dns_resolution`, and the `reachability_*` facts if available. For the Windows connection profile
+and the named DNS lookup, ask the owner to run these exact checklist commands locally:
+
+```powershell
+Get-NetConnectionProfile | Select-Object Name,InterfaceAlias,IPv4Connectivity,IPv6Connectivity
+Resolve-DnsName www.microsoft.com | Select-Object Name,Type,IPAddress
+Test-NetConnection -ComputerName 1.1.1.1 -Port 443 -InformationLevel Quiet
+```
+
+**Facts.** Copy observed connectivity, DNS, and reachability values with their source and time.
+The live checklist's profile, DNS lookup, and TCP test all worked without admin; that laptop had
+internet at the time of the check.
+
+**Uncertainty.** A failed DNS lookup with working IP reachability is consistent with a resolver
+problem. If DNS and IP reachability both fail, the cause is not established by these checks. The
+checklist's live success does not establish this device's present state.
+
+**One reversible repair.** Only if the evidence points to stale or failed DNS resolution, propose
+clearing the local DNS cache:
+
+```powershell
+Clear-DnsClientCache
+```
+
+`Clear-DnsClientCache -WhatIf` worked in the standard-user probe without UAC or access denied, but
+the actual clear was not run, so actual repair permissions were not verified. State that limit
+before requesting one F2 approval. Windows rebuilds the cache as lookups happen again.
+
+**Recheck and outcome.** Repeat `hands_checkup` and the same three local PowerShell checks. Record
+the DNS and TCP values before and after. Report `fixed` only if the earlier DNS failure is gone,
+reachability succeeds, and the owner confirms the original symptom is resolved; otherwise report
+`not fixed` with the values.
+
+**Linux read-only equivalent (not run):** `ip route`, `getent ahosts www.microsoft.com`, and
+`curl -I --connect-timeout 5 https://www.microsoft.com`. Clearing the Windows DNS Client cache is
+not a Linux/WSL repair.
+
+### Printer stuck (Windows-only)
+
+**Confirm the symptom.** Ask which queue and document the owner expects to print. Resume a job only
+if the owner confirms that exact paused job should print.
+
+**Read-only diagnostics.** Run `hands_checkup`; its `print_queue_jobs` fact is unsupported in this
+device build. Ask the owner to run these exact read-only checks locally:
+
+```powershell
+Get-Service -Name Spooler | Select-Object Name,Status,StartType
+Get-Printer | Select-Object Name,PrinterStatus,WorkOffline
+Get-PrintJob -PrinterName 'Microsoft Print to PDF' | Select-Object PrinterName,ID,DocumentName,JobStatus
+Get-PrintJob -PrinterName 'OneNote (Desktop)' | Select-Object PrinterName,ID,DocumentName,JobStatus
+```
+
+**Facts.** Report the spooler status, queue status, and exact job ID/status. The live read-only
+checks worked as a standard user; the two listed queues had no jobs at that time.
+
+**Uncertainty.** The live checklist found no job to repair. It does not establish access to a
+different queue or job. The standard-user probe
+`Resume-PrintJob -PrinterName 'Microsoft Print to PDF' -ID 4294967295 -WhatIf` returned
+`HRESULT 0x80070005` (Access is denied), and Windows showed no UAC dialog.
+
+**Admin and one reversible repair.** Clearing a print job requires administrator privileges. This
+playbook does not clear jobs or the whole queue. Its only repair is to resume one owner-confirmed
+paused job by its exact queue and ID:
+
+```powershell
+Resume-PrintJob -PrinterName '<same printer>' -ID <same job ID>
+```
+
+The live standard-user `-WhatIf` probe was denied, so resuming may also require admin or queue
+permissions. Tell the owner both facts before asking. Request one F2 approval only after the owner
+confirms the job should print and the required permissions are available. If access is denied,
+stop; do not retry or switch to clearing. If it remains queued, it can be re-paused before printing:
+
+```powershell
+Suspend-PrintJob -PrinterName '<same printer>' -ID <same job ID>
+```
+
+**Recheck and outcome.** Repeat the same spooler, printer, and job checks. Record the job's status
+before and after, and ask whether the intended document printed. Report `fixed` only if the
+confirmed job is no longer stuck and the owner confirms the result; otherwise report `not fixed`.
+
+**Linux read-only equivalent (not run):** `lpstat -p -d` and `lpstat -o` when CUPS and a Linux
+queue exist. WSL does not imply access to the Windows Spooler or these queues.
+
+### Slow PC (Windows-only)
+
+**Confirm the symptom.** Ask what feels slow and whether it is specifically window/menu
+transitions. The visual-effects repair below is only for slow-feeling transitions, not a general
+CPU or memory repair.
+
+**Read-only diagnostics.** Run `hands_checkup` and report `memory_used_percent`,
+`memory_available_bytes`, and the sampled `top_process_*` facts. It does not measure CPU utilization
+or per-process responsiveness. For the exact Windows CPU, memory, and process samples, ask the
+owner to run:
+
+```powershell
+Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 3
+Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,LastBootUpTime
+Get-Process | Sort-Object CPU -Descending | Select-Object -First 8 Name,Id,CPU,WorkingSet64,Responding
+```
+
+**Facts.** Report the measured CPU samples and memory values. The live checklist measured CPU at
+20.4%, 17.3%, and 15.4%, and about 2.39 GiB available of 31.21 GiB. `Get-Process`'s `CPU` field is
+cumulative since process start, not current utilization.
+
+**Uncertainty.** A short CPU sample and one memory reading do not identify a cause for all
+slowness. Low available memory can contribute, but turning off animations does not increase CPU
+or RAM capacity.
+
+**One reversible repair.** Only for slow-feeling window or menu transitions, propose turning off
+**Settings → Accessibility → Visual effects → Animation effects** for this account. The owner can
+turn the same setting back on to undo it. The standard-user `-WhatIf` probe below worked, and a
+throwaway HKCU test completed without UAC; the real animation setting was not changed during the
+checklist:
+
+```powershell
+Set-ItemProperty -LiteralPath 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -Value '0' -WhatIf
+```
+
+State that the live probe was not the Settings repair, then request one F2 approval and wait. Do
+not use the registry probe as the repair.
+
+**Recheck and outcome.** Repeat `hands_checkup` and the same local performance checks. Record the
+before/after CPU samples, available memory, and animation-effects setting; ask whether transitions
+improved. Report `fixed` only if the setting is off and the reported transition problem is gone;
+otherwise report `not fixed`.
+
+**Linux read-only equivalents (not run):** `free -h`, `top`, and
+`ps -eo pid,comm,%cpu,%mem --sort=-%mem`. Animation settings are desktop-environment-specific and
+are not a shared Windows/Linux repair.
+
+### Disk full (Windows-only)
+
+**Confirm the symptom.** Ask which drive is low and whether Windows reports a low-space warning.
+Do not assume the device home folder is on C:.
+
+**Read-only diagnostics.** Run `hands_checkup` and report `disk_free_percent`, `disk_free_bytes`,
+and available `folder_*_bytes` facts. The checkup measures the device home volume and bounded
+folder sizes. If the affected drive or TEMP total is not covered, ask the owner to run these exact
+read-only checks locally:
+
+```powershell
+Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | Select-Object DeviceID,FileSystem,FreeSpace,Size
+Get-ChildItem -LiteralPath $env:TEMP -File -Force | Measure-Object -Property Length -Sum
+```
+
+The TEMP total is immediate files only, not recursive.
+
+**Facts.** Report the drive, filesystem, free bytes, total bytes, and any folder-size result with
+its availability. The live checklist found C: was NTFS with about 24.6% free; it was not full at
+that time.
+
+**Uncertainty.** The TEMP listing does not identify nested folder sizes. Compression may save
+little or no space for already-compressed media/archive files and uses CPU.
+
+**One reversible repair.** Only for an owner-selected, infrequently accessed folder on NTFS,
+propose compressing that folder. It does not delete files. The standard-user probe compressed and
+uncompressed a throwaway 1 MiB text file with no UAC or access denied; the selected real folder's
+permissions and savings were not tested.
+
+```powershell
+compact.exe /C /S:"<same folder>"
+```
+
+The owner can undo it on the same folder with:
+
+```powershell
+compact.exe /U /S:"<same folder>"
+```
+
+State the selected path and CPU/savings caveat, then request one F2 approval and wait. Do not
+delete files as part of this repair.
+
+**Recheck and outcome.** Repeat the same disk and folder checks and record free bytes before and
+after. Report `fixed` only if free space increased and the owner's low-space symptom is resolved;
+otherwise report `not fixed` with the measured values.
+
+**Linux read-only equivalents (not run):** `df -hT /` and
+`du -x -h --max-depth=1 "$HOME"`. Compression is filesystem-specific; WSL does not provide a
+universal equivalent to NTFS `compact`.
+
+### Program frozen (Windows-only)
+
+**Confirm the symptom.** Confirm the exact app and PID and ask whether its work is saved or
+recoverable. Do not end an app with unsaved work.
+
+**Read-only diagnostics.** Run `hands_checkup` for general device facts, but it does not report
+which process is unresponsive. Ask the owner to run this exact check in local Windows PowerShell:
+
+```powershell
+Get-Process | Where-Object { -not $_.Responding } | Select-Object Name,Id,Responding,StartTime
+```
+
+**Facts.** Record the app name, PID, `Responding` value, and start time from the output. The live
+check returned no unresponsive processes.
+
+**Uncertainty.** The live test used a throwaway Notepad process. Its `Stop-Process -Force` probe
+exited without UAC, but that does not prove permission for this app or a process owned by another
+account. Unsaved work may be lost.
+
+**One reversible repair.** Only after the owner confirms the exact app and that its work is saved
+or recoverable, propose **Task Manager → End task** for that app. Do not issue `Stop-Process -Force`
+or `taskkill /F`; the GUI action avoids a second shell-pattern approval prompt. State the
+same-user probe limit, request one F2 approval, and wait. Then relaunch the app.
+
+**Recheck and outcome.** Repeat the unresponsive-process check and verify the relaunched app
+responds. Record the original PID/status before and the remaining unresponsive list and relaunch
+status after. Report `fixed` only if the old hung process is gone, the app relaunches, and the
+owner confirms it responds; otherwise report `not fixed`.
+
+**Linux read-only equivalent (not run):** `ps -p {PID} -o pid,stat,comm`. WSL process tools do not
+manage Windows GUI processes.

@@ -125,9 +125,87 @@ def test_manifest_advertises_the_checkup_tool():
 
     manifest = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8-sig"))
 
+    assert manifest["version"] == "0.2.0"
     assert {"hands_screenshot", "hands_devices", "hands_checkup"} <= set(
         manifest["provides_tools"]
     )
+
+
+def test_f4_playbooks_keep_diagnostics_approval_and_rechecks():
+    source = SKILL_MD.read_text(encoding="utf-8-sig")
+    expected_commands = {
+        "No internet": (
+            "Get-NetConnectionProfile | Select-Object Name,InterfaceAlias,IPv4Connectivity,IPv6Connectivity",
+            "Resolve-DnsName www.microsoft.com | Select-Object Name,Type,IPAddress",
+            "Test-NetConnection -ComputerName 1.1.1.1 -Port 443 -InformationLevel Quiet",
+            "Clear-DnsClientCache -WhatIf",
+            "Clear-DnsClientCache",
+        ),
+        "Printer stuck": (
+            "Get-Service -Name Spooler | Select-Object Name,Status,StartType",
+            "Get-Printer | Select-Object Name,PrinterStatus,WorkOffline",
+            "Get-PrintJob -PrinterName 'Microsoft Print to PDF' | Select-Object PrinterName,ID,DocumentName,JobStatus",
+            "Get-PrintJob -PrinterName 'OneNote (Desktop)' | Select-Object PrinterName,ID,DocumentName,JobStatus",
+            "Resume-PrintJob -PrinterName 'Microsoft Print to PDF' -ID 4294967295 -WhatIf",
+            "Resume-PrintJob -PrinterName '<same printer>' -ID <same job ID>",
+            "Suspend-PrintJob -PrinterName '<same printer>' -ID <same job ID>",
+        ),
+        "Slow PC": (
+            r"Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 3",
+            "Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,LastBootUpTime",
+            "Get-Process | Sort-Object CPU -Descending | Select-Object -First 8 Name,Id,CPU,WorkingSet64,Responding",
+            r"Set-ItemProperty -LiteralPath 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name MinAnimate -Value '0' -WhatIf",
+        ),
+        "Disk full": (
+            'Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" | Select-Object DeviceID,FileSystem,FreeSpace,Size',
+            "Get-ChildItem -LiteralPath $env:TEMP -File -Force | Measure-Object -Property Length -Sum",
+            'compact.exe /C /S:"<same folder>"',
+            'compact.exe /U /S:"<same folder>"',
+        ),
+        "Program frozen": (
+            "Get-Process | Where-Object { -not $_.Responding } | Select-Object Name,Id,Responding,StartTime",
+            "Task Manager → End task",
+        ),
+    }
+
+    for title, commands in expected_commands.items():
+        match = re.search(
+            rf"^### {re.escape(title)} \(Windows-only\)\n(.*?)(?=^### |\Z)",
+            source,
+            re.M | re.S,
+        )
+        assert match is not None, title
+        section = match.group(1)
+        for phrase in (
+            "Confirm the symptom",
+            "Read-only diagnostics",
+            "Facts.",
+            "Uncertainty.",
+            "One reversible repair",
+            "one F2 approval",
+            "Recheck and outcome",
+            "Before",
+            "After",
+            "fixed",
+            "not fixed",
+            "Linux read-only equivalent",
+            "hands_checkup",
+        ):
+            assert phrase.casefold() in section.casefold(), (title, phrase)
+        for command in commands:
+            assert command in section, (title, command)
+
+    normalized = " ".join(source.split())
+    assert "local Windows PowerShell session" in normalized
+    assert "blocks pipelines and shell composition" in normalized
+    assert "keep its `facts` and `inferences` separate" in normalized.casefold()
+    assert "wait for it" in normalized
+    assert "a second dangerous-command prompt" in normalized
+    assert "Clearing a print job requires administrator privileges" in normalized
+    assert "Remove-Item -Recurse/-Force" in normalized
+    assert "del /s /q" in normalized
+    assert "taskkill /F" in normalized
+    assert "Stop-Process -Force" in normalized
 
 
 def _pane_pattern(name: str) -> re.Pattern[str]:
