@@ -267,8 +267,9 @@ def _screenshot_agent(owner):
     return agent
 
 
-def test_each_screenshot_request_requires_its_own_consent(monkeypatch):
-    owner = PromptOwner(["Y", "N"])
+@pytest.mark.parametrize("answer", ["Y", "y"])
+def test_each_screenshot_request_requires_its_own_consent(monkeypatch, answer):
+    owner = PromptOwner([answer, "N"])
     agent = _screenshot_agent(owner)
     captures, posted = [], []
     monkeypatch.setattr(loop.screen, "capture", lambda **kwargs: captures.append(kwargs) or b"png")
@@ -288,7 +289,7 @@ def test_each_screenshot_request_requires_its_own_consent(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("answer", [None, "", "n"])
+@pytest.mark.parametrize("answer", [None, "", "n", "N", "yes", "ok"])
 def test_screenshot_timeout_eof_and_non_y_decline(monkeypatch, answer):
     owner = PromptOwner([answer])
     agent = _screenshot_agent(owner)
@@ -429,7 +430,10 @@ def test_console_stop_cancels_registered_process_tree(monkeypatch):
         agent.client.close()
 
 
-@pytest.mark.parametrize(("answer", "expected"), [("Y", True), ("N", False), ("y", False), ("", False)])
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [("Y", True), ("y", True), ("N", False), ("n", False), ("", False), ("yes", False), ("ok", False)],
+)
 def test_session_screenshot_consent_requires_explicit_y(monkeypatch, answer, expected):
     private, public = generate_keypair()
     monkeypatch.setattr(loop, "get_or_create", lambda: (private, public))

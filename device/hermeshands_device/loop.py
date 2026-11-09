@@ -279,7 +279,7 @@ class DeviceLoop:
         )
         if self.stop_event.is_set():
             return
-        self.allow_screen = answer is not None and answer.strip() == "Y"
+        self.allow_screen = answer is not None and answer.strip().casefold() == "y"
         self._record_receipt_event(
             "Screenshot session permission",
             "Enabled" if self.allow_screen else "Disabled",
@@ -784,7 +784,7 @@ class DeviceLoop:
                     if self.stop_event.is_set():
                         receipt_label = None
                         return
-                    if answer is None or answer.strip() != "Y":
+                    if answer is None or answer.strip().casefold() != "y":
                         receipt_outcome = "Declined"
                         self._result(
                             job_id,

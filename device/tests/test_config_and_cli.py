@@ -381,8 +381,9 @@ def test_witness_refuses_service_mode(monkeypatch, capsys):
     assert "service" in capsys.readouterr().err.lower()
 
 
-def test_witness_y_starts_session_after_initial_consent(monkeypatch):
-    console = FakeConsole("Y")
+@pytest.mark.parametrize("answer", ["Y", "y"])
+def test_witness_y_starts_session_after_initial_consent(monkeypatch, answer):
+    console = FakeConsole(answer)
     _prepare_witness_cli(monkeypatch, console)
 
     assert cli.main(["serve", "--witness"]) == 0
@@ -414,7 +415,7 @@ def test_witness_consent_screen_uses_persisted_owner_label(monkeypatch):
     assert "Ridwan's Hermes wants to help" in "".join(console.outputs)
 
 
-@pytest.mark.parametrize(("answer", "expected"), [("N", 0), (None, 1)])
+@pytest.mark.parametrize(("answer", "expected"), [("N", 0), ("n", 0), ("yes", 0), ("ok", 0), ("", 0), (None, 1)])
 def test_witness_decline_or_eof_does_not_start_agent(monkeypatch, capsys, answer, expected):
     console = FakeConsole(answer)
     _prepare_witness_cli(monkeypatch, console)

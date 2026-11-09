@@ -219,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent.console_owner.close()
                 console.write(WITNESS_STOPPED_BEFORE_START)
                 return 0
-            if consent.strip() != "Y":
+            if consent.strip().casefold() != "y":
                 agent.console_owner.close()
                 console.write(WITNESS_DECLINED)
                 return 0
