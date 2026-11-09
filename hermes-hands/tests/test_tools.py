@@ -342,6 +342,48 @@ def test_witness_file_operations_require_approval_with_path_and_operation(
     assert f"tool={tool_name}; device=laptop; operation={operation}; path=notes.txt" in result["message"]
 
 
+@pytest.mark.parametrize(
+    ("arguments", "details"),
+    [
+        (
+            {"pattern": "invoice", "path": "Documents", "target": "content"},
+            "operation=search; path=Documents; pattern=invoice; target=content",
+        ),
+        (
+            {"pattern": "*.txt", "target": "files"},
+            "operation=search; path=.; pattern=*.txt; target=files",
+        ),
+        (
+            {"pattern": "invoice", "file_glob": "*.txt"},
+            "operation=search; path=.; pattern=invoice; target=content; file_glob=*.txt",
+        ),
+    ],
+)
+def test_witness_search_requires_unique_approval_with_scope(monkeypatch, arguments, details):
+    hook = witness_hook(monkeypatch)
+
+    first = hook(tool_name="search_files", args=arguments)
+    second = hook(tool_name="search_files", args=arguments)
+
+    assert first["action"] == second["action"] == "approve"
+    assert first["rule_key"] != second["rule_key"]
+    assert first["message"] == (
+        f"Hands witness approval required: tool=search_files; device=laptop; {details}. "
+        "Review the request before approving."
+    )
+
+
+def test_witness_search_resolution_failure_blocks_the_search(monkeypatch):
+    from hands import witness
+
+    def fail(ctx):
+        raise RuntimeError("target resolver failed")
+
+    monkeypatch.setattr(witness, "_witness_device", fail)
+
+    assert witness.pre_tool_call(HookContext(), "search_files", {"pattern": "invoice"})["action"] == "block"
+
+
 def test_witness_blocks_execute_code(monkeypatch):
     hook = witness_hook(monkeypatch)
     result = hook(tool_name="execute_code", args={"code": "print('hello')"})

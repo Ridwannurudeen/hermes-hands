@@ -7,7 +7,9 @@ from functools import partial
 
 from . import messages, store, targets
 
-_PROTECTED_TOOLS = frozenset({"terminal", "read_file", "write_file", "patch", "execute_code"})
+_PROTECTED_TOOLS = frozenset(
+    {"terminal", "read_file", "search_files", "write_file", "patch", "execute_code"}
+)
 _APPROVAL_DETAIL_MAX = 300
 _READ_ONLY_ARGV = frozenset(
     {
@@ -151,6 +153,14 @@ def pre_tool_call(ctx, tool_name: str, args: dict, **kwargs):
             return {"action": "block", "message": messages.WITNESS_EXECUTE_CODE_BLOCKED}
         if not isinstance(args, dict):
             return {"action": "block", "message": messages.WITNESS_COMMAND_BLOCKED}
+        if tool_name == "search_files":
+            details = (
+                f"operation=search; path={args.get('path', '.')}; "
+                f"pattern={args.get('pattern', '')}; target={args.get('target', 'content')}"
+            )
+            if args.get("file_glob"):
+                details += f"; file_glob={args['file_glob']}"
+            return _approval(tool_name, device["name"], details)
         if tool_name in {"read_file", "write_file", "patch"}:
             path = args.get("path")
             path = path if isinstance(path, str) else "(path unavailable)"

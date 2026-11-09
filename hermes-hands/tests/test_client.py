@@ -315,6 +315,14 @@ def test_unencodable_script_returns_a_hands_error_instead_of_silent_255(wired, m
         assert "stdin" not in agent.jobs[0]
 
 
+def test_help_message_tells_the_helper_without_acting_on_the_device():
+    message = client._help_message("Please help with the printer.")
+
+    assert "Device message: «Please help with the printer.»" in message
+    assert "Tell the helper in this chat and wait; take no action on the device." in message
+    assert "Relay it to the computer" not in message
+
+
 def test_help_poller_logs_an_error_and_keeps_ticking(monkeypatch, caplog):
     attempts = []
 
