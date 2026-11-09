@@ -1,4 +1,7 @@
 import subprocess
+import sys
+import threading
+import time
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -35,11 +38,7 @@ def _quiet_probes(monkeypatch):
     monkeypatch.setattr(
         checkup,
         "_run_windows_probe",
-        lambda name, deadline: (
-            {"print_queue_jobs": 0, "print_queue_count": 2}
-            if name == "print_queue"
-            else {"pending_updates": 0}
-        ),
+        lambda name, deadline: {"print_queue_jobs": 0, "print_queue_count": 2},
         raising=False,
     )
 
@@ -126,17 +125,13 @@ def test_checkup_keeps_unsupported_and_failed_facts_explicit(monkeypatch):
     assert facts["battery_percent"]["availability"] == "unsupported"
 
 
-def test_windows_print_queue_and_pending_updates_have_observed_counts(monkeypatch):
+def test_windows_print_queue_has_observed_count(monkeypatch):
     _quiet_probes(monkeypatch)
     monkeypatch.setattr(checkup.platform, "system", lambda: "Windows")
     monkeypatch.setattr(
         checkup,
         "_run_windows_probe",
-        lambda name, deadline: (
-            {"print_queue_jobs": 3, "print_queue_count": 2}
-            if name == "print_queue"
-            else {"pending_updates": 4}
-        ),
+        lambda name, deadline: {"print_queue_jobs": 3, "print_queue_count": 2},
     )
 
     facts = _facts(checkup.collect())
@@ -145,9 +140,126 @@ def test_windows_print_queue_and_pending_updates_have_observed_counts(monkeypatc
     assert facts["print_queue_jobs"]["status"] == "warn"
     assert facts["print_queue_jobs"]["availability"] == "observed"
     assert "2 queues" in facts["print_queue_jobs"]["source"]
-    assert facts["pending_updates"]["value"] == 4
-    assert facts["pending_updates"]["status"] == "warn"
-    assert facts["pending_updates"]["availability"] == "observed"
+
+
+@pytest.mark.parametrize(
+    ("marker_path", "rename_operations"),
+    [
+        (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+            None,
+        ),
+        (None, [r"\??\C:\old-file", r"\??\C:\new-file"]),
+    ],
+)
+def test_windows_pending_reboot_reads_registry_markers_without_shell(
+    monkeypatch, marker_path, rename_operations
+):
+    monkeypatch.setattr(checkup.platform, "system", lambda: "Windows")
+    opened = []
+    machine = object()
+    session_manager = r"SYSTEM\CurrentControlSet\Control\Session Manager"
+
+    class Key:
+        def __init__(self, path):
+            self.path = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def open_key(root, path):
+        opened.append(path)
+        if path == session_manager or path == marker_path:
+            return Key(path)
+        raise FileNotFoundError(path)
+
+    def query_value(key, name):
+        if key.path == session_manager and name == "PendingFileRenameOperations" and rename_operations:
+            return rename_operations, 7
+        raise FileNotFoundError(name)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "winreg",
+        SimpleNamespace(HKEY_LOCAL_MACHINE=machine, OpenKey=open_key, QueryValueEx=query_value),
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("shell probe used"))
+
+    fact = checkup._pending_reboot_fact(time.monotonic() + 1)
+
+    assert fact["value"] is True
+    assert fact["availability"] == "observed"
+    assert "registry markers" in fact["source"]
+    if marker_path:
+        assert marker_path in opened
+    else:
+        assert session_manager in opened
+
+
+def test_windows_pending_reboot_respects_the_checkup_deadline(monkeypatch):
+    monkeypatch.setattr(checkup.platform, "system", lambda: "Windows")
+    release = threading.Event()
+
+    def blocked_registry_read():
+        release.wait(0.5)
+        return False
+
+    monkeypatch.setattr(checkup, "_read_windows_reboot_markers", blocked_registry_read, raising=False)
+    try:
+        fact = checkup._pending_reboot_fact(time.monotonic() + 0.05)
+    finally:
+        release.set()
+
+    assert fact["value"] is None
+    assert fact["availability"] == "error"
+    assert "TimeoutError" in fact["source"]
+
+
+def test_windows_pending_update_catalog_is_unsupported_without_a_bounded_query(monkeypatch):
+    _quiet_probes(monkeypatch)
+    monkeypatch.setattr(checkup.platform, "system", lambda: "Windows")
+    calls = []
+
+    def run_windows_probe(name, deadline):
+        calls.append(name)
+        if name == "print_queue":
+            return {"print_queue_jobs": 0, "print_queue_count": 2}
+        raise TimeoutError("Windows Update Agent search timed out")
+
+    monkeypatch.setattr(checkup, "_run_windows_probe", run_windows_probe)
+
+    fact = _facts(checkup.collect())["pending_updates"]
+
+    assert fact["value"] is None
+    assert fact["availability"] == "unsupported"
+    assert calls == ["print_queue"]
+
+
+def test_folder_size_is_unsupported_when_an_entry_is_inaccessible(monkeypatch, tmp_path):
+    temp = tmp_path / "Temp"
+    temp.mkdir()
+
+    class InaccessibleEntry:
+        def is_dir(self, follow_symlinks=False):
+            raise PermissionError("entry metadata is inaccessible")
+
+    class Entries:
+        def __enter__(self):
+            return iter((InaccessibleEntry(),))
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(checkup.os, "scandir", lambda path: Entries())
+
+    size, availability, source = checkup._folder_size(temp, time.monotonic() + 2)
+
+    assert size is None
+    assert availability == "unsupported"
+    assert "complete size unavailable" in source
 
 
 def test_linux_print_queue_and_pending_updates_are_explicitly_unsupported(monkeypatch):
@@ -187,10 +299,8 @@ def test_windows_probes_are_fixed_non_interpolated_and_never_use_shell(
         assert kwargs["shell"] is False
         assert injected_value not in script
         assert str(marker) not in script
-        if "Get-PrintJob" in script:
-            output = '{"print_queue_jobs":0,"print_queue_count":2}'
-        else:
-            output = '{"pending_updates":0}'
+        assert "Get-PrintJob" in script
+        output = '{"print_queue_jobs":0,"print_queue_count":2}'
         return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
 
     monkeypatch.setattr(subprocess, "run", run)
@@ -202,11 +312,11 @@ def test_windows_probes_are_fixed_non_interpolated_and_never_use_shell(
     facts = _facts(checkup.collect())
 
     assert [args[-1] for args, _ in calls] == list(checkup._WINDOWS_PROBES.values())
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert all(args[-2] == "-Command" for args, _ in calls)
     assert all(kwargs["timeout"] > 0 for _, kwargs in calls)
     assert facts["print_queue_jobs"]["availability"] == "observed"
-    assert facts["pending_updates"]["availability"] == "observed"
+    assert facts["pending_updates"]["availability"] == "unsupported"
     assert not marker.exists()
 
 

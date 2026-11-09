@@ -22,7 +22,8 @@ MAX_PROCESS_SAMPLE = 128
 MAX_CHECKUP_SECONDS = 9.0
 _DNS_TIMEOUT = 1.0
 _REACHABILITY_TIMEOUT = 0.75
-_WINDOWS_PROBE_TIMEOUTS = {"print_queue": 1.5, "pending_updates": 2.5}
+_WINDOWS_PROBE_TIMEOUTS = {"print_queue": 1.5}
+_WINDOWS_REBOOT_TIMEOUT = 0.5
 _WINDOWS_PROBES = {
     "print_queue": (
         "$ErrorActionPreference = 'Stop'; "
@@ -31,12 +32,6 @@ _WINDOWS_PROBES = {
         "Get-PrintJob -PrinterName $printer.Name -ErrorAction Stop }); "
         "[ordered]@{ print_queue_jobs = [int]$jobs.Count; "
         "print_queue_count = [int]$printers.Count } | ConvertTo-Json -Compress"
-    ),
-    "pending_updates": (
-        "$ErrorActionPreference = 'Stop'; "
-        "$session = New-Object -ComObject Microsoft.Update.Session; "
-        "$result = $session.CreateUpdateSearcher().Search(\"IsInstalled=0 and Type='Software' and IsHidden=0\"); "
-        "[ordered]@{ pending_updates = [int]$result.Updates.Count } | ConvertTo-Json -Compress"
     ),
 }
 _REACHABILITY_TARGETS = (
@@ -281,8 +276,9 @@ def _scan_folder_size(path: Path, probe_deadline: float) -> tuple[int | None, Av
     if limited:
         source += "; entry limit or traversal time/depth bound reached"
     if failed:
-        source += "; some entries were inaccessible"
-    return total, "error" if failed else "observed", source
+        source += "; some entries were inaccessible; complete size unavailable"
+        return None, "unsupported", source
+    return total, "observed", source
 
 
 def _folder_size(path: Path, deadline: float) -> tuple[int | None, Availability, str]:
@@ -551,10 +547,7 @@ def _run_windows_probe(probe_name: str, deadline: float) -> dict[str, int]:
     value = json.loads(result.stdout)
     if not isinstance(value, dict):
         raise ValueError("invalid Windows checkup probe result")
-    expected = {
-        "print_queue": ("print_queue_jobs", "print_queue_count"),
-        "pending_updates": ("pending_updates",),
-    }[probe_name]
+    expected = ("print_queue_jobs", "print_queue_count")
     if any(type(value.get(key)) is not int or value[key] < 0 for key in expected):
         raise ValueError("invalid Windows checkup probe result")
     return {key: value[key] for key in expected}
@@ -600,41 +593,67 @@ def _uptime_fact() -> dict[str, object]:
     )
 
 
-def _pending_reboot_fact() -> dict[str, object]:
-    if os.name == "nt":
-        try:
-            import winreg
+def _read_windows_reboot_markers() -> bool:
+    import winreg
 
-            markers = (
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"),
-                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"),
-            )
-            pending = False
-            for root, path in markers:
-                try:
-                    with winreg.OpenKey(root, path):
-                        pending = True
-                        break
-                except FileNotFoundError:
-                    continue
-            value = None
+    markers = (
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"),
+    )
+    for root, path in markers:
+        try:
+            with winreg.OpenKey(root, path):
+                return True
+        except FileNotFoundError:
+            continue
+
+    value = None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager",
+        ) as key:
             try:
-                with winreg.OpenKey(
-                    winreg.HKEY_LOCAL_MACHINE,
-                    r"SYSTEM\CurrentControlSet\Control\Session Manager",
-                ) as key:
-                    try:
-                        value, _ = winreg.QueryValueEx(key, "PendingFileRenameOperations")
-                    except FileNotFoundError:
-                        value = None
+                value, _ = winreg.QueryValueEx(key, "PendingFileRenameOperations")
             except FileNotFoundError:
-                value = None
-            pending = pending or bool(value)
-        except ImportError:
-            return _unsupported_fact("pending_reboot", "Known pending reboot marker", None, "Windows registry API")
-        except OSError as exc:
-            return _error_fact("pending_reboot", "Known pending reboot marker", None, "Windows reboot registry markers", exc)
-        source = "Windows servicing and update reboot registry markers"
+                pass
+    except FileNotFoundError:
+        pass
+    return bool(value)
+
+
+def _pending_reboot_fact(deadline: float) -> dict[str, object]:
+    if platform.system() == "Windows":
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _error_fact(
+                "pending_reboot", "Known pending reboot marker", None, "Windows reboot registry markers", TimeoutError()
+            )
+
+        result: queue.Queue[tuple[bool, bool | Exception]] = queue.Queue(maxsize=1)
+
+        def read_markers() -> None:
+            try:
+                result.put((True, _read_windows_reboot_markers()))
+            except Exception as exc:
+                result.put((False, exc))
+
+        threading.Thread(target=read_markers, name="hermes-hands-checkup-reboot", daemon=True).start()
+        try:
+            succeeded, value = result.get(timeout=min(_WINDOWS_REBOOT_TIMEOUT, remaining))
+        except queue.Empty:
+            return _error_fact(
+                "pending_reboot", "Known pending reboot marker", None, "Windows reboot registry markers", TimeoutError()
+            )
+        if not succeeded:
+            error = value if isinstance(value, Exception) else RuntimeError("Windows registry read failed")
+            if isinstance(error, ImportError):
+                return _unsupported_fact("pending_reboot", "Known pending reboot marker", None, "Windows registry API")
+            return _error_fact(
+                "pending_reboot", "Known pending reboot marker", None, "Windows reboot registry markers", error
+            )
+        pending = bool(value)
+        source = "Windows servicing and update reboot registry markers, including pending file rename operations"
     elif platform.system() == "Linux":
         markers = (Path("/var/run/reboot-required"), Path("/run/reboot-required"))
         try:
@@ -655,23 +674,14 @@ def _pending_reboot_fact() -> dict[str, object]:
     )
 
 
-def _pending_updates_fact(deadline: float) -> dict[str, object]:
+def _pending_updates_fact() -> dict[str, object]:
     fact_id = "pending_updates"
     label = "Pending Windows software updates"
-    if platform.system() != "Windows":
-        return _unsupported_fact(
-            fact_id,
-            label,
-            "updates",
-            "Windows Update Agent is unavailable on Linux; update checks are distribution-specific",
-        )
-    source = "fixed Windows Update Agent search for non-installed, non-hidden software updates"
-    try:
-        result = _run_windows_probe("pending_updates", deadline)
-    except Exception as exc:
-        return _error_fact(fact_id, label, "updates", source, exc)
-    count = result["pending_updates"]
-    return _fact(fact_id, label, count, "updates", "warn" if count else "ok", "observed", source)
+    if platform.system() == "Windows":
+        source = "No bounded in-process Windows Update catalog query is available; known reboot markers are reported separately"
+    else:
+        source = "Windows Update checks are distribution-specific and are not queried by this device checkup"
+    return _unsupported_fact(fact_id, label, "updates", source)
 
 
 def _battery_facts() -> list[dict[str, object]]:
@@ -792,14 +802,14 @@ def collect() -> dict[str, object]:
     facts.extend(_memory_facts())
     facts.extend(_process_facts(deadline))
     facts.append(_print_queue_fact(deadline))
-    facts.append(_pending_updates_fact(deadline))
+    facts.append(_pending_updates_fact())
     facts.extend(_folder_facts(deadline))
     facts.append(_wifi_fact())
     facts.append(_dns_servers_fact())
     facts.append(_dns_resolution_fact(deadline))
     facts.extend(_reachability_facts(deadline))
     facts.append(_uptime_fact())
-    facts.append(_pending_reboot_fact())
+    facts.append(_pending_reboot_fact(deadline))
     facts.extend(_battery_facts())
     facts.append(_startup_item_fact())
     observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")

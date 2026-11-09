@@ -127,7 +127,7 @@ The command requires stdin and stdout TTYs. It does not run under `pythonw` or a
 
 The session lasts at most 30 minutes. Press `S` or `s` to stop. Press `H` to write a help request, or Escape to cancel that request. Up to three help requests are accepted per session. The helper needs a saved owner chat origin from `/hands use` for the relay to accept a request. An accepted request is marked pending until the gateway delivers it. The device console says when the request was not sent or when delivery is still pending.
 
-The helper can request the built in `hands_checkup` tool. It returns structured device facts with `observed`, `unsupported`, or `error` availability. Its `inferences` list is currently empty. The checkup does not inspect print queues or pending operating system updates. Those facts are returned as unsupported.
+The helper can request the built in `hands_checkup` tool. It returns structured device facts with `observed`, `unsupported`, or `error` availability. Its `inferences` list is currently empty. On Windows, the checkup can report aggregate print queue jobs and known pending reboot registry markers. It does not enumerate the Windows Update catalog, so `pending_updates` is unsupported. On Linux, Windows print queue and update facts are unsupported, while `pending_reboot` checks the known reboot marker files.
 
 Screenshots require two separate permissions. The person first answers `Y` to allow screenshot requests for the session. Each screenshot then asks `Allow this screenshot?` and requires another `Y`. A declined or unanswered request does not capture an image. This session consent is separate from the normal `serve --allow-screen` setting.
 
@@ -174,7 +174,7 @@ The target is selected for each terminal call. The first terminal result after a
 - A command handed to a connection the device can no longer read, for example during a Wi-Fi switch while the same agent process keeps running, is not delivered again; it fails when the gateway's terminal timeout ends.
 - macOS is not a supported device platform.
 - Linux device behavior, including witness mode, has not been tested live. Linux witness mode needs an interactive TTY. The service installer supports Windows Task Scheduler only.
-- `hands_checkup` reports print queue jobs and pending operating system updates as unsupported. It does not run Windows printer or update queries.
+- `hands_checkup` can report Windows print queue jobs and known Windows reboot registry markers. It does not enumerate Windows Update availability, so `pending_updates` is unsupported. Linux reports Windows-only print queue and update facts as unsupported; its `pending_reboot` fact checks known reboot marker files.
 
 ## Security model
 
