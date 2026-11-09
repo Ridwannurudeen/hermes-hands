@@ -203,8 +203,6 @@ def _help_message(text: str) -> str:
 
 def deliver_help_once(ctx) -> bool:
     """Try one pending device message; True means the host accepted its scheduled injection."""
-    if not ctx.has_gateway_message_injector:
-        return False
     request = store.lease_help_request()
     if request is None:
         return False
@@ -223,7 +221,10 @@ def deliver_help_once(ctx) -> bool:
 
 def _help_poller(ctx, stop: threading.Event) -> None:
     while not stop.wait(_HELP_POLL_EVERY):
-        deliver_help_once(ctx)
+        try:
+            deliver_help_once(ctx)
+        except Exception:
+            logger.warning("hermes-hands: help poll failed", exc_info=True)
 
 
 def start_help_poller(ctx) -> None:

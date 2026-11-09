@@ -2,6 +2,7 @@
 with a fake device agent on a thread."""
 
 import functools
+import logging
 import os
 import threading
 
@@ -251,3 +252,29 @@ def test_unencodable_script_returns_a_hands_error_instead_of_silent_255(wired, m
         assert proc_stdin.wait(5) == 0
         assert agent.jobs[0]["stdin_b64"] == "/w=="
         assert "stdin" not in agent.jobs[0]
+
+
+def test_help_poller_logs_an_error_and_keeps_ticking(monkeypatch, caplog):
+    attempts = []
+
+    def deliver(_ctx):
+        attempts.append(None)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary store failure")
+
+    class StopAfterTwoTicks:
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, _timeout):
+            self.waits += 1
+            return self.waits == 3
+
+    monkeypatch.setattr(client, "deliver_help_once", deliver)
+    stop = StopAfterTwoTicks()
+    with caplog.at_level(logging.WARNING, logger=client.__name__):
+        client._help_poller(object(), stop)
+
+    assert len(attempts) == 2
+    assert stop.waits == 3
+    assert "hermes-hands: help poll failed" in caplog.text

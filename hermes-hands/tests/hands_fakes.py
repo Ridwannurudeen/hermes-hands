@@ -199,6 +199,9 @@ class RegisterCtx:
     def register_skill(self, name, path, description="", frontmatter=None):
         self.calls.append(("skill", name))
 
+    def inject_message(self, content, role="user", *, session_key=None, origin=None):
+        return False
+
 
 def load_plugin_package():
     """``hermes_plugins.hermes_hands`` exactly as plugins_loader.py:811-837 imports it."""

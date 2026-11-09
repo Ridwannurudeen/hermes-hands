@@ -12,6 +12,7 @@ Needs FastAPI and Hermes core importable (``hermes_cli``, ``tools``), and bash f
 
 import base64
 import functools
+import importlib
 import json
 import sys
 import threading
@@ -131,6 +132,7 @@ def rig(hands_db, tmp_path, monkeypatch):
     monkeypatch.setattr(device_keys, "_keyring", lambda: None)
 
     package = load_plugin_package()
+    hands_client = importlib.import_module("hermes_plugins.hermes_hands.hands.client")
     api = make_app(load_plugin_api(), base_url=GATEWAY)
     forgeries: list = []  # each answers one device poll instead of the dashboard
     delivered: list = []  # every job the relay handed the device
@@ -156,13 +158,16 @@ def rig(hands_db, tmp_path, monkeypatch):
     unloaders = []
     ctx.register_hook = lambda name, callback: ctx.calls.append(("hook", name))
     ctx.on_unload = lambda callback: unloaders.append(callback)
-    ctx.has_gateway_message_injector = False
-    ctx.inject_message = lambda *args, **kwargs: False
+
+    def skip_help_poller(context):
+        context.on_unload(lambda: None)
+
     with monkeypatch.context() as scoped:  # register() builds the gateway's loopback client
         scoped.setattr(httpx, "Client", functools.partial(httpx.Client, transport=transport))
+        scoped.setattr(hands_client, "start_help_poller", skip_help_poller)
         package.register(ctx)
     provider = dict(ctx.calls)["auth"]
-    hands = sys.modules["hermes_plugins.hermes_hands.hands"]  # imported by register()
+    hands = sys.modules["hermes_plugins.hermes_hands.hands"]
     monkeypatch.setattr(hands.relay.Relay, "start", lambda self: None)  # no heartbeat thread
     monkeypatch.setattr(hands.relay, "MAX_POLL_WAIT", 1)  # the agent's 25 s long-poll, shortened
 
@@ -619,7 +624,6 @@ def test_signed_device_help_reaches_only_its_saved_owner_origin(rig):
     injections = []
     tool_calls = []
     gateway_ctx = SimpleNamespace(
-        has_gateway_message_injector=True,
         inject_message=lambda content, role="user", *, origin=None: injections.append(
             (content, role, origin)
         )

@@ -3,6 +3,7 @@ the plugin package is imported the way the plugin loader does (``hermes_plugins.
 dashboard file on its own, and requests go through the real token-auth middleware."""
 
 import functools
+import importlib
 import secrets
 import sqlite3
 import sys
@@ -17,7 +18,7 @@ pytest.importorskip("agent.secret_scope")
 
 from hermes_cli.dashboard_auth import registry, token_auth  # noqa: E402
 
-from hands import protocol  # noqa: E402
+from hands import client, protocol, store  # noqa: E402
 from hands_fakes import (  # noqa: E402
     Device,
     PLUGIN_DIR,
@@ -45,8 +46,6 @@ def prepare_context(ctx):
 
     ctx.register_hook = register_hook
     ctx.on_unload = on_unload
-    ctx.has_gateway_message_injector = False
-    ctx.inject_message = lambda *args, **kwargs: False
     ctx._hands_unloaders = unloaders
     ctx._hands_hooks = hooks
     return ctx
@@ -56,8 +55,15 @@ def prepare_context(ctx):
 def plugin(hands_db, monkeypatch):
     monkeypatch.setenv("HANDS_RELAY_SEED", SEED)
     package = load_plugin_package()
+    hands_client = importlib.import_module("hermes_plugins.hermes_hands.hands.client")
     ctx = prepare_context(RegisterCtx())
-    package.register(ctx)
+
+    def skip_help_poller(context):
+        context.on_unload(lambda: None)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(hands_client, "start_help_poller", skip_help_poller)
+        package.register(ctx)
     hands = sys.modules["hermes_plugins.hermes_hands.hands"]
     monkeypatch.setattr(hands.relay.Relay, "start", lambda self: None)
     provider = dict((kind, obj) for kind, obj in ctx.calls if kind == "auth")["auth"]
@@ -480,7 +486,6 @@ def test_help_delivery_keeps_adversarial_text_with_its_owner(plugin):
     api = make_app(load_plugin_api())
     delivered = []
     tool_calls = []
-    ctx.has_gateway_message_injector = True
     ctx.inject_message = lambda content, role="user", *, origin=None: delivered.append(
         (content, role, origin)
     ) or True
@@ -545,7 +550,7 @@ def test_help_delivery_keeps_adversarial_text_with_its_owner(plugin):
     assert hands.store.get_help_request(second.device_id, "2" * 32)["status"] == "queued"
 
 
-def test_help_injection_refusal_and_disabled_capability_leave_work_pending(plugin):
+def test_help_injection_refusal_leaves_work_pending(plugin):
     ctx, hands, _ = plugin
     device = Device("laptop")
     origin = {"platform": "telegram", "chat_id": "chat-1", "chat_type": "dm", "user_id": "42"}
@@ -560,16 +565,43 @@ def test_help_injection_refusal_and_disabled_capability_leave_work_pending(plugi
     assert hands.store.accept_help_request(
         device.device_id, request_id="3" * 32, instance="serve-1", text="help"
     ) == "accepted"
-    ctx.has_gateway_message_injector = False
-    assert hands.client.deliver_help_once(ctx) is False
-    assert hands.store.get_help_request(device.device_id, "3" * 32)["attempts"] == 0
-
-    ctx.has_gateway_message_injector = True
     ctx.inject_message = lambda *args, **kwargs: False
     assert hands.client.deliver_help_once(ctx) is False
     pending = hands.store.get_help_request(device.device_id, "3" * 32)
     assert pending["status"] == "pending" and pending["attempts"] == 1
     assert pending["next_attempt_at"] > time.time()
+
+
+def test_deliver_help_once_uses_real_plugin_context_without_gateway(hands_db, tmp_path):
+    from hermes_cli.plugins import PluginContext, PluginManager
+    from hermes_cli.plugins_manifest import PluginManifest
+
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    hermes-hands:\n      allow_gateway_injection: true\n",
+        encoding="utf-8",
+    )
+    manager = PluginManager(scope_key=str(tmp_path))
+    ctx = PluginContext(PluginManifest(name="hermes-hands", kind="backend"), manager)
+    assert manager.has_gateway_message_injector is False
+    assert not hasattr(ctx, "has_gateway_message_injector")
+
+    device = Device("laptop")
+    origin = {"platform": "telegram", "chat_id": "chat-1", "chat_type": "dm", "user_id": "42"}
+    store.record_seen(
+        device.device_id,
+        instance="serve-1",
+        witness=True,
+        session_state="active",
+        capabilities=["witness-v1", "help-v1"],
+    )
+    store.set_help_origin(device.device_id, "telegram:42", origin, "session-1")
+    assert store.accept_help_request(
+        device.device_id, request_id="4" * 32, instance="serve-1", text="help"
+    ) == "accepted"
+
+    assert client.deliver_help_once(ctx) is False
+    pending = store.get_help_request(device.device_id, "4" * 32)
+    assert pending["status"] == "pending" and pending["attempts"] == 1
 
 
 def test_hermes_refuses_a_help_origin_that_would_open_a_new_chat(plugin, monkeypatch, caplog, tmp_path):
