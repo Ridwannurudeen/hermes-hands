@@ -1,5 +1,7 @@
 # Hermes Hands
 
+> This is the archived development repo. The current release lives at [Ridwannurudeen/hermes-hands-plugin](https://github.com/Ridwannurudeen/hermes-hands-plugin).
+
 Help someone's computer from your phone. They see each command and hold the off switch.
 
 Hermes Hands pairs a Windows or Linux computer with a one-time code. Hermes runs on a Linux or WSL gateway; terminal and file tools run on the paired computer. In optional witness mode, the person at that computer gives local consent, sees a timestamped command transcript, approves each screenshot, and can stop the session with S. The device connects out over HTTPS and does not listen for inbound connections. If a device is offline, revoked, or the relay is unreachable, the device command fails and is not sent to another target.
